@@ -39,30 +39,48 @@ class BybitClient:
         # Create exchange instance
         exchange_class = getattr(ccxt, config.name)
         
+        # Strip and validate credentials (strip again as safety measure)
+        api_key = (config.api_key or "").strip()
+        api_secret = (config.api_secret or "").strip()
+        
         # Log credential status (without exposing actual values)
-        api_key_present = bool(config.api_key and config.api_key.strip())
-        api_secret_present = bool(config.api_secret and config.api_secret.strip())
-        key_len = len(config.api_key) if config.api_key else 0
-        secret_len = len(config.api_secret) if config.api_secret else 0
+        api_key_present = bool(api_key)
+        api_secret_present = bool(api_secret)
+        key_len = len(api_key)
+        secret_len = len(api_secret)
+        
+        # Log first/last few chars for debugging (without exposing full key)
+        key_preview = f"{api_key[:3]}...{api_key[-3:]}" if len(api_key) >= 6 else ("***" if api_key else "MISSING")
+        secret_preview = f"{api_secret[:3]}...{api_secret[-3:]}" if len(api_secret) >= 6 else ("***" if api_secret else "MISSING")
         
         self.logger.info(
-            f"Initializing CCXT exchange - API key present: {api_key_present} ({key_len} chars), "
-            f"Secret present: {api_secret_present} ({secret_len} chars)"
+            f"Initializing CCXT exchange - API key: {api_key_present} ({key_len} chars, preview: {key_preview}), "
+            f"Secret: {api_secret_present} ({secret_len} chars, preview: {secret_preview}), "
+            f"Testnet: {config.testnet}, Mode: {config.mode}"
         )
         
         if not api_key_present or not api_secret_present:
-            self.logger.warning(
-                "API credentials are missing or empty in config. "
+            self.logger.error(
+                "API credentials are missing or empty in config!\n"
+                f"  API key present: {api_key_present} ({key_len} chars)\n"
+                f"  API secret present: {api_secret_present} ({secret_len} chars)\n"
                 "Ensure BYBIT_API_KEY and BYBIT_API_SECRET are set in .env file or config.yaml"
             )
         
         self.exchange = exchange_class(
             {
-                "apiKey": config.api_key or "",
-                "secret": config.api_secret or "",
+                "apiKey": api_key,
+                "secret": api_secret,
                 "enableRateLimit": True,
                 "options": exchange_options,
             }
+        )
+        
+        # Verify what CCXT received (just for debugging)
+        self.logger.debug(
+            f"CCXT exchange initialized - apiKey set: {bool(self.exchange.apiKey)}, "
+            f"secret set: {bool(self.exchange.secret)}, "
+            f"sandbox: {self.exchange.options.get('sandbox', False)}"
         )
 
         # Retry configuration (could be made configurable via ExchangeConfig)

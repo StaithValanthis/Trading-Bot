@@ -7,11 +7,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from dotenv import load_dotenv
+import logging
+
+# Module-level logger for debugging
+_logger = logging.getLogger(__name__)
 
 # Load .env file if it exists (look in current directory and parent directories)
 # When running via systemd, EnvironmentFile directive should set env vars directly,
 # but load_dotenv() is useful for manual runs.
-load_dotenv(override=False)  # Don't override existing env vars
+# Note: This runs at import time, so it uses Python's current working directory.
+# For systemd, EnvironmentFile should already set the vars, so this may be redundant.
+env_result = load_dotenv(override=False)  # Don't override existing env vars
+if env_result:
+    _logger.debug("load_dotenv() found and loaded .env file at module import time")
+else:
+    _logger.debug("load_dotenv() did not find .env file at module import time (this is OK if using systemd EnvironmentFile)")
 
 
 @dataclass
@@ -27,15 +37,70 @@ class ExchangeConfig:
     
     def __post_init__(self):
         """Load API keys from environment if not provided."""
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # Debug: Check environment at __post_init__ time
+        env_key_raw = os.getenv("BYBIT_API_KEY")
+        env_secret_raw = os.getenv("BYBIT_API_SECRET")
+        env_key_present = bool(env_key_raw)
+        env_secret_present = bool(env_secret_raw)
+        
+        logger.debug(
+            f"ExchangeConfig.__post_init__ - "
+            f"Initial api_key: {bool(self.api_key)} ({len(self.api_key) if self.api_key else 0} chars), "
+            f"Initial api_secret: {bool(self.api_secret)} ({len(self.api_secret) if self.api_secret else 0} chars), "
+            f"ENV BYBIT_API_KEY present: {env_key_present}, "
+            f"ENV BYBIT_API_SECRET present: {env_secret_present}"
+        )
+        
+        # Try to reload .env if we're in a known working directory context
+        # This is a fallback for cases where module-level load_dotenv() didn't work
+        if not env_key_present or not env_secret_present:
+            # Try loading from explicit paths
+            import os
+            cwd = os.getcwd()
+            env_paths = [
+                os.path.join(cwd, ".env"),
+                os.path.join(os.path.dirname(cwd), ".env"),  # Parent directory
+            ]
+            for env_path in env_paths:
+                if os.path.exists(env_path):
+                    logger.debug(f"Attempting to reload .env from {env_path}")
+                    result = load_dotenv(env_path, override=False)
+                    if result:
+                        logger.debug(f"Successfully loaded .env from {env_path}")
+                        # Re-check environment after reload
+                        env_key_raw = os.getenv("BYBIT_API_KEY")
+                        env_secret_raw = os.getenv("BYBIT_API_SECRET")
+                        env_key_present = bool(env_key_raw)
+                        env_secret_present = bool(env_secret_raw)
+                        break
+        
         # Load from environment if None or empty string
+        # Strip whitespace (common issue with .env files)
         if not self.api_key:
-            env_key = os.getenv("BYBIT_API_KEY")
-            if env_key:
-                self.api_key = env_key
+            if env_key_raw:
+                self.api_key = env_key_raw.strip()
+                logger.debug(
+                    f"Loaded API key from environment ({len(self.api_key)} chars, "
+                    f"first 3: {self.api_key[:3] if len(self.api_key) >= 3 else 'N/A'}, "
+                    f"last 3: {self.api_key[-3:] if len(self.api_key) >= 3 else 'N/A'})"
+                )
         if not self.api_secret:
-            env_secret = os.getenv("BYBIT_API_SECRET")
-            if env_secret:
-                self.api_secret = env_secret
+            if env_secret_raw:
+                self.api_secret = env_secret_raw.strip()
+                logger.debug(
+                    f"Loaded API secret from environment ({len(self.api_secret)} chars, "
+                    f"first 3: {self.api_secret[:3] if len(self.api_secret) >= 3 else 'N/A'}, "
+                    f"last 3: {self.api_secret[-3:] if len(self.api_secret) >= 3 else 'N/A'})"
+                )
+        
+        # Final debug output
+        logger.debug(
+            f"ExchangeConfig.__post_init__ - Final api_key: {bool(self.api_key)} ({len(self.api_key) if self.api_key else 0} chars), "
+            f"Final api_secret: {bool(self.api_secret)} ({len(self.api_secret) if self.api_secret else 0} chars)"
+        )
 
 
 @dataclass
@@ -208,9 +273,46 @@ class BotConfig:
     @classmethod
     def from_yaml(cls, config_path: str) -> "BotConfig":
         """Load configuration from YAML file."""
+        import logging
+        logger = logging.getLogger(__name__)
+        
         config_path = Path(config_path)
         if not config_path.exists():
             raise FileNotFoundError(f"Config file not found: {config_path}")
+        
+        # Debug: Log current working directory and environment state before loading
+        import os
+        cwd = os.getcwd()
+        env_key_check = bool(os.getenv("BYBIT_API_KEY"))
+        env_secret_check = bool(os.getenv("BYBIT_API_SECRET"))
+        logger.debug(
+            f"BotConfig.from_yaml - CWD: {cwd}, "
+            f"Config path: {config_path}, "
+            f"ENV BYBIT_API_KEY present: {env_key_check}, "
+            f"ENV BYBIT_API_SECRET present: {env_secret_check}"
+        )
+        
+        # Try to explicitly load .env from config file's directory or project root
+        config_dir = config_path.parent.absolute()
+        env_file_candidates = [
+            config_dir / ".env",
+            Path(cwd) / ".env",
+            config_dir.parent / ".env",  # One level up from config
+        ]
+        for env_file in env_file_candidates:
+            if env_file.exists():
+                logger.debug(f"Found .env file at {env_file}, attempting to load...")
+                result = load_dotenv(env_file, override=False)
+                if result:
+                    logger.debug(f"Successfully loaded .env from {env_file}")
+                    # Re-check environment after reload
+                    env_key_check = bool(os.getenv("BYBIT_API_KEY"))
+                    env_secret_check = bool(os.getenv("BYBIT_API_SECRET"))
+                    logger.debug(
+                        f"After .env reload - ENV BYBIT_API_KEY present: {env_key_check}, "
+                        f"ENV BYBIT_API_SECRET present: {env_secret_check}"
+                    )
+                    break
         
         with open(config_path, "r") as f:
             raw = f.read()
