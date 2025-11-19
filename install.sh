@@ -372,7 +372,7 @@ User=$SERVICE_USER
 WorkingDirectory=$BOT_DIR
 EnvironmentFile=$ENV_FILE
 Environment="PATH=$VENV_DIR/bin"
-ExecStart=$VENV_DIR/bin/python -m src.main live --config $CONFIG_FILE
+ExecStart=$VENV_DIR/bin/python -m src.main --config $CONFIG_FILE live
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -396,7 +396,7 @@ User=$SERVICE_USER
 WorkingDirectory=$BOT_DIR
 EnvironmentFile=$ENV_FILE
 Environment="PATH=$VENV_DIR/bin"
-ExecStart=$VENV_DIR/bin/python -m src.main optimize --config $CONFIG_FILE
+ExecStart=$VENV_DIR/bin/python -m src.main --config $CONFIG_FILE optimize
 StandardOutput=journal
 StandardError=journal
 
@@ -435,7 +435,7 @@ User=$SERVICE_USER
 WorkingDirectory=$BOT_DIR
 EnvironmentFile=$ENV_FILE
 Environment="PATH=$VENV_DIR/bin"
-ExecStart=$VENV_DIR/bin/python -m src.main report --config $CONFIG_FILE
+ExecStart=$VENV_DIR/bin/python -m src.main --config $CONFIG_FILE report
 StandardOutput=journal
 StandardError=journal
 
