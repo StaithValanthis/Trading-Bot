@@ -8,8 +8,10 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any
 from dotenv import load_dotenv
 
-# Load .env file if it exists
-load_dotenv()
+# Load .env file if it exists (look in current directory and parent directories)
+# When running via systemd, EnvironmentFile directive should set env vars directly,
+# but load_dotenv() is useful for manual runs.
+load_dotenv(override=False)  # Don't override existing env vars
 
 
 @dataclass
@@ -25,10 +27,15 @@ class ExchangeConfig:
     
     def __post_init__(self):
         """Load API keys from environment if not provided."""
-        if self.api_key is None:
-            self.api_key = os.getenv("BYBIT_API_KEY", "")
-        if self.api_secret is None:
-            self.api_secret = os.getenv("BYBIT_API_SECRET", "")
+        # Load from environment if None or empty string
+        if not self.api_key:
+            env_key = os.getenv("BYBIT_API_KEY")
+            if env_key:
+                self.api_key = env_key
+        if not self.api_secret:
+            env_secret = os.getenv("BYBIT_API_SECRET")
+            if env_secret:
+                self.api_secret = env_secret
 
 
 @dataclass

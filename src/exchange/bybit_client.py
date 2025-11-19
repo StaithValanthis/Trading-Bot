@@ -38,6 +38,24 @@ class BybitClient:
 
         # Create exchange instance
         exchange_class = getattr(ccxt, config.name)
+        
+        # Log credential status (without exposing actual values)
+        api_key_present = bool(config.api_key and config.api_key.strip())
+        api_secret_present = bool(config.api_secret and config.api_secret.strip())
+        key_len = len(config.api_key) if config.api_key else 0
+        secret_len = len(config.api_secret) if config.api_secret else 0
+        
+        self.logger.info(
+            f"Initializing CCXT exchange - API key present: {api_key_present} ({key_len} chars), "
+            f"Secret present: {api_secret_present} ({secret_len} chars)"
+        )
+        
+        if not api_key_present or not api_secret_present:
+            self.logger.warning(
+                "API credentials are missing or empty in config. "
+                "Ensure BYBIT_API_KEY and BYBIT_API_SECRET are set in .env file or config.yaml"
+            )
+        
         self.exchange = exchange_class(
             {
                 "apiKey": config.api_key or "",
