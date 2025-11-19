@@ -174,6 +174,18 @@ def run_live(config_path: str):
     
     # Validate API credentials early
     if config.exchange.mode != "paper":
+        # Debug: Check if env vars are loaded (without exposing values)
+        import os
+        env_key_present = bool(os.getenv("BYBIT_API_KEY"))
+        env_secret_present = bool(os.getenv("BYBIT_API_SECRET"))
+        config_key_present = bool(config.exchange.api_key)
+        config_secret_present = bool(config.exchange.api_secret)
+        
+        logger.info(
+            f"Credential check - ENV key present: {env_key_present}, ENV secret present: {env_secret_present}, "
+            f"Config key present: {config_key_present}, Config secret present: {config_secret_present}"
+        )
+        
         if not config.exchange.api_key or not config.exchange.api_secret:
             logger.error(
                 "API credentials are missing!\n"
@@ -181,11 +193,25 @@ def run_live(config_path: str):
                 "  1. .env file in the project root (recommended), or\n"
                 "  2. config.yaml under exchange.api_key and exchange.api_secret\n"
                 "\n"
-                "If running via systemd, ensure the .env file exists and contains:\n"
-                "  BYBIT_API_KEY=your_api_key_here\n"
-                "  BYBIT_API_SECRET=your_api_secret_here"
+                "If running via systemd, ensure:\n"
+                "  - The .env file exists at the project root\n"
+                "  - The systemd service has: EnvironmentFile=/path/to/.env\n"
+                "  - The .env file contains (no quotes, no spaces around =):\n"
+                "    BYBIT_API_KEY=your_api_key_here\n"
+                "    BYBIT_API_SECRET=your_api_secret_here\n"
+                f"\n"
+                f"Current status: API key from config: {'SET' if config_key_present else 'MISSING'}, "
+                f"API secret from config: {'SET' if config_secret_present else 'MISSING'}"
             )
             sys.exit(1)
+        
+        # Log key length for debugging (without exposing actual key)
+        key_len = len(config.exchange.api_key) if config.exchange.api_key else 0
+        secret_len = len(config.exchange.api_secret) if config.exchange.api_secret else 0
+        logger.info(
+            f"API credentials loaded - Key length: {key_len} chars, Secret length: {secret_len} chars, "
+            f"Testnet: {config.exchange.testnet}, Mode: {config.exchange.mode}"
+        )
     
     # Initialize exchange client
     exchange = BybitClient(config.exchange)
