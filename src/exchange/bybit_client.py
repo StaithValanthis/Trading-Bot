@@ -133,6 +133,49 @@ class BybitClient:
             self.logger.error(f"Error fetching OHLCV for {symbol}: {e}")
             raise
     
+    def test_connection(self) -> bool:
+        """
+        Test connection and validate API credentials.
+        
+        Returns:
+            True if credentials are valid, False otherwise
+            
+        Raises:
+            AuthenticationError: If credentials are invalid or missing
+        """
+        try:
+            if self.paper_mode:
+                # No credentials needed in paper mode
+                return True
+            
+            # Check if credentials are provided
+            if not self.config.api_key or not self.config.api_secret:
+                raise ccxt.AuthenticationError(
+                    "API credentials are missing. Please set BYBIT_API_KEY and BYBIT_API_SECRET "
+                    "in your .env file or config.yaml"
+                )
+            
+            # Test with a simple API call that requires authentication
+            time.sleep(self.exchange.rateLimit / 1000)
+            self._call_with_retries(self.exchange.fetch_balance, {"type": "swap"})
+            self.logger.info("Connection test successful - API credentials are valid")
+            return True
+            
+        except ccxt.AuthenticationError as e:
+            error_msg = (
+                f"Authentication failed: {e}\n"
+                "Please verify:\n"
+                "  1. BYBIT_API_KEY and BYBIT_API_SECRET are set in .env file\n"
+                "  2. API keys are valid and not expired\n"
+                "  3. API keys have proper permissions (read account, trade)\n"
+                "  4. If using testnet, ensure keys are for testnet environment"
+            )
+            self.logger.error(error_msg)
+            raise ccxt.AuthenticationError(error_msg) from e
+        except Exception as e:
+            self.logger.error(f"Connection test failed: {e}")
+            raise
+    
     def fetch_balance(self) -> Dict:
         """
         Fetch account balance.
@@ -152,6 +195,12 @@ class BybitClient:
             balance = self._call_with_retries(self.exchange.fetch_balance, {"type": "swap"})
             return balance
             
+        except ccxt.AuthenticationError as e:
+            self.logger.error(
+                f"Authentication error in fetch_balance: {e}\n"
+                "This may indicate your API credentials expired or were revoked."
+            )
+            raise
         except Exception as e:
             self.logger.error(f"Error fetching balance: {e}")
             raise

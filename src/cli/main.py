@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from datetime import datetime, timezone, date, timedelta
 from typing import Optional
+import ccxt
 
 from ..config import BotConfig
 from ..logging_utils import setup_logging, get_logger
@@ -171,8 +172,36 @@ def run_live(config_path: str):
         config.logging.backup_count
     )
     
-    # Initialize components
+    # Validate API credentials early
+    if config.exchange.mode != "paper":
+        if not config.exchange.api_key or not config.exchange.api_secret:
+            logger.error(
+                "API credentials are missing!\n"
+                "Please set BYBIT_API_KEY and BYBIT_API_SECRET in:\n"
+                "  1. .env file in the project root (recommended), or\n"
+                "  2. config.yaml under exchange.api_key and exchange.api_secret\n"
+                "\n"
+                "If running via systemd, ensure the .env file exists and contains:\n"
+                "  BYBIT_API_KEY=your_api_key_here\n"
+                "  BYBIT_API_SECRET=your_api_secret_here"
+            )
+            sys.exit(1)
+    
+    # Initialize exchange client
     exchange = BybitClient(config.exchange)
+    
+    # Test connection and validate credentials before proceeding
+    try:
+        exchange.test_connection()
+    except Exception as e:
+        logger.error(
+            f"Failed to connect to Bybit exchange: {e}\n"
+            "The bot cannot start without valid API credentials.\n"
+            "Please fix your API credentials and try again."
+        )
+        sys.exit(1)
+    
+    # Initialize remaining components
     store = OHLCVStore(config.data.db_path)
     downloader = DataDownloader(exchange, store)
     portfolio = PortfolioState(exchange)
@@ -214,6 +243,13 @@ def run_live(config_path: str):
             try:
                 # Update portfolio state
                 portfolio.update()
+            except ccxt.AuthenticationError as e:
+                # Authentication errors are fatal - stop the bot
+                logger.critical(
+                    f"Authentication error during trading loop: {e}\n"
+                    "The bot will stop. Please check your API credentials and restart."
+                )
+                sys.exit(1)
                 
                 # Check daily loss limits
                 can_trade, loss_reason = portfolio_limits.check_daily_loss_limits(
