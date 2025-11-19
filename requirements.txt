@@ -1,0 +1,16 @@
+# Core dependencies
+ccxt>=4.1.0
+pyyaml>=6.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+
+# Data & computation
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Database
+# SQLite is built-in, no extra package needed
+
+# Optional but useful
+scipy>=1.11.0  # For statistical functions in optimizer
+

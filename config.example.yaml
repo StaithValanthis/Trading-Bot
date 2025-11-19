@@ -1,0 +1,204 @@
+# Bybit Trading Bot Configuration Example
+# Copy this to config.yaml and fill in your values
+# Secrets (API keys, webhook URL) should be in .env file
+
+# Exchange settings
+exchange:
+  name: bybit
+  # Account type: testnet or mainnet (mainnet for production)
+  testnet: true
+  # Mode: paper (simulate only, no real orders), testnet, or live
+  # IMPORTANT: Set to 'live' only when you want real trading!
+  mode: testnet
+  # API keys should be in .env file:
+  # BYBIT_API_KEY=your_key_here
+  # BYBIT_API_SECRET=your_secret_here
+  # API keys are loaded from environment variables
+  symbols:
+    - BTCUSDT
+    - ETHUSDT
+    - SOLUSDT
+    - BNBUSDT
+    - ADAUSDT
+  # Trading timeframe (1h recommended for retail latency)
+  timeframe: 1h
+
+# Strategy parameters
+strategy:
+  # Sleeve A: Time-series trend-following
+  trend:
+    # Short moving average period (bars)
+    ma_short: 20
+    # Long moving average period (bars)
+    ma_long: 100
+    # Momentum lookback (bars, e.g. 24 = 24 hours)
+    momentum_lookback: 24
+    # ATR multiplier for stop-loss distance
+    atr_stop_multiplier: 2.5
+    # ATR lookback for volatility calculation
+    atr_period: 14
+    # Minimum ATR filter: skip trades if ATR < min_atr_threshold * price
+    min_atr_threshold: 0.001  # 0.1% of price
+    
+  # Sleeve B: Cross-sectional momentum overlay
+  cross_sectional:
+    # Ranking window (bars, e.g. 72 = 3 days of 1h bars)
+    ranking_window: 72
+    # Number of top symbols to trade
+    top_k: 3
+    # Rebalance frequency in hours (e.g. 4 = every 4 hours)
+    rebalance_frequency_hours: 4
+    # Only trade symbols that also have positive time-series trend
+    require_trend_alignment: true
+    
+  # Sleeve C: Funding-rate bias overlay
+  funding_bias:
+    # Minimum absolute funding rate to apply bias (e.g. 0.0005 = 0.05% per 8h)
+    min_funding_threshold: 0.0005
+    # If funding is positive and we'd go long, reduce size by this factor
+    positive_funding_size_reduction: 0.5
+    # If funding is negative and we'd go long, allow slightly larger size (capped)
+    negative_funding_size_boost: 1.2
+    # Max boost factor (safety cap)
+    max_boost_factor: 1.5
+
+# Risk management
+risk:
+  # Per-trade risk as fraction of equity (e.g. 0.005 = 0.5%)
+  per_trade_risk_fraction: 0.005
+  # Maximum gross leverage (sum of |notional| / equity)
+  max_leverage: 3.0
+  # Maximum % of equity in any single symbol (notional)
+  max_symbol_fraction: 0.30
+  # Maximum number of concurrent open positions
+  max_positions: 5
+  # Soft daily loss cap: reduce risk after this loss (% of equity)
+  daily_soft_loss_pct: -2.0
+  # Hard daily loss cap: stop trading after this loss (% of equity)
+  daily_hard_loss_pct: -4.0
+  # Fractional Kelly aggressiveness (0.0-1.0, 0.5 = half-Kelly)
+  kelly_fraction: 0.5
+  # Advanced: approximate minimum liquidation distance as 100 / effective_leverage >= this value.
+  # This is a conservative check based on gross leverage only (not exact exchange liquidation math).
+  min_liquidation_distance_pct: 5.0
+
+# Data & backtest settings
+data:
+  # Number of bars to fetch for signal calculation
+  lookback_bars: 500
+  # Database file path
+  db_path: data/trading_bot.db
+
+# Universe selection
+universe:
+  # Liquidity filters
+  # Minimum 24h notional volume for entry ($10M USDT default)
+  min_24h_volume_entry: 10_000_000
+  # Minimum 24h volume to stay in universe ($7M USDT default, hysteresis)
+  min_24h_volume_exit: 7_000_000
+  # Number of consecutive days volume must be above threshold
+  volume_check_days: 7
+  # Optional: minimum open interest ($5M USDT, set null to disable)
+  min_open_interest: null
+  # Optional: maximum bid-ask spread in basis points (20 = 0.20%, set null to disable)
+  max_spread_bps: null
+  
+  # Historical data requirements
+  # Minimum days of continuous OHLCV history required
+  min_history_days: 30
+  # Warm-up period: new listings must pass filters for this many days before entry
+  warmup_days: 14
+  # Maximum percentage of missing candles allowed
+  max_data_gap_pct: 5.0
+  # Maximum days since last data update
+  max_days_since_last_update: 7
+  
+  # Volatility & price filters
+  # Minimum price in USDT (reject dust coins)
+  min_price_usdt: 0.01
+  # Maximum annualized realized volatility (%)
+  max_realized_vol_pct: 200.0
+  # Maximum percentage of days with limit-up/limit-down moves
+  # Advanced: currently not enforced in code; reserved for future volatility sanity checks
+  limit_move_frequency_pct: 5.0
+  
+  # Universe stability (hysteresis)
+  # Minimum days symbol must stay in universe before it can be removed
+  min_time_in_universe_days: 7
+  # Maximum percentage of universe that can change per rebalance (20% default)
+  max_turnover_per_rebalance_pct: 20.0
+  
+  # Rebalancing frequency
+  # How often to recompute universe (hours)
+  rebalance_frequency_hours: 24
+  
+  # Override lists
+  # Symbols that are always included (bypass all filters)
+  include_list: [BTCUSDT, ETHUSDT]
+  # Symbols that are never included (always excluded)
+  exclude_list: []
+  
+  # Optional: bucket limits (not implemented yet)
+  # max_symbols_per_bucket: {}
+
+# Optimizer settings
+optimizer:
+  # Number of months of historical data to use
+  lookback_months: 6
+  # Walk-forward window size in days
+  walk_forward_window_days: 30
+  # Minimum number of trades required to consider a parameter set
+  min_trades: 20
+  # Minimum Sharpe ratio to consider updating
+  min_sharpe_ratio: 1.0
+  # Maximum drawdown allowed (%)
+  max_drawdown_pct: -15.0
+  # Parameter search method: grid, random, or bayesian
+  search_method: random
+  # Number of parameter sets to test
+  n_trials: 50
+  # Parameter ranges (if using random/bayesian search)
+  param_ranges:
+    ma_short: [15, 25, 30]
+    ma_long: [80, 100, 120, 150]
+    momentum_lookback: [12, 24, 36, 48]
+    atr_stop_multiplier: [2.0, 2.5, 3.0]
+    top_k: [2, 3, 4, 5]
+
+# Universe optimizer settings (for universe parameter optimization)
+universe_optimizer:
+  # Number of parameter combinations to test (default: 200)
+  n_combinations: 200
+  # Search method: random or grid
+  search_method: random
+  # Default backtest period (if not specified via CLI)
+  default_start_date: "2023-01-01"
+  default_end_date: "2024-01-01"
+  # Constraint thresholds
+  min_avg_universe_size: 10
+  max_avg_universe_size: 100
+  max_universe_turnover_pct: 50.0
+  max_drawdown_pct: -30.0
+  min_total_trades: 50
+  min_win_rate: 0.35
+
+# Reporting
+reporting:
+  # Discord webhook URL (should be in .env: DISCORD_WEBHOOK_URL=...)
+  # discord_webhook_url: loaded from .env
+  # Daily report time (UTC, HH:MM format)
+  report_time_utc: "09:00"
+  # Include detailed strategy breakdown in report
+  include_strategy_breakdown: true
+
+# Logging
+logging:
+  # Log level: DEBUG, INFO, WARNING, ERROR
+  level: INFO
+  # Log directory
+  log_dir: logs
+  # Max log file size in MB before rotation
+  max_log_size_mb: 10
+  # Number of backup log files to keep
+  backup_count: 5
+

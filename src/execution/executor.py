@@ -1,0 +1,291 @@
+"""Order execution logic."""
+
+import time
+from typing import Dict, Optional, List
+from datetime import datetime, timezone
+
+from ..exchange.bybit_client import BybitClient
+from ..state.portfolio import PortfolioState
+from ..data.trades_store import TradesStore, TradeRecord
+from ..data.orders_store import OrdersStore, OrderRecord
+from ..logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+
+class OrderExecutor:
+    """Execute trading orders."""
+
+    def __init__(
+        self,
+        exchange_client: BybitClient,
+        trades_store: Optional[TradesStore] = None,
+        orders_store: Optional[OrdersStore] = None,
+    ):
+        """
+        Initialize order executor.
+
+        Args:
+            exchange_client: Exchange client
+            trades_store: Optional trades store for logging closed trades
+        """
+        self.exchange = exchange_client
+        self.trades_store = trades_store
+        self.orders_store = orders_store
+        self.logger = get_logger(__name__)
+        self.recent_orders: Dict[str, float] = {}  # symbol -> last order timestamp
+    
+    def execute_position_change(
+        self,
+        symbol: str,
+        target_size: float,  # Target position size in contracts (can be negative for short)
+        entry_price: float,
+        stop_loss_price: Optional[float] = None,
+        signal: str = 'long'  # 'long' or 'short'
+    ) -> Dict:
+        """
+        Execute a position change to reach target size.
+        
+        Args:
+            symbol: Trading pair symbol
+            target_size: Target position size (positive for long, negative for short)
+            entry_price: Entry price
+            stop_loss_price: Optional stop loss price
+            signal: Signal direction
+        
+        Returns:
+            Dictionary with execution results
+        """
+        # Rate limiting: don't place orders too frequently for same symbol
+        current_time = time.time()
+        last_order_time = self.recent_orders.get(symbol, 0)
+        min_interval = 5.0  # 5 seconds between orders for same symbol
+        
+        if current_time - last_order_time < min_interval:
+            self.logger.warning(
+                f"Rate limit: skipping order for {symbol} "
+                f"(last order {current_time - last_order_time:.1f}s ago)"
+            )
+            return {'status': 'skipped', 'reason': 'rate_limit'}
+        
+        # Determine side and absolute size
+        if target_size > 0:
+            side = 'buy'
+            size = abs(target_size)
+        elif target_size < 0:
+            side = 'sell'
+            size = abs(target_size)
+        else:
+            # target_size == 0, close position
+            return self.close_position(symbol)
+        
+        # Validate order size
+        is_valid, error_msg = self.exchange.validate_order_size(
+            symbol,
+            size,
+            entry_price
+        )
+        
+        if not is_valid:
+            self.logger.warning(f"Invalid order size for {symbol}: {error_msg}")
+            return {'status': 'rejected', 'reason': error_msg}
+        
+        try:
+            # Place market order (can be changed to limit if needed)
+            order = self.exchange.create_order(
+                symbol,
+                side,
+                size,
+                order_type='market',
+                price=None
+            )
+            
+            self.recent_orders[symbol] = current_time
+            
+            self.logger.info(
+                f"Executed {side} order for {symbol}: {size} contracts @ {entry_price}"
+            )
+
+            # Log order execution if store is available
+            if self.orders_store is not None:
+                self.orders_store.log_order(
+                    OrderRecord(
+                        symbol=symbol,
+                        side=side,
+                        size=size,
+                        price=entry_price,
+                        order_type="market",
+                        reason="reconcile",
+                        timestamp=datetime.now(timezone.utc),
+                    )
+                )
+            
+            return {
+                'status': 'filled',
+                'order': order,
+                'symbol': symbol,
+                'side': side,
+                'size': size,
+                'price': entry_price
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error executing order for {symbol}: {e}")
+            return {'status': 'error', 'error': str(e)}
+    
+    def close_position(self, symbol: str) -> Dict:
+        """
+        Close an existing position.
+        
+        Args:
+            symbol: Trading pair symbol
+        
+        Returns:
+            Dictionary with execution results
+        """
+        # Fetch current position
+        positions = self.exchange.fetch_positions(symbol=symbol)
+
+        for pos in positions:
+            if pos.get("symbol") == symbol or pos.get("symbol") == symbol.replace(
+                "USDT", "/USDT"
+            ):
+                contracts = float(pos.get("contracts", 0))
+
+                if abs(contracts) < 0.001:  # Already closed
+                    return {"status": "no_position"}
+
+                # Determine side to close (relative to current position)
+                side = "sell" if contracts > 0 else "buy"
+                size = abs(contracts)
+                entry_price = float(pos.get("entryPrice", 0.0))
+                mark_price = float(pos.get("markPrice", entry_price))
+                position_side = pos.get("side", "long" if contracts > 0 else "short")
+                entry_time_str = pos.get("timestamp") or pos.get("datetime")
+                try:
+                    entry_time = (
+                        datetime.fromisoformat(entry_time_str)
+                        if isinstance(entry_time_str, str)
+                        else datetime.now(timezone.utc)
+                    )
+                except Exception:
+                    entry_time = datetime.now(timezone.utc)
+
+                try:
+                    order = self.exchange.create_order(
+                        symbol,
+                        side,
+                        size,
+                        order_type="market",
+                    )
+
+                    exit_time = datetime.now(timezone.utc)
+                    exit_price = mark_price
+
+                    # Approximate PnL for the round-trip
+                    if position_side == "long":
+                        pnl = (exit_price - entry_price) * size
+                    else:
+                        pnl = (entry_price - exit_price) * size
+
+                    self.logger.info(f"Closed position for {symbol}: {size} contracts")
+
+                    # Log order for close if store available
+                    if self.orders_store is not None:
+                        self.orders_store.log_order(
+                            OrderRecord(
+                                symbol=symbol,
+                                side=side,
+                                size=size,
+                                price=exit_price,
+                                order_type="market",
+                                reason="close_position",
+                                timestamp=exit_time,
+                            )
+                        )
+
+                    # Log trade if store is available
+                    if self.trades_store is not None:
+                        trade = TradeRecord(
+                            symbol=symbol,
+                            side=position_side,
+                            size=size,
+                            entry_price=entry_price,
+                            exit_price=exit_price,
+                            entry_time=entry_time,
+                            exit_time=exit_time,
+                            pnl=pnl,
+                            reason="close_position",
+                        )
+                        self.trades_store.log_trade(trade)
+
+                    return {
+                        "status": "closed",
+                        "order": order,
+                        "symbol": symbol,
+                        "size": size,
+                    }
+
+                except Exception as e:
+                    self.logger.error(f"Error closing position for {symbol}: {e}")
+                    return {"status": "error", "error": str(e)}
+
+        return {"status": "no_position"}
+    
+    def reconcile_positions(
+        self,
+        portfolio_state: PortfolioState,
+        target_positions: Dict[str, Dict]  # symbol -> {size, signal, entry_price, stop_loss}
+    ) -> List[Dict]:
+        """
+        Reconcile current positions with target positions and execute changes.
+        
+        Args:
+            portfolio_state: Current portfolio state
+            target_positions: Dictionary of target positions
+        
+        Returns:
+            List of execution results
+        """
+        results = []
+        
+        # Get current positions
+        current_positions = {}
+        for symbol, pos in portfolio_state.positions.items():
+            contracts = pos.get('contracts', 0)
+            if abs(contracts) > 0.001:
+                current_positions[symbol] = contracts
+        
+        # Close positions not in target
+        for symbol in current_positions:
+            if symbol not in target_positions:
+                result = self.close_position(symbol)
+                results.append(result)
+        
+        # Open or adjust positions
+        for symbol, target in target_positions.items():
+            target_size = target.get('size', 0)
+            current_size = current_positions.get(symbol, 0)
+            
+            # Only execute if size difference is significant (>1% of target or >0.001 contracts)
+            size_diff = abs(target_size - current_size)
+            if size_diff < 0.001 and abs(target_size) < 0.001:
+                # Both are effectively zero, skip
+                continue
+            
+            if size_diff < max(0.001, abs(target_size) * 0.01):
+                # Size difference is small, skip to avoid over-trading
+                continue
+            
+            # Execute position change
+            result = self.execute_position_change(
+                symbol,
+                target_size,
+                target.get('entry_price', 0),
+                target.get('stop_loss'),
+                target.get('signal', 'long')
+            )
+            results.append(result)
+        
+        return results
+
