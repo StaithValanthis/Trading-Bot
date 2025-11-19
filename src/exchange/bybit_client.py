@@ -35,6 +35,9 @@ class BybitClient:
         if config.testnet:
             # CCXT uses testnet when sandbox=True
             exchange_options["sandbox"] = True
+            endpoint_url = "testnet.bybit.com (TESTNET)"
+        else:
+            endpoint_url = "api.bybit.com (LIVE PRODUCTION)"
 
         # Create exchange instance
         exchange_class = getattr(ccxt, config.name)
@@ -53,10 +56,26 @@ class BybitClient:
         key_preview = f"{api_key[:3]}...{api_key[-3:]}" if len(api_key) >= 6 else ("***" if api_key else "MISSING")
         secret_preview = f"{api_secret[:3]}...{api_secret[-3:]}" if len(api_secret) >= 6 else ("***" if api_secret else "MISSING")
         
+        # Critical warning if there's a mismatch
+        if config.mode == "live" and config.testnet:
+            self.logger.error(
+                "⚠️  CONFIGURATION MISMATCH DETECTED ⚠️\n"
+                "  Config has mode='live' but testnet=true!\n"
+                "  The bot will connect to TESTNET, but you likely want LIVE.\n"
+                "  Set testnet: false in config.yaml for live trading."
+            )
+        elif config.mode != "paper" and config.mode != "testnet" and not config.testnet:
+            self.logger.warning(
+                "⚠️  Live production mode detected!\n"
+                "  Ensure your API keys are for LIVE Bybit (not testnet).\n"
+                "  Live API keys are created at bybit.com (not testnet.bybit.com)."
+            )
+        
         self.logger.info(
-            f"Initializing CCXT exchange - API key: {api_key_present} ({key_len} chars, preview: {key_preview}), "
-            f"Secret: {api_secret_present} ({secret_len} chars, preview: {secret_preview}), "
-            f"Testnet: {config.testnet}, Mode: {config.mode}"
+            f"Initializing CCXT exchange - Endpoint: {endpoint_url}\n"
+            f"  API key: {api_key_present} ({key_len} chars, preview: {key_preview})\n"
+            f"  Secret: {api_secret_present} ({secret_len} chars, preview: {secret_preview})\n"
+            f"  Config testnet: {config.testnet}, mode: {config.mode}, sandbox: {exchange_options.get('sandbox', False)}"
         )
         
         if not api_key_present or not api_secret_present:
@@ -191,9 +210,43 @@ class BybitClient:
                     "in your .env file or config.yaml"
                 )
             
+            # Debug: Log what we're about to send to CCXT
+            sandbox_mode = self.exchange.options.get('sandbox', False)
+            endpoint = "testnet.bybit.com" if sandbox_mode else "api.bybit.com (LIVE)"
+            
+            self.logger.info(
+                f"Testing connection to {endpoint}\n"
+                f"  API key length: {len(self.config.api_key)}, Secret length: {len(self.config.api_secret)}\n"
+                f"  Config testnet: {self.config.testnet}, mode: {self.config.mode}, sandbox: {sandbox_mode}\n"
+                f"  CCXT apiKey set: {bool(getattr(self.exchange, 'apiKey', None))}, "
+                f"CCXT secret set: {bool(getattr(self.exchange, 'secret', None))}"
+            )
+            
+            # Final warning before API call
+            if sandbox_mode and self.config.mode == "live":
+                self.logger.error(
+                    "⚠️  CRITICAL: Connecting to TESTNET but mode is 'live'!\n"
+                    "  Your live API keys will be rejected by the testnet endpoint.\n"
+                    "  Set testnet: false in config.yaml and restart."
+                )
+            
             # Test with a simple API call that requires authentication
+            # For Bybit unified account (v5), use params dict correctly
             time.sleep(self.exchange.rateLimit / 1000)
-            self._call_with_retries(self.exchange.fetch_balance, {"type": "swap"})
+            
+            # CCXT fetch_balance for Bybit takes params as a keyword argument
+            # The 'type' parameter should be passed via params, not directly
+            self.logger.info("Calling fetch_balance with params={'type': 'spot'} for testnet compatibility...")
+            
+            # Use _call_with_retries but pass params correctly as keyword argument
+            try:
+                # Try spot first (works on both testnet and live for unified account)
+                balance = self._call_with_retries(self.exchange.fetch_balance, params={'type': 'spot'})
+            except (ccxt.ExchangeError, ccxt.AuthenticationError) as e:
+                # If spot fails, try swap for derivatives account
+                self.logger.debug(f"Spot balance fetch failed: {e}, trying swap...")
+                balance = self._call_with_retries(self.exchange.fetch_balance, params={'type': 'swap'})
+            
             self.logger.info("Connection test successful - API credentials are valid")
             return True
             
@@ -227,8 +280,26 @@ class BybitClient:
                     "info": {},
                 }
             
+            # Debug logging before API call
+            self.logger.debug(
+                f"fetch_balance called - Testnet: {self.config.testnet}, "
+                f"Sandbox option: {self.exchange.options.get('sandbox', False)}, "
+                f"API key present: {bool(getattr(self.exchange, 'apiKey', None))}"
+            )
+            
             time.sleep(self.exchange.rateLimit / 1000)
-            balance = self._call_with_retries(self.exchange.fetch_balance, {"type": "swap"})
+            
+            # For Bybit unified margin, we want the swap account balance
+            # CCXT's fetch_balance for Bybit accepts params dict
+            # Use 'spot' for unified account, or try 'swap' for perps
+            try:
+                # Try unified account first (works for both spot and derivatives)
+                balance = self._call_with_retries(self.exchange.fetch_balance, params={'type': 'spot'})
+            except (ccxt.ExchangeError, ccxt.AuthenticationError) as e:
+                # If spot fails, try swap for derivatives account
+                self.logger.debug(f"Spot balance fetch failed: {e}, trying swap...")
+                balance = self._call_with_retries(self.exchange.fetch_balance, params={'type': 'swap'})
+            
             return balance
             
         except ccxt.AuthenticationError as e:

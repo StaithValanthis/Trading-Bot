@@ -176,15 +176,35 @@ def run_live(config_path: str):
     if config.exchange.mode != "paper":
         # Debug: Check if env vars are loaded (without exposing values)
         import os
-        env_key_present = bool(os.getenv("BYBIT_API_KEY"))
-        env_secret_present = bool(os.getenv("BYBIT_API_SECRET"))
+        env_key_raw = os.getenv("BYBIT_API_KEY", "")
+        env_secret_raw = os.getenv("BYBIT_API_SECRET", "")
+        env_key_present = bool(env_key_raw)
+        env_secret_present = bool(env_secret_raw)
         config_key_present = bool(config.exchange.api_key)
         config_secret_present = bool(config.exchange.api_secret)
         
+        # Show preview without exposing full keys
+        env_key_preview = f"{env_key_raw[:3]}...{env_key_raw[-3:]}" if len(env_key_raw) >= 6 else "MISSING"
+        config_key_preview = f"{config.exchange.api_key[:3]}...{config.exchange.api_key[-3:]}" if config.exchange.api_key and len(config.exchange.api_key) >= 6 else "MISSING"
+        
         logger.info(
-            f"Credential check - ENV key present: {env_key_present}, ENV secret present: {env_secret_present}, "
-            f"Config key present: {config_key_present}, Config secret present: {config_secret_present}"
+            f"Credential check - ENV key: {env_key_present} (preview: {env_key_preview}, len: {len(env_key_raw)}), "
+            f"ENV secret: {env_secret_present} (len: {len(env_secret_raw)}), "
+            f"Config key: {config_key_present} (preview: {config_key_preview}, len: {len(config.exchange.api_key) if config.exchange.api_key else 0}), "
+            f"Config secret: {config_secret_present} (len: {len(config.exchange.api_secret) if config.exchange.api_secret else 0})"
         )
+        
+        # Critical check: if env vars exist but config doesn't have them, something is wrong
+        if env_key_present and not config_key_present:
+            logger.error(
+                "CRITICAL: BYBIT_API_KEY found in environment but NOT loaded into config! "
+                "This indicates a bug in config loading."
+            )
+        if env_secret_present and not config_secret_present:
+            logger.error(
+                "CRITICAL: BYBIT_API_SECRET found in environment but NOT loaded into config! "
+                "This indicates a bug in config loading."
+            )
         
         if not config.exchange.api_key or not config.exchange.api_secret:
             logger.error(
