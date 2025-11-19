@@ -58,7 +58,6 @@ class ExchangeConfig:
         # This is a fallback for cases where module-level load_dotenv() didn't work
         if not env_key_present or not env_secret_present:
             # Try loading from explicit paths
-            import os
             cwd = os.getcwd()
             env_paths = [
                 os.path.join(cwd, ".env"),
