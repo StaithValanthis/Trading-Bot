@@ -471,7 +471,7 @@ EOF
     
     # Verify Python entry point works
     info "Testing Python entry point..."
-    if "$VENV_DIR/bin/python" -m src.main --help &>/dev/null; then
+    if (cd "$BOT_DIR" && "$VENV_DIR/bin/python" -m src.main --help &>/dev/null); then
         info "✓ Entry point verified (CLI works)"
     else
         warn "Entry point test failed. CLI may not work correctly."

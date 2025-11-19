@@ -2,7 +2,7 @@
 
 import pandas as pd
 import numpy as np
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from ..config import CrossSectionalStrategyConfig
 from ..logging_utils import get_logger
