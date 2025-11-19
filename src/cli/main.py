@@ -5,6 +5,7 @@ import sys
 import time
 from pathlib import Path
 from datetime import datetime, timezone, date, timedelta
+from typing import Optional
 
 from ..config import BotConfig
 from ..logging_utils import setup_logging, get_logger
