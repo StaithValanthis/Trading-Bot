@@ -616,7 +616,9 @@ class UniverseSelector:
                     }
         
         # Apply turnover control
-        if self.config.max_turnover_per_rebalance_pct > 0:
+        # NOTE: When there is no existing universe (first build), we allow all eligible additions.
+        # Turnover limiting only makes sense once we already have a non-empty universe.
+        if self.config.max_turnover_per_rebalance_pct > 0 and current_universe:
             max_changes = max(1, int(len(current_universe) * self.config.max_turnover_per_rebalance_pct / 100))
             
             additions = [s for s, c in changes.items() if c['action'] == 'added']
