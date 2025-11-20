@@ -740,7 +740,7 @@ class BybitClient:
                         'min': market.get('limits', {}).get('cost', {}).get('min', 0),
                     },
                 },
-                'contractSize': market.get('contractSize', 1.0),
+                'contractSize': market.get('contractSize') or 1.0,
             }
             
         except Exception as e:
@@ -752,17 +752,47 @@ class BybitClient:
                 'contractSize': 1.0,
             }
     
+    def _precision_to_decimals(self, precision: Any) -> int:
+        """
+        Convert precision (int or float/tick size) to number of decimal places.
+        
+        Args:
+            precision: Can be an int (decimal places) or float (tick size like 0.1, 0.01)
+        
+        Returns:
+            Integer number of decimal places
+        """
+        if isinstance(precision, int):
+            return precision
+        elif isinstance(precision, float):
+            # If precision is a tick size (e.g., 0.1, 0.01, 0.001), convert to decimal places
+            if precision >= 1.0:
+                return int(precision)
+            # Count decimal places by converting to string
+            precision_str = str(precision).rstrip('0').rstrip('.')
+            if '.' in precision_str:
+                return len(precision_str.split('.')[1])
+            return 0
+        else:
+            # Fallback: try to convert to int
+            try:
+                return int(precision)
+            except (ValueError, TypeError):
+                return 8  # Default to 8 decimal places for amounts
+    
     def round_amount(self, symbol: str, amount: float) -> float:
         """Round amount to exchange precision."""
         market_info = self.get_market_info(symbol)
         precision = market_info['precision']['amount']
-        return round(amount, precision)
+        decimals = self._precision_to_decimals(precision)
+        return round(amount, decimals)
     
     def round_price(self, symbol: str, price: float) -> float:
         """Round price to exchange precision."""
         market_info = self.get_market_info(symbol)
         precision = market_info['precision']['price']
-        return round(price, precision)
+        decimals = self._precision_to_decimals(precision)
+        return round(price, decimals)
     
     def validate_order_size(self, symbol: str, amount: float, price: float) -> Tuple[bool, Optional[str]]:
         """

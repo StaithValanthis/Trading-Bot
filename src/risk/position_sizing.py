@@ -63,7 +63,10 @@ class PositionSizer:
         
         # Get market info
         market_info = self.exchange.get_market_info(symbol)
-        contract_size = market_info.get('contractSize', 1.0)
+        contract_size = market_info.get('contractSize') or 1.0
+        
+        if contract_size is None or contract_size <= 0:
+            return 0.0, f"Invalid contract size for {symbol}: {contract_size}"
         
         # Calculate position size in contracts
         # Risk = (entry - stop) * contracts * contract_size
