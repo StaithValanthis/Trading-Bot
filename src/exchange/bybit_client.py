@@ -574,6 +574,7 @@ class BybitClient:
                     "Attempting direct Bybit v5 API call..."
                 )
                 # Use Bybit v5 API directly for conditional orders
+                # Fall back to direct API call since CCXT doesn't support conditional orders
                 order = self._create_stop_order_v5_api(
                     symbol, side, amount, trigger_price, order_type, limit_price, reduce_only
                 )
@@ -647,25 +648,32 @@ class BybitClient:
         # Build request parameters
         timestamp = str(int(time.time() * 1000))
         
+        # Build parameters matching Bybit v5 API format
+        # CRITICAL: All numeric values (qty, triggerPrice, price) must be strings
+        # Boolean values (reduceOnly) must be boolean (JSON will serialize as true/false)
+        # Integer values (positionIdx) must be integers (JSON will serialize as numbers)
         params = {
             "category": "linear",  # USDT-margined perpetuals
             "symbol": bybit_symbol,
-            "side": side.capitalize(),  # Buy or Sell
-            "orderType": "Market" if order_type == "market" else "Limit",
-            "qty": str(amount),
-            "positionIdx": 0,  # One-way mode
-            "reduceOnly": reduce_only,
-            "stopOrderType": "StopMarket" if order_type == "market" else "StopLimit",
-            "triggerPrice": str(trigger_price),
+            "side": side.capitalize(),  # Buy or Sell (capitalized)
+            "orderType": "Market" if order_type == "market" else "Limit",  # Capitalized
+            "qty": str(amount),  # Must be string
+            "positionIdx": 0,  # One-way mode (integer, 0 = One-way, 1 = Buy side hedge, 2 = Sell side hedge)
+            "reduceOnly": bool(reduce_only),  # Boolean (will serialize as true/false)
+            "stopOrderType": "StopMarket" if order_type == "market" else "StopLimit",  # Capitalized
+            "triggerPrice": str(trigger_price),  # Must be string
         }
         
         if order_type == "limit" and limit_price:
-            params["price"] = str(limit_price)
+            params["price"] = str(limit_price)  # Must be string
         
-        # Build query string for signing (sort keys alphabetically)
-        # For POST with JSON body, use query string format for signature
-        query_string = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
-        recv_window = "5000"
+        # Log parameters for debugging (without exposing full amounts)
+        self.logger.debug(
+            f"Bybit v5 stop order params: category={params['category']}, "
+            f"symbol={params['symbol']}, side={params['side']}, "
+            f"orderType={params['orderType']}, stopOrderType={params['stopOrderType']}, "
+            f"positionIdx={params['positionIdx']}, reduceOnly={params['reduceOnly']}"
+        )
         
         # Get credentials (ensure they're stripped, same as in __init__)
         api_key = (self.config.api_key or "").strip()
@@ -674,15 +682,53 @@ class BybitClient:
         if not api_key or not api_secret:
             raise ccxt.AuthenticationError("API credentials missing or empty in config")
         
-        # Bybit v5 signature for POST: timestamp + api_key + recv_window + query_string
-        param_str = f"{timestamp}{api_key}{recv_window}{query_string}"
+        recv_window = "5000"
+        
+        # For Bybit v5 POST requests with JSON body:
+        # Signature string = timestamp + api_key + recv_window + JSON_string
+        # JSON string must have sorted keys and NO spaces (compact JSON)
+        # CRITICAL: The JSON string used for signature MUST match exactly what's sent in the request body
+        
+        # Create compact JSON string (no spaces, sorted keys)
+        # IMPORTANT: For Bybit v5 POST requests, the signature must use the EXACT JSON string
+        # that will be sent in the request body. This string must:
+        # - Have keys sorted alphabetically (sort_keys=True)
+        # - Have NO spaces (separators=(',', ':'))
+        # - Match EXACTLY what gets sent in the HTTP body
+        # CRITICAL: Use ensure_ascii=True (default) to match Bybit's expectations
+        # Use sort_keys=True to ensure consistent alphabetical ordering
+        json_string = json.dumps(params, separators=(',', ':'), sort_keys=True, ensure_ascii=True)
+        
+        # Debug: Log the JSON string for troubleshooting (without exposing full secrets)
+        self.logger.debug(f"Bybit v5 API request JSON (length={len(json_string)}): {json_string}")
+        
+        # Build signature string: timestamp + api_key + recv_window + json_string
+        # CRITICAL: Use explicit string concatenation to avoid any f-string formatting issues
+        # All components must be strings
+        param_str = str(timestamp) + str(api_key) + str(recv_window) + json_string
+        
+        self.logger.debug(
+            f"Signature string components: "
+            f"timestamp={timestamp} (len={len(str(timestamp))}), "
+            f"api_key_len={len(api_key)}, "
+            f"recv_window={recv_window}, "
+            f"json_len={len(json_string)}, "
+            f"total_param_str_len={len(param_str)}"
+        )
         
         # Generate signature (HMAC-SHA256)
-        signature = hmac.new(
-            api_secret.encode("utf-8"),
-            param_str.encode("utf-8"),
+        # CRITICAL: Both secret and param_str must be UTF-8 encoded bytes
+        param_str_bytes = param_str.encode("utf-8")
+        api_secret_bytes = api_secret.encode("utf-8")
+        
+        signature_bytes = hmac.new(
+            api_secret_bytes,
+            param_str_bytes,
             hashlib.sha256
-        ).hexdigest()
+        ).digest()
+        signature = signature_bytes.hex()
+        
+        self.logger.debug(f"Generated signature (hex, len={len(signature)}): {signature[:16]}...{signature[-8:]}")
         
         # Prepare headers
         headers = {
@@ -695,14 +741,34 @@ class BybitClient:
         }
         
         # Make request
+        # CRITICAL: Send the exact same JSON string used in signature calculation
+        # Use data= with the JSON string directly, not json= which auto-serializes
         try:
-            response = requests.post(url, json=params, headers=headers, timeout=10)
+            response = requests.post(url, data=json_string.encode('utf-8'), headers=headers, timeout=10)
             response.raise_for_status()
             result = response.json()
             
             if result.get("retCode") != 0:
                 error_msg = result.get("retMsg", "Unknown error")
-                raise ccxt.ExchangeError(f"Bybit API error: {error_msg}")
+                error_code = result.get("retCode", "unknown")
+                
+                # Enhanced error logging for signature errors
+                if "error sign" in error_msg.lower() or error_code == 10004:
+                    self.logger.error(
+                        f"Signature error details:\n"
+                        f"  Error code: {error_code}\n"
+                        f"  Error message: {error_msg}\n"
+                        f"  Request URL: {url}\n"
+                        f"  Request JSON: {json_string}\n"
+                        f"  Timestamp: {timestamp}\n"
+                        f"  Recv window: {recv_window}\n"
+                        f"  API key length: {len(api_key)}\n"
+                        f"  Signature string length: {len(param_str)}\n"
+                        f"  This indicates the signature calculation doesn't match Bybit's expectations.\n"
+                        f"  Check that: timestamp + api_key + recv_window + json_string matches Bybit's format."
+                    )
+                
+                raise ccxt.ExchangeError(f"Bybit API error (code {error_code}): {error_msg}")
             
             order_data = result.get("result", {})
             order_id = order_data.get("orderId", "")
