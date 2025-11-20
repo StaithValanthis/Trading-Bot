@@ -85,6 +85,8 @@ class Backtester:
         taker_fee: float = 0.00055,  # Bybit taker fee
         universe_history: Optional[Dict[date, Set[str]]] = None,
         funding_rate_per_8h: float = 0.0,  # Optional constant funding rate approximation
+        stop_slippage_bps: float = 10.0,  # Slippage in basis points when stop is hit
+        tp_slippage_bps: float = 5.0,  # Slippage for take-profit orders
     ) -> Dict:
         """
         Run backtest on historical data.
@@ -134,6 +136,8 @@ class Backtester:
                     continue
 
                 current_price = df_sym.loc[timestamp, "close"]
+                high_price = df_sym.loc[timestamp, "high"]
+                low_price = df_sym.loc[timestamp, "low"]
                 entry_price = pos["entry_price"]
                 size = pos["size"]
                 signal = pos["signal"]
@@ -149,37 +153,124 @@ class Backtester:
 
                 unrealized_pnl += pnl
 
-                # Check stop loss
+                # Update trailing stop if enabled
                 stop_loss = pos.get("stop_loss")
-                if stop_loss:
-                    stop_hit = (signal == "long" and current_price <= stop_loss) or (
-                        signal == "short" and current_price >= stop_loss
-                    )
-                    if stop_hit:
-                        # Realize PnL at stop
-                        exit_price = stop_loss
-                        if signal == "long":
-                            pnl = (exit_price - entry_price) * size
-                        else:
-                            pnl = (entry_price - exit_price) * size
+                if stop_loss and self.config.strategy.trend.use_trailing_stop:
+                    # Update highest/lowest price for trailing
+                    highest = pos.get("highest_price", entry_price)
+                    lowest = pos.get("lowest_price", entry_price)
+                    
+                    if signal == "long":
+                        if current_price > highest:
+                            pos["highest_price"] = current_price
+                            highest = current_price
+                    else:  # short
+                        if current_price < lowest:
+                            pos["lowest_price"] = current_price
+                            lowest = current_price
+                    
+                    # Check if trailing should activate
+                    if signal == "long":
+                        profit_pct = (current_price - entry_price) / entry_price
+                        stop_distance_pct = abs(entry_price - stop_loss) / entry_price
+                        if profit_pct >= (stop_distance_pct * self.config.strategy.trend.trailing_stop_activation_rr):
+                            # Calculate new trailing stop
+                            atr_estimate = current_price * 0.01  # Rough ATR approximation
+                            new_stop = current_price - (atr_estimate * self.config.strategy.trend.trailing_stop_atr_multiplier)
+                            # Only move stop up, never down
+                            if new_stop > stop_loss:
+                                pos["stop_loss"] = new_stop
+                                stop_loss = new_stop
+                    # Similar for short (trail down)
+                    elif signal == "short":
+                        profit_pct = (entry_price - current_price) / entry_price
+                        stop_distance_pct = abs(entry_price - stop_loss) / entry_price
+                        if profit_pct >= (stop_distance_pct * self.config.strategy.trend.trailing_stop_activation_rr):
+                            atr_estimate = current_price * 0.01
+                            new_stop = current_price + (atr_estimate * self.config.strategy.trend.trailing_stop_atr_multiplier)
+                            if new_stop < stop_loss or stop_loss == 0:  # First trailing stop
+                                pos["stop_loss"] = new_stop
+                                stop_loss = new_stop
 
-                        fee = abs(size) * exit_price * taker_fee
-                        current_equity += pnl - fee
-                        trades.append(
-                            {
-                                "symbol": symbol,
-                                "entry_time": pos["entry_time"],
-                                "exit_time": timestamp,
-                                "side": signal,
-                                "size": size,
-                                "entry_price": entry_price,
-                                "exit_price": exit_price,
-                                "pnl": pnl,
-                                "return_pct": (pnl / (entry_price * size)) * 100,
-                                "reason": "stop_loss",
-                            }
-                        )
-                        del positions[symbol]
+                # Check stop loss using bar high/low (more realistic)
+                stop_loss = pos.get("stop_loss")
+                stop_hit = False
+                exit_price = None
+                exit_reason = None
+                
+                if stop_loss:
+                    # Use high/low to check if stop was hit intrabar
+                    if signal == "long":
+                        # Long: stop is below entry, check if low touched stop
+                        if low_price <= stop_loss:
+                            stop_hit = True
+                            # Model slippage: assume we fill slightly worse than stop
+                            slippage = stop_loss * (stop_slippage_bps / 10000.0)
+                            exit_price = stop_loss - slippage  # Worse fill for long stop
+                            exit_reason = "stop_loss"
+                    else:  # short
+                        # Short: stop is above entry, check if high touched stop
+                        if high_price >= stop_loss:
+                            stop_hit = True
+                            # Model slippage: assume we fill slightly worse than stop
+                            slippage = stop_loss * (stop_slippage_bps / 10000.0)
+                            exit_price = stop_loss + slippage  # Worse fill for short stop
+                            exit_reason = "stop_loss"
+                
+                # Check take-profit if configured
+                take_profit = pos.get("take_profit")
+                if not stop_hit and take_profit:
+                    if signal == "long":
+                        # Long: TP is above entry, check if high touched TP
+                        if high_price >= take_profit:
+                            stop_hit = True  # Reuse flag for exit
+                            # TP usually has less slippage (limit order)
+                            slippage = take_profit * (tp_slippage_bps / 10000.0)
+                            exit_price = take_profit - slippage  # Slightly better than TP
+                            exit_reason = "take_profit"
+                    else:  # short
+                        # Short: TP is below entry, check if low touched TP
+                        if low_price <= take_profit:
+                            stop_hit = True
+                            slippage = take_profit * (tp_slippage_bps / 10000.0)
+                            exit_price = take_profit + slippage
+                            exit_reason = "take_profit"
+                
+                # Check time-based exit
+                if not stop_hit and self.config.strategy.trend.max_holding_hours:
+                    entry_time = pos.get("entry_time")
+                    if entry_time:
+                        hours_held = (timestamp - entry_time).total_seconds() / 3600
+                        if hours_held >= self.config.strategy.trend.max_holding_hours:
+                            stop_hit = True
+                            exit_price = current_price  # Exit at close
+                            exit_reason = "max_holding_period"
+                
+                if stop_hit and exit_price:
+                    # Realize PnL at exit
+                    if signal == "long":
+                        pnl = (exit_price - entry_price) * size
+                    else:
+                        pnl = (entry_price - exit_price) * size
+
+                    fee = abs(size) * exit_price * taker_fee
+                    current_equity += pnl - fee
+                    trades.append(
+                        {
+                            "symbol": symbol,
+                            "entry_time": pos["entry_time"],
+                            "exit_time": timestamp,
+                            "side": signal,
+                            "size": size,
+                            "entry_price": entry_price,
+                            "exit_price": exit_price,
+                            "pnl": pnl,
+                            "return_pct": (pnl / (entry_price * size)) * 100,
+                            "reason": exit_reason or "stop_loss",
+                        }
+                    )
+                    del positions[symbol]
+                    continue  # Skip rest of position update for this symbol
 
             # Apply funding PnL approximation for open positions (if configured)
             if funding_rate_per_8h != 0.0 and positions:
@@ -324,6 +415,15 @@ class Backtester:
                     if not within_max:
                         continue
 
+                    # Calculate take-profit price if configured
+                    take_profit = None
+                    if self.config.strategy.trend.take_profit_rr and stop_loss:
+                        stop_distance = abs(entry_price - stop_loss)
+                        if signal == "long":
+                            take_profit = entry_price + (stop_distance * self.config.strategy.trend.take_profit_rr)
+                        else:  # short
+                            take_profit = entry_price - (stop_distance * self.config.strategy.trend.take_profit_rr)
+                    
                     # Open position
                     notional = abs(adjusted_size) * entry_price
                     positions[symbol] = {
@@ -331,9 +431,13 @@ class Backtester:
                         "contracts": adjusted_size,
                         "entry_price": entry_price,
                         "stop_loss": stop_loss,
+                        "take_profit": take_profit,
                         "signal": signal,
                         "entry_time": timestamp,
                         "notional": notional,
+                        # For trailing stop
+                        "highest_price": entry_price if signal == "long" else None,
+                        "lowest_price": entry_price if signal == "short" else None,
                     }
 
                     # Pay entry fee

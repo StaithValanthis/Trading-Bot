@@ -111,6 +111,14 @@ class TrendStrategyConfig:
     atr_stop_multiplier: float = 2.5
     atr_period: int = 14
     min_atr_threshold: float = 0.001
+    # Position management
+    max_holding_hours: Optional[int] = None  # Optional time-based exit (None = no limit)
+    # Take-profit (optional, None = no TP, let winners run)
+    take_profit_rr: Optional[float] = None  # Risk-reward multiple (e.g., 2.0 = TP at 2x SL distance)
+    # Trailing stop (optional)
+    use_trailing_stop: bool = False
+    trailing_stop_atr_multiplier: float = 1.5  # Trailing stop distance (ATR multiplier)
+    trailing_stop_activation_rr: float = 1.0  # Activate trailing after this RR profit (e.g., 1.0 = break-even)
 
 
 @dataclass
@@ -152,6 +160,12 @@ class RiskConfig:
     # Advanced: approximate minimum liquidation distance as 1 / effective leverage.
     # Ensures effective leverage is capped such that 100 / leverage >= min_liquidation_distance_pct.
     min_liquidation_distance_pct: float = 5.0
+    # Stop-loss and take-profit order management
+    use_server_side_stops: bool = True  # Place real stop-loss orders on exchange (mandatory for production)
+    stop_order_type: str = "stop_market"  # "stop_market" or "stop_limit"
+    # Backtest slippage modeling
+    stop_slippage_bps: float = 10.0  # Slippage in basis points when stop is hit (10 bps = 0.1%)
+    tp_slippage_bps: float = 5.0  # Slippage for take-profit orders (usually tighter)
 
 
 @dataclass

@@ -39,6 +39,17 @@ strategy:
     atr_period: 14
     # Minimum ATR filter: skip trades if ATR < min_atr_threshold * price
     min_atr_threshold: 0.001  # 0.1% of price
+    # Position management
+    # Optional: Maximum holding period in hours (null = no limit)
+    # Useful for closing stale positions that haven't moved
+    max_holding_hours: null  # e.g., 168 = 7 days
+    # Optional: Take-profit as risk-reward multiple (null = no TP, let winners run)
+    # e.g., 2.0 = TP at 2x the SL distance from entry
+    take_profit_rr: null  # Recommended: null for trend-following, 2.0-3.0 for mean-reversion
+    # Trailing stop settings
+    use_trailing_stop: false  # Enable trailing stops
+    trailing_stop_atr_multiplier: 1.5  # Trailing stop distance (ATR multiplier)
+    trailing_stop_activation_rr: 1.0  # Activate trailing after this RR profit (e.g., 1.0 = break-even)
     
   # Sleeve B: Cross-sectional momentum overlay
   cross_sectional:
@@ -81,6 +92,14 @@ risk:
   # Advanced: approximate minimum liquidation distance as 100 / effective_leverage >= this value.
   # This is a conservative check based on gross leverage only (not exact exchange liquidation math).
   min_liquidation_distance_pct: 5.0
+  # Stop-loss and take-profit order management
+  # Place real stop-loss orders on exchange (mandatory for production)
+  use_server_side_stops: true
+  # Stop order type: "stop_market" (more robust, higher slippage) or "stop_limit" (risk of not filling)
+  stop_order_type: stop_market
+  # Backtest slippage modeling (basis points)
+  stop_slippage_bps: 10.0  # 10 bps = 0.1% slippage when stop is hit
+  tp_slippage_bps: 5.0  # 5 bps = 0.05% slippage for take-profit (usually tighter)
 
 # Data & backtest settings
 data:

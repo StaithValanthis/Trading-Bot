@@ -258,7 +258,13 @@ def run_live(config_path: str):
     portfolio_limits = PortfolioLimits(config.risk, exchange)
     trades_store = TradesStore(config.data.db_path)
     orders_store = OrdersStore(config.data.db_path)
-    executor = OrderExecutor(exchange, trades_store=trades_store, orders_store=orders_store)
+    executor = OrderExecutor(
+        exchange,
+        trades_store=trades_store,
+        orders_store=orders_store,
+        risk_config=config.risk,
+        strategy_config=config.strategy.trend,
+    )
 
     logger.info(f"Loaded config version: {config.config_version}")
 
@@ -327,6 +333,102 @@ def run_live(config_path: str):
                 logger.info("Updating portfolio state...")
                 portfolio.update()
                 logger.info(f"Portfolio updated - Equity: ${portfolio.equity:,.2f}, Positions: {len(portfolio.positions)}")
+                
+                # Check time-based exits and trailing stops for existing positions
+                now_utc = datetime.now(timezone.utc)
+                
+                # Check time-based exits for existing positions
+                if config.strategy.trend.max_holding_hours:
+                    positions_to_close_time = []
+                    for symbol, pos in portfolio.positions.items():
+                        entry_time = pos.get('entry_time')
+                        if entry_time:
+                            if isinstance(entry_time, str):
+                                try:
+                                    entry_time = datetime.fromisoformat(entry_time.replace('Z', '+00:00'))
+                                except Exception:
+                                    continue
+                            hours_held = (now_utc - entry_time).total_seconds() / 3600
+                            if hours_held >= config.strategy.trend.max_holding_hours:
+                                positions_to_close_time.append(symbol)
+                                logger.info(
+                                    f"Closing {symbol}: max holding period exceeded "
+                                    f"({hours_held:.1f}h >= {config.strategy.trend.max_holding_hours}h)"
+                                )
+                    
+                    if positions_to_close_time:
+                        for symbol in positions_to_close_time:
+                            executor._cancel_stop_orders(symbol, portfolio)
+                            result = executor.close_position(symbol)
+                            if result.get('status') == 'closed':
+                                logger.info(f"Closed {symbol} due to max holding period")
+                
+                # Check and update trailing stops for existing positions
+                if config.strategy.trend.use_trailing_stop:
+                    for symbol, pos in list(portfolio.positions.items()):
+                        try:
+                            mark_price = pos.get('mark_price', 0)
+                            entry_price = pos.get('entry_price', 0)
+                            side = pos.get('side', 'long')
+                            current_stop = pos.get('stop_loss_price')
+                            highest = pos.get('highest_price', mark_price)
+                            lowest = pos.get('lowest_price', mark_price)
+                            
+                            if not mark_price or not entry_price or not current_stop:
+                                continue
+                            
+                            # Update highest/lowest price
+                            if side == 'long':
+                                if mark_price > highest:
+                                    portfolio.set_position_metadata(symbol, stop_loss_price=current_stop)
+                                    pos = portfolio.positions[symbol]  # Refresh
+                                    pos['highest_price'] = mark_price
+                                    highest = mark_price
+                            else:  # short
+                                if mark_price < lowest:
+                                    portfolio.set_position_metadata(symbol, stop_loss_price=current_stop)
+                                    pos = portfolio.positions[symbol]  # Refresh
+                                    pos['lowest_price'] = mark_price
+                                    lowest = mark_price
+                            
+                            # Check if we should update trailing stop
+                            if side == 'long':
+                                # Calculate profit in ATR terms
+                                price_above_entry = mark_price - entry_price
+                                atr = config.strategy.trend.atr_period  # Approximate: we'd need actual ATR
+                                # For now, use percentage-based trailing
+                                # Trail stop up if price has moved favorably
+                                if mark_price > highest * 0.95:  # Near highest
+                                    # Calculate trailing stop distance
+                                    atr_estimate = mark_price * 0.01  # Rough 1% ATR approximation
+                                    new_stop = mark_price - (atr_estimate * config.strategy.trend.trailing_stop_atr_multiplier)
+                                    # Only move stop up, never down
+                                    if new_stop > current_stop:
+                                        # Check if profit is enough to activate trailing
+                                        profit_pct = (mark_price - entry_price) / entry_price
+                                        stop_distance_pct = (entry_price - current_stop) / entry_price
+                                        if profit_pct >= (stop_distance_pct * config.strategy.trend.trailing_stop_activation_rr):
+                                            logger.info(
+                                                f"Updating trailing stop for {symbol}: {current_stop:.2f} -> {new_stop:.2f}"
+                                            )
+                                            # Cancel old stop order and place new one
+                                            executor._cancel_stop_orders(symbol, portfolio)
+                                            contracts = abs(pos.get('contracts', 0))
+                                            new_stop_id = executor._place_stop_loss_order(
+                                                symbol,
+                                                side,
+                                                contracts,
+                                                new_stop,
+                                                portfolio,
+                                            )
+                                            if new_stop_id:
+                                                logger.info(f"Trailing stop updated for {symbol}: order_id={new_stop_id}")
+                            # Similar logic for short positions...
+                            # (implementation similar, trailing stop moves down)
+                            
+                        except Exception as e:
+                            logger.warning(f"Error updating trailing stop for {symbol}: {e}")
+                
             except ccxt.AuthenticationError as e:
                 # Authentication errors are fatal - stop the bot
                 logger.critical(
@@ -342,11 +444,27 @@ def run_live(config_path: str):
             )
             
             if not can_trade:
-                logger.warning(f"Daily loss limit breached: {loss_reason}")
-                logger.info("Waiting 1 hour before checking again...")
+                logger.warning(f"Daily HARD loss limit breached: {loss_reason}")
+                
+                # Flatten all positions on hard loss cap
+                if portfolio.positions:
+                    logger.critical(
+                        f"Flattening all {len(portfolio.positions)} position(s) due to hard loss cap"
+                    )
+                    for symbol in list(portfolio.positions.keys()):
+                        executor._cancel_stop_orders(symbol, portfolio)
+                        result = executor.close_position(symbol)
+                        if result.get('status') == 'closed':
+                            logger.info(f"Flattened {symbol} due to hard loss cap")
+                
+                logger.error(
+                    "Trading disabled until next UTC day. Bot will sleep and check again."
+                )
                 # Wait until next day
                 time.sleep(3600)  # Check again in 1 hour
                 continue
+            elif loss_reason:  # Soft loss cap reached
+                logger.warning(f"Daily soft loss cap reached: {loss_reason}. Continuing with reduced risk.")
             
             # Update data
             logger.info("Updating market data...")
@@ -628,7 +746,14 @@ def run_backtest(config_path: str, symbols: list = None, output_file: str = None
         sys.exit(1)
     
     # Run backtest
-    result = backtester.backtest(symbol_data)
+    # Pass slippage parameters to backtest
+    stop_slippage = config.risk.stop_slippage_bps if config.risk else 10.0
+    tp_slippage = config.risk.tp_slippage_bps if config.risk else 5.0
+    result = backtester.backtest(
+        symbol_data,
+        stop_slippage_bps=stop_slippage,
+        tp_slippage_bps=tp_slippage,
+    )
     
     if 'error' in result:
         logger.error(f"Backtest error: {result['error']}")

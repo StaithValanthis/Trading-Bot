@@ -433,6 +433,197 @@ class BybitClient:
             self.logger.error(f"Error creating order for {symbol}: {e}")
             raise
     
+    def create_stop_order(
+        self,
+        symbol: str,
+        side: str,  # 'buy' or 'sell' (opposite of position side)
+        amount: float,
+        trigger_price: float,
+        order_type: str = "market",  # "market" or "limit"
+        limit_price: Optional[float] = None,
+        reduce_only: bool = True,
+    ) -> Dict:
+        """
+        Create a stop-loss or stop-entry order (conditional order).
+        
+        For Bybit v5, this uses conditional orders via params:
+        - stopOrder: conditional orders
+        - triggerPrice: price that triggers the order
+        - orderLinkId: optional custom order ID
+        
+        Args:
+            symbol: Trading pair symbol
+            side: 'buy' or 'sell' (direction of stop order)
+            amount: Order size in contracts
+            trigger_price: Price that triggers the stop order
+            order_type: "market" (stop-market) or "limit" (stop-limit)
+            limit_price: Limit price (required if order_type="limit")
+            reduce_only: If True, only reduce position (for stop-loss)
+        
+        Returns:
+            Order dictionary with order ID
+        """
+        if self.paper_mode:
+            self.logger.info(
+                f"[PAPER] Would create stop {order_type} {side} order: "
+                f"{symbol} {amount} @ trigger={trigger_price}, limit={limit_price}"
+            )
+            return {
+                "id": f"paper_stop_{int(time.time() * 1000)}",
+                "symbol": symbol,
+                "side": side,
+                "amount": amount,
+                "price": limit_price or trigger_price,
+                "type": f"stop_{order_type}",
+                "status": "open",
+                "timestamp": int(time.time() * 1000),
+                "info": {},
+            }
+        
+        try:
+            ccxt_symbol = symbol.replace("USDT", "/USDT") if "/" not in symbol else symbol
+            
+            time.sleep(self.exchange.rateLimit / 1000)
+            
+            # Bybit v5 conditional order params
+            # CCXT may support this via params or may need direct API call
+            # For now, we'll use CCXT's create_order with conditional order params
+            order_params = {
+                "stopPrice": trigger_price,  # Trigger price
+                "stopLossPrice": trigger_price,  # Alternative field name
+                "reduceOnly": reduce_only,
+            }
+            
+            if order_type == "limit":
+                if limit_price is None:
+                    raise ValueError("limit_price required for stop-limit orders")
+                order_params["price"] = limit_price
+                order_params["timeInForce"] = "GTC"  # Good till cancel
+            
+            # Try using CCXT's create_order with conditional order type
+            # If CCXT doesn't support it directly, we may need to use exchange-specific API
+            try:
+                order = self._call_with_retries(
+                    self.exchange.create_order,
+                    ccxt_symbol,
+                    f"stop_{order_type}",  # e.g., "stop_market", "stop_limit"
+                    side,
+                    amount,
+                    None,  # price (handled in params)
+                    order_params,
+                )
+            except (ccxt.ExchangeError, ccxt.NotSupported) as e:
+                # CCXT may not support conditional orders directly
+                # Fall back to creating via exchange-specific method if available
+                self.logger.warning(
+                    f"CCXT doesn't support conditional orders directly for {symbol}: {e}. "
+                    "Using alternative method..."
+                )
+                # For Bybit, we might need to use private API directly
+                # This is a fallback - in practice, you'd want to use Bybit's Python SDK or direct API
+                raise NotImplementedError(
+                    "Conditional orders require Bybit v5 API. "
+                    "Please ensure CCXT version supports Bybit conditional orders, "
+                    "or use Bybit SDK directly."
+                )
+            
+            self.logger.info(
+                f"Created stop {order_type} {side} order: {symbol} {amount} @ "
+                f"trigger={trigger_price}, order_id={order.get('id', 'N/A')}"
+            )
+            return order
+            
+        except Exception as e:
+            self.logger.error(f"Error creating stop order for {symbol}: {e}")
+            raise
+    
+    def create_take_profit_order(
+        self,
+        symbol: str,
+        side: str,  # 'buy' or 'sell' (opposite of position side)
+        amount: float,
+        trigger_price: float,
+        order_type: str = "limit",  # Usually limit for TP
+        limit_price: Optional[float] = None,
+        reduce_only: bool = True,
+    ) -> Dict:
+        """
+        Create a take-profit order (conditional limit order).
+        
+        Args:
+            symbol: Trading pair symbol
+            side: 'buy' or 'sell' (opposite of position side)
+            amount: Order size in contracts
+            trigger_price: Price that triggers the TP order
+            order_type: "limit" (recommended) or "market"
+            limit_price: Limit price (should be trigger_price for TP)
+            reduce_only: If True, only reduce position
+        
+        Returns:
+            Order dictionary with order ID
+        """
+        if self.paper_mode:
+            self.logger.info(
+                f"[PAPER] Would create take-profit {order_type} {side} order: "
+                f"{symbol} {amount} @ trigger={trigger_price}"
+            )
+            return {
+                "id": f"paper_tp_{int(time.time() * 1000)}",
+                "symbol": symbol,
+                "side": side,
+                "amount": amount,
+                "price": limit_price or trigger_price,
+                "type": f"take_profit_{order_type}",
+                "status": "open",
+                "timestamp": int(time.time() * 1000),
+                "info": {},
+            }
+        
+        try:
+            ccxt_symbol = symbol.replace("USDT", "/USDT") if "/" not in symbol else symbol
+            
+            time.sleep(self.exchange.rateLimit / 1000)
+            
+            # For take-profit, use limit order at trigger price
+            order_params = {
+                "stopPrice": trigger_price,
+                "takeProfitPrice": trigger_price,
+                "reduceOnly": reduce_only,
+            }
+            
+            if order_type == "limit":
+                order_params["price"] = limit_price or trigger_price
+                order_params["timeInForce"] = "GTC"
+            
+            try:
+                order = self._call_with_retries(
+                    self.exchange.create_order,
+                    ccxt_symbol,
+                    "take_profit" if order_type == "limit" else "take_profit_market",
+                    side,
+                    amount,
+                    limit_price or trigger_price,
+                    order_params,
+                )
+            except (ccxt.ExchangeError, ccxt.NotSupported) as e:
+                self.logger.warning(
+                    f"CCXT doesn't support take-profit orders directly for {symbol}: {e}"
+                )
+                raise NotImplementedError(
+                    "Take-profit orders require Bybit v5 API. "
+                    "Please ensure CCXT version supports Bybit conditional orders."
+                )
+            
+            self.logger.info(
+                f"Created take-profit {order_type} {side} order: {symbol} {amount} @ "
+                f"trigger={trigger_price}, order_id={order.get('id', 'N/A')}"
+            )
+            return order
+            
+        except Exception as e:
+            self.logger.error(f"Error creating take-profit order for {symbol}: {e}")
+            raise
+    
     def cancel_order(self, order_id: str, symbol: str) -> Dict:
         """
         Cancel an order.
