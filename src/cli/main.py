@@ -668,9 +668,13 @@ def run_live(config_path: str):
                             confidence = sig.get('confidence', 0)
                             entry_price = sig.get('entry_price', 0)
                             stop_loss = sig.get('stop_loss')
+                            if stop_loss is not None:
+                                stop_str = f"{stop_loss:.4f}"
+                            else:
+                                stop_str = "N/A"
                             logger.info(
                                 f"  {symbol}: {signal_type} @ ${entry_price:.4f} "
-                                f"(confidence: {confidence:.2f}, stop: ${stop_loss:.4f if stop_loss else 'N/A'})"
+                                f"(confidence: {confidence:.2f}, stop: ${stop_str})"
                             )
                 
                 # Cross-sectional selection
