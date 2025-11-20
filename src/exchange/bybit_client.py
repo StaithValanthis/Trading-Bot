@@ -207,16 +207,19 @@ class BybitClient:
             List of [timestamp, open, high, low, close, volume]
         """
         try:
-            # CCXT uses '/' separator
-            # Handle both formats: "BTCUSDT" -> "BTC/USDT", "BTC/USDT" -> unchanged
+            # CCXT uses '/' separator and :USDT suffix for perpetual futures
+            # Handle both formats: "BTCUSDT" -> "BTC/USDT:USDT" for perpetual futures
             if "/" not in symbol:
-                # Convert "BASEUSDT" to "BASE/USDT"
+                # Convert "BASEUSDT" to "BASE/USDT:USDT" for perpetual futures
                 if symbol.endswith("USDT"):
                     base = symbol[:-4]  # Remove "USDT" suffix
-                    ccxt_symbol = f"{base}/USDT"
+                    ccxt_symbol = f"{base}/USDT:USDT"  # Perpetual futures format
                 else:
-                    # Fallback: try adding "/USDT" if no slash
-                    ccxt_symbol = f"{symbol}/USDT"
+                    # Fallback: try adding "/USDT:USDT" if no slash
+                    ccxt_symbol = f"{symbol}/USDT:USDT"
+            elif ":USDT" not in symbol:
+                # Add :USDT suffix if missing (for perpetual futures)
+                ccxt_symbol = f"{symbol}:USDT"
             else:
                 ccxt_symbol = symbol
 
@@ -407,7 +410,17 @@ class BybitClient:
             Funding rate dictionary with 'fundingRate' and 'nextFundingTime'
         """
         try:
-            ccxt_symbol = symbol.replace("USDT", "/USDT") if "/" not in symbol else symbol
+            # Convert symbol format for CCXT (BTCUSDT -> BTC/USDT:USDT for perpetual futures)
+            if "/" not in symbol:
+                if symbol.endswith("USDT"):
+                    base = symbol[:-4]
+                    ccxt_symbol = f"{base}/USDT:USDT"
+                else:
+                    ccxt_symbol = f"{symbol}/USDT:USDT"
+            elif ":USDT" not in symbol:
+                ccxt_symbol = f"{symbol}:USDT"
+            else:
+                ccxt_symbol = symbol
 
             time.sleep(self.exchange.rateLimit / 1000)
             funding = self._call_with_retries(self.exchange.fetch_funding_rate, ccxt_symbol)
@@ -460,13 +473,34 @@ class BybitClient:
             }
         
         try:
-            ccxt_symbol = symbol.replace("USDT", "/USDT") if "/" not in symbol else symbol
+            # Convert symbol format for CCXT (BTCUSDT -> BTC/USDT:USDT for perpetual futures)
+            # For Bybit perpetual futures, we need to use the :USDT suffix
+            if "/" not in symbol:
+                if symbol.endswith("USDT"):
+                    base = symbol[:-4]  # Remove "USDT" suffix
+                    ccxt_symbol = f"{base}/USDT:USDT"  # Perpetual futures format
+                else:
+                    ccxt_symbol = f"{symbol}/USDT:USDT"
+            elif ":USDT" not in symbol:
+                # Add :USDT suffix if missing (for perpetual futures)
+                ccxt_symbol = f"{symbol}:USDT"
+            else:
+                ccxt_symbol = symbol
 
             time.sleep(self.exchange.rateLimit / 1000)
             
+            # CRITICAL: Explicitly specify market type for Bybit
+            # Bybit unified account needs explicit 'type' parameter to avoid defaulting to spot
             order_params = params or {}
+            order_params['type'] = 'swap'  # Force swap/perpetual futures, not spot
+            
             if order_type == "limit" and price is None:
                 raise ValueError("Price required for limit orders")
+
+            self.logger.debug(
+                f"Creating {order_type} {side} order for {symbol} (CCXT symbol: {ccxt_symbol}, "
+                f"market type: swap/perpetual)"
+            )
 
             order = self._call_with_retries(
                 self.exchange.create_order,
@@ -535,7 +569,17 @@ class BybitClient:
             }
         
         try:
-            ccxt_symbol = symbol.replace("USDT", "/USDT") if "/" not in symbol else symbol
+            # Convert symbol format for CCXT (BTCUSDT -> BTC/USDT:USDT for perpetual futures)
+            if "/" not in symbol:
+                if symbol.endswith("USDT"):
+                    base = symbol[:-4]
+                    ccxt_symbol = f"{base}/USDT:USDT"
+                else:
+                    ccxt_symbol = f"{symbol}/USDT:USDT"
+            elif ":USDT" not in symbol:
+                ccxt_symbol = f"{symbol}:USDT"
+            else:
+                ccxt_symbol = symbol
             
             time.sleep(self.exchange.rateLimit / 1000)
             

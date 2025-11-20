@@ -287,11 +287,15 @@ class OrderExecutor:
             self.recent_orders[symbol] = current_time
             
             order_id = order.get('id')
-            order_status = order.get('status', 'unknown')
+            order_status = order.get('status')
+            
+            # CCXT may return status=None for market orders that fill instantly
+            # This is normal - we'll verify by checking position existence
+            status_str = str(order_status) if order_status is not None else 'None (likely filled instantly)'
             
             self.logger.info(
                 f"Executed {side} order for {symbol}: {size} contracts @ {entry_price}, "
-                f"order_id={order_id}, status={order_status}"
+                f"order_id={order_id}, status={status_str}"
             )
 
             # Log order execution if store is available
@@ -309,36 +313,66 @@ class OrderExecutor:
                 )
             
             # CRITICAL: Wait for entry order to be filled before placing SL/TP orders
-            # Market orders should fill immediately, but verify position exists
-            if order_status != 'closed' and order_status != 'filled':
-                self.logger.warning(
-                    f"Entry order {order_id} for {symbol} not yet filled (status={order_status}). "
-                    "Waiting before placing SL/TP orders..."
-                )
-                # Wait briefly and verify position exists
-                time.sleep(1.0)  # Wait 1 second for market order to fill
+            # Market orders should fill immediately, but position may take a moment to appear
+            # CCXT may return status=None for market orders that fill instantly
+            # So we check position existence rather than relying on order status
             
-            # Verify position exists before placing SL/TP
-            # This ensures the entry order was filled and position is active
+            # Wait and retry position verification (up to 5 seconds total)
             position_verified = False
-            if portfolio_state:
-                portfolio_state.update()  # Refresh positions from exchange
-                position_verified = portfolio_state.has_position(symbol)
+            actual_size = size  # Use target size as default
+            max_retries = 5
+            retry_delay = 1.0  # Start with 1 second delay
             
-            if not position_verified:
-                # Check exchange directly
-                positions = self.exchange.fetch_positions(symbol=symbol)
-                for pos in positions:
-                    pos_symbol = pos.get('symbol', '').replace('/USDT', 'USDT')
-                    contracts = float(pos.get('contracts', 0))
-                    if pos_symbol == symbol and abs(contracts) > 0.001:
-                        position_verified = True
+            for attempt in range(max_retries):
+                if attempt > 0:
+                    self.logger.debug(
+                        f"Position verification attempt {attempt + 1}/{max_retries} for {symbol} "
+                        f"(waiting {retry_delay}s)..."
+                    )
+                    time.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 1.5, 3.0)  # Exponential backoff, max 3s
+                
+                # Try portfolio state first (cached)
+                if portfolio_state:
+                    portfolio_state.update()  # Refresh positions from exchange
+                    position_verified = portfolio_state.has_position(symbol)
+                    if position_verified:
+                        pos = portfolio_state.get_position(symbol)
+                        actual_size = abs(pos.get('contracts', size))
+                        self.logger.info(
+                            f"Position for {symbol} verified via portfolio state: "
+                            f"{actual_size:.6f} contracts"
+                        )
                         break
+                
+                # Check exchange directly as fallback
+                if not position_verified:
+                    try:
+                        positions = self.exchange.fetch_positions(symbol=symbol)
+                        for pos in positions:
+                            pos_symbol = pos.get('symbol', '').replace('/USDT', 'USDT')
+                            contracts = float(pos.get('contracts', 0))
+                            if pos_symbol == symbol and abs(contracts) > 0.001:
+                                position_verified = True
+                                actual_size = abs(contracts)
+                                self.logger.info(
+                                    f"Position for {symbol} verified via exchange: "
+                                    f"{actual_size:.6f} contracts"
+                                )
+                                break
+                    except Exception as e:
+                        self.logger.warning(
+                            f"Error fetching positions during verification attempt {attempt + 1}: {e}"
+                        )
+                
+                if position_verified:
+                    break
             
             if not position_verified:
                 self.logger.warning(
-                    f"Position for {symbol} not yet visible after entry order. "
-                    "Skipping SL/TP order placement for now. They will be placed on next rebalance."
+                    f"Position for {symbol} not verified after {max_retries} attempts ({max_retries * retry_delay:.1f}s total). "
+                    f"Entry order {order_id} was placed, but position not yet visible. "
+                    "SL/TP orders will be placed on next rebalance cycle."
                 )
                 return {
                     'status': 'partial',
@@ -350,7 +384,7 @@ class OrderExecutor:
                     'message': 'Entry order placed, but position not yet verified. SL/TP will be placed on next cycle.'
                 }
             
-            self.logger.info(f"Position for {symbol} verified. Proceeding to place SL/TP orders...")
+            self.logger.info(f"Position for {symbol} verified ({actual_size:.6f} contracts). Proceeding to place SL/TP orders...")
             
             # Place stop-loss order if configured and stop price provided
             stop_order_id = None
@@ -359,14 +393,7 @@ class OrderExecutor:
             # Determine position side from signal
             position_side = signal  # 'long' or 'short'
             
-            # Get actual position size from exchange (may differ slightly from target due to fill price)
-            actual_size = size  # Use target size by default
-            if portfolio_state and portfolio_state.has_position(symbol):
-                pos = portfolio_state.get_position(symbol)
-                actual_size = abs(pos.get('contracts', size))
-                self.logger.debug(
-                    f"Using actual position size for {symbol}: {actual_size:.6f} (target was {size:.6f})"
-                )
+            # actual_size is already set during position verification above
             
             # Place stop-loss order
             if stop_loss_price:
