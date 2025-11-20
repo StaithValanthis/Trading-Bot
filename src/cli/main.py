@@ -643,6 +643,36 @@ def run_live(config_path: str):
                         logger.warning(f"Error generating signal for {symbol}: {e}")
                         continue
                 
+                # Log all signals generated (for monitoring)
+                if symbol_signals:
+                    long_signals = [s for s, sig in symbol_signals.items() if sig.get('signal') == 'long']
+                    short_signals = [s for s, sig in symbol_signals.items() if sig.get('signal') == 'short']
+                    flat_signals = [s for s, sig in symbol_signals.items() if sig.get('signal') == 'flat']
+                    
+                    logger.info(
+                        f"Signal summary: {len(long_signals)} LONG, {len(short_signals)} SHORT, "
+                        f"{len(flat_signals)} FLAT out of {len(symbol_signals)} symbols"
+                    )
+                    
+                    # Log top signals by confidence
+                    signals_with_conf = [
+                        (s, sig) for s, sig in symbol_signals.items() 
+                        if sig.get('signal') in ['long', 'short']
+                    ]
+                    signals_with_conf.sort(key=lambda x: x[1].get('confidence', 0), reverse=True)
+                    
+                    if signals_with_conf:
+                        logger.info("Top signals by confidence:")
+                        for symbol, sig in signals_with_conf[:10]:  # Top 10
+                            signal_type = sig.get('signal', 'flat').upper()
+                            confidence = sig.get('confidence', 0)
+                            entry_price = sig.get('entry_price', 0)
+                            stop_loss = sig.get('stop_loss')
+                            logger.info(
+                                f"  {symbol}: {signal_type} @ ${entry_price:.4f} "
+                                f"(confidence: {confidence:.2f}, stop: ${stop_loss:.4f if stop_loss else 'N/A'})"
+                            )
+                
                 # Cross-sectional selection
                 selected_symbols = cross_sectional_gen.select_top_symbols(
                     symbol_data,
@@ -650,7 +680,40 @@ def run_live(config_path: str):
                     config.strategy.cross_sectional.require_trend_alignment
                 )
                 
-                logger.info(f"Selected symbols: {selected_symbols}")
+                # Log cross-sectional rankings
+                if symbol_data:
+                    rankings = cross_sectional_gen.rank_symbols(symbol_data)
+                    if rankings:
+                        logger.info("Cross-sectional rankings (top 10):")
+                        for i, (symbol, return_pct) in enumerate(rankings[:10], 1):
+                            signal = symbol_signals.get(symbol, {}).get('signal', 'flat')
+                            signal_icon = "📈" if signal == 'long' else "📉" if signal == 'short' else "➖"
+                            selected_marker = "⭐" if symbol in selected_symbols else "  "
+                            logger.info(
+                                f"  {i:2d}. {selected_marker} {signal_icon} {symbol}: "
+                                f"{return_pct*100:+.2f}% ({signal})"
+                            )
+                
+                logger.info(f"Selected symbols for trading: {selected_symbols}")
+                
+                # Log detailed info for selected symbols
+                if selected_symbols:
+                    logger.info("Selected symbols details:")
+                    for symbol in selected_symbols:
+                        signal = symbol_signals.get(symbol, {})
+                        signal_type = signal.get('signal', 'flat')
+                        confidence = signal.get('confidence', 0)
+                        entry_price = signal.get('entry_price', 0)
+                        stop_loss = signal.get('stop_loss')
+                        metadata = signal.get('metadata', {})
+                        momentum = metadata.get('momentum', 0) * 100
+                        
+                        logger.info(
+                            f"  {symbol}: {signal_type.upper()} @ ${entry_price:.4f} | "
+                            f"Confidence: {confidence:.2f} | "
+                            f"Momentum: {momentum:+.2f}% | "
+                            f"Stop Loss: ${stop_loss:.4f if stop_loss else 'N/A'}"
+                        )
                 
                 # Generate target positions
                 target_positions = {}
