@@ -55,18 +55,59 @@ class Optimizer:
         since = int((datetime.now() - timedelta(days=lookback_days)).timestamp() * 1000)
         
         symbol_data = {}
+        symbols_with_insufficient_data = []
+        symbols_with_no_data = []
+        
         for symbol in symbols:
             try:
                 df = self.store.get_ohlcv(symbol, timeframe, since=since)
-                if not df.empty and len(df) > 200:  # Need enough data
+                if df.empty:
+                    symbols_with_no_data.append(symbol)
+                    self.logger.warning(f"No data found for {symbol} at timeframe {timeframe}")
+                    # Check what timeframes are available
+                    try:
+                        import sqlite3
+                        conn = sqlite3.connect(self.store.db_path)
+                        cursor = conn.cursor()
+                        cursor.execute(
+                            "SELECT DISTINCT timeframe FROM ohlcv WHERE symbol = ?",
+                            (symbol,)
+                        )
+                        available_timeframes = [row[0] for row in cursor.fetchall()]
+                        conn.close()
+                        if available_timeframes:
+                            self.logger.info(
+                                f"Available timeframes for {symbol}: {available_timeframes}. "
+                                f"Optimizer requires {timeframe}"
+                            )
+                    except Exception:
+                        pass
+                elif len(df) < 200:  # Need at least 200 bars
+                    symbols_with_insufficient_data.append((symbol, len(df)))
+                    self.logger.warning(
+                        f"Insufficient data for {symbol}: {len(df)} bars (need at least 200)"
+                    )
+                else:
                     symbol_data[symbol] = df
-                    self.logger.info(f"Loaded {len(df)} candles for {symbol}")
+                    self.logger.info(f"Loaded {len(df)} candles for {symbol} at {timeframe}")
             except Exception as e:
+                symbols_with_no_data.append(symbol)
                 self.logger.warning(f"Error loading data for {symbol}: {e}")
                 continue
         
         if not symbol_data:
-            return {'error': 'No data available for optimization'}
+            error_msg = f"No data available for optimization at timeframe {timeframe}.\n"
+            if symbols_with_no_data:
+                error_msg += f"Symbols with no data: {', '.join(symbols_with_no_data)}\n"
+            if symbols_with_insufficient_data:
+                insufficient_list = [f"{s} ({n} bars)" for s, n in symbols_with_insufficient_data]
+                error_msg += f"Symbols with insufficient data (<200 bars): {', '.join(insufficient_list)}\n"
+            error_msg += f"\nTo fix:\n"
+            error_msg += f"1. Download data first: Let the live bot run or manually download data\n"
+            error_msg += f"2. Check timeframe: Ensure data exists for {timeframe}\n"
+            error_msg += f"3. Check symbols: Verify {', '.join(symbols)} exist in database\n"
+            self.logger.error(error_msg)
+            return {'error': error_msg}
         
         # Generate parameter sets
         if self.config.optimizer.search_method == 'random':

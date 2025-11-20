@@ -1016,14 +1016,103 @@ def run_optimize(config_path: str):
     logger.info("Starting optimization")
     
     # Initialize components
+    exchange = BybitClient(config.exchange)
     store = OHLCVStore(config.data.db_path)
+    downloader = DataDownloader(exchange, store)
+    
+    # Determine which symbols to optimize on
+    # Prefer config.exchange.symbols if specified, otherwise use symbols with data
+    target_symbols = config.exchange.symbols if config.exchange.symbols else []
+    
+    # Ensure data exists for target symbols (download if missing)
+    if target_symbols:
+        logger.info(f"Ensuring data exists for {len(target_symbols)} target symbols: {', '.join(target_symbols)}")
+        
+        # Check what data exists and download missing data
+        lookback_days = max(config.optimizer.lookback_months * 30, 60)  # At least 60 days
+        since = int((datetime.now() - timedelta(days=lookback_days)).timestamp() * 1000)
+        
+        for symbol in target_symbols:
+            try:
+                # Check if symbol has enough data
+                df = store.get_ohlcv(
+                    symbol, 
+                    config.exchange.timeframe, 
+                    since=since
+                )
+                
+                if df.empty or len(df) < 200:
+                    logger.info(f"Downloading data for {symbol} (has {len(df) if not df.empty else 0} bars, need 200+)")
+                    downloader.update_symbol(
+                        symbol,
+                        config.exchange.timeframe,
+                        lookback_days=lookback_days
+                    )
+                    # Verify after download
+                    df = store.get_ohlcv(symbol, config.exchange.timeframe, since=since)
+                    if not df.empty and len(df) >= 200:
+                        logger.info(f"✓ {symbol} now has {len(df)} bars")
+                    else:
+                        logger.warning(f"⚠ {symbol} still has insufficient data after download ({len(df) if not df.empty else 0} bars)")
+                else:
+                    logger.info(f"✓ {symbol} has sufficient data: {len(df)} bars")
+            except Exception as e:
+                logger.warning(f"Error checking/downloading data for {symbol}: {e}")
+    else:
+        # No target symbols specified, use symbols with data from database
+        logger.info("No target symbols specified, finding symbols with sufficient data...")
+        conn = sqlite3.connect(config.data.db_path)
+        cursor = conn.cursor()
+        
+        # Find symbols with at least 200 bars at the target timeframe
+        lookback_days = config.optimizer.lookback_months * 30
+        min_timestamp = int((datetime.now() - timedelta(days=lookback_days)).timestamp() * 1000)
+        
+        cursor.execute("""
+            SELECT symbol, COUNT(*) as bar_count
+            FROM ohlcv
+            WHERE timeframe = ? AND timestamp >= ?
+            GROUP BY symbol
+            HAVING COUNT(*) >= 200
+            ORDER BY bar_count DESC
+            LIMIT 10
+        """, (config.exchange.timeframe, min_timestamp))
+        
+        results = cursor.fetchall()
+        conn.close()
+        
+        if results:
+            target_symbols = [row[0] for row in results]
+            logger.info(f"Found {len(target_symbols)} symbols with sufficient data: {', '.join(target_symbols)}")
+        else:
+            logger.error("No symbols found with sufficient data for optimization")
+            logger.error("Please either:")
+            logger.error("1. Specify symbols in config.exchange.symbols")
+            logger.error("2. Let the live bot run to download data")
+            logger.error("3. Manually download data for your desired symbols")
+            sys.exit(1)
+    
     optimizer = Optimizer(config, store)
     
     # Run optimization
-    result = optimizer.optimize(config.exchange.symbols, config.exchange.timeframe)
+    result = optimizer.optimize(target_symbols, config.exchange.timeframe)
     
     if 'error' in result:
-        logger.error(f"Optimization error: {result['error']}")
+        error_msg = result['error']
+        logger.error(f"Optimization error: {error_msg}")
+        
+        # Provide helpful suggestions
+        logger.error("\n" + "="*60)
+        logger.error("OPTIMIZATION FAILED - DATA NOT AVAILABLE")
+        logger.error("="*60)
+        logger.error("\nPossible solutions:")
+        logger.error("1. Let the live bot run first to download data")
+        logger.error("2. Manually download data for the required symbols/timeframe")
+        logger.error(f"3. Check if data exists: sqlite3 {config.data.db_path} \"SELECT DISTINCT symbol, timeframe FROM ohlcv;\"")
+        logger.error(f"4. Required timeframe: {config.exchange.timeframe}")
+        logger.error(f"5. Target symbols: {', '.join(target_symbols) if target_symbols else 'auto-selected from database'}")
+        logger.error("="*60 + "\n")
+        
         sys.exit(1)
     
     # Compare with current

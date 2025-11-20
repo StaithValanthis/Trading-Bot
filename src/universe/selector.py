@@ -2,7 +2,7 @@
 
 import time
 from typing import Dict, List, Optional, Set, Tuple
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 import pandas as pd
 import numpy as np
 
@@ -11,6 +11,7 @@ from ..exchange.bybit_client import BybitClient
 from ..data.ohlcv_store import OHLCVStore
 from ..universe.store import UniverseStore
 from ..logging_utils import get_logger
+from ..utils import parse_timeframe_to_hours
 
 logger = get_logger(__name__)
 
@@ -198,60 +199,93 @@ class UniverseSelector:
         
         Args:
             symbol: Symbol name
-            timeframe: Trading timeframe (e.g., '1h')
+            timeframe: Trading timeframe (e.g., '1h', '4h')
         
         Returns:
             Tuple of (passes, reason, metadata)
         """
         try:
-            # Get OHLCV data
-            df = self.ohlcv_store.get_ohlcv(symbol, timeframe, limit=None)
+            # Calculate how many bars we need to check (more efficient than loading all data)
+            hours_per_bar = parse_timeframe_to_hours(timeframe)
+            if hours_per_bar == 0:
+                return False, "invalid_timeframe", {'timeframe': timeframe}
+            
+            candles_per_day = 24 / hours_per_bar  # 6 for 4h, 24 for 1h, 1 for 1d
+            min_bars = int((self.config.min_history_days * 24) / hours_per_bar)
+            
+            # Load data (with buffer for gap checking)
+            df = self.ohlcv_store.get_ohlcv(symbol, timeframe, limit=min_bars + 100)
             
             if df.empty:
                 return False, "no_data", {}
             
-            # Check data age
+            # Check data age (FIX: Use UTC-aware datetime)
             latest_timestamp = df.index[-1]
-            now = datetime.now()
+            now_utc = datetime.now(timezone.utc)
+            
+            # Ensure pandas timestamp is UTC-aware
             if isinstance(latest_timestamp, pd.Timestamp):
-                age_days = (now - latest_timestamp.to_pydatetime()).days
+                if latest_timestamp.tz is None:
+                    latest_dt = latest_timestamp.to_pydatetime().replace(tzinfo=timezone.utc)
+                else:
+                    latest_dt = latest_timestamp.to_pydatetime()
             else:
-                age_days = (now - latest_timestamp).days
+                # Fallback: assume UTC if naive
+                latest_dt = latest_timestamp if hasattr(latest_timestamp, 'tzinfo') and latest_timestamp.tzinfo else latest_timestamp.replace(tzinfo=timezone.utc)
+            
+            age_days = (now_utc - latest_dt).days
             
             if age_days > self.config.max_days_since_last_update:
                 return False, "data_too_old", {
                     'days_since_update': age_days,
-                    'threshold': self.config.max_days_since_last_update
+                    'threshold': self.config.max_days_since_last_update,
+                    'latest_timestamp': latest_timestamp.isoformat() if hasattr(latest_timestamp, 'isoformat') else str(latest_timestamp)
                 }
             
-            # Check total history
+            # Check total history (use bars-based check for accuracy)
+            actual_bars = len(df)
+            if actual_bars < min_bars:
+                return False, "insufficient_history", {
+                    'actual_bars': actual_bars,
+                    'required_bars': min_bars,
+                    'actual_days': actual_bars / candles_per_day,
+                    'threshold_days': self.config.min_history_days,
+                    'candles_per_day': candles_per_day
+                }
+            
+            # Also check days for reporting
             oldest_timestamp = df.index[0]
             if isinstance(oldest_timestamp, pd.Timestamp):
-                history_days = (latest_timestamp.to_pydatetime() - oldest_timestamp.to_pydatetime()).days
+                oldest_dt = oldest_timestamp.to_pydatetime()
+                if oldest_dt.tzinfo is None:
+                    oldest_dt = oldest_dt.replace(tzinfo=timezone.utc)
             else:
-                history_days = (latest_timestamp - oldest_timestamp).days
+                oldest_dt = oldest_timestamp if hasattr(oldest_timestamp, 'tzinfo') and oldest_timestamp.tzinfo else oldest_timestamp.replace(tzinfo=timezone.utc)
             
-            if history_days < self.config.min_history_days:
-                return False, "insufficient_history", {
-                    'history_days': history_days,
-                    'threshold': self.config.min_history_days
-                }
+            if isinstance(latest_dt, pd.Timestamp):
+                latest_dt = latest_dt.to_pydatetime()
+            history_days = (latest_dt - oldest_dt).days
             
-            # Check data gaps
-            expected_candles = history_days * 24  # For 1h timeframe
-            actual_candles = len(df)
-            gap_pct = (1 - actual_candles / expected_candles) * 100 if expected_candles > 0 else 0
+            # Check data gaps (FIX: Use timeframe-aware calculation)
+            expected_candles = history_days * candles_per_day
+            gap_pct = (1 - actual_bars / expected_candles) * 100 if expected_candles > 0 else 0
             
             if gap_pct > self.config.max_data_gap_pct:
                 return False, "too_many_gaps", {
                     'gap_pct': gap_pct,
-                    'threshold': self.config.max_data_gap_pct
+                    'threshold': self.config.max_data_gap_pct,
+                    'expected_candles': expected_candles,
+                    'actual_candles': actual_bars,
+                    'candles_per_day': candles_per_day,
+                    'timeframe': timeframe
                 }
             
             return True, None, {
                 'history_days': history_days,
-                'data_points': len(df),
-                'gap_pct': gap_pct
+                'data_points': actual_bars,
+                'gap_pct': gap_pct,
+                'candles_per_day': candles_per_day,
+                'required_bars': min_bars
             }
             
         except Exception as e:
@@ -487,6 +521,7 @@ class UniverseSelector:
         # Evaluate each symbol
         eligible_symbols = set()
         changes = {}
+        rejection_reasons = {}  # Track rejection reasons for diagnostics
         
         for symbol in all_symbols:
             # Check if currently in universe
@@ -517,6 +552,23 @@ class UniverseSelector:
                         'metadata': metadata
                     }
             else:
+                # Track rejection reasons
+                if reason not in rejection_reasons:
+                    rejection_reasons[reason] = []
+                rejection_reasons[reason].append(symbol)
+                
+                # Log rejection (INFO for first few, DEBUG for rest)
+                if len(rejection_reasons[reason]) <= 5:
+                    self.logger.info(
+                        f"Symbol {symbol} rejected: {reason} "
+                        f"(metadata: {metadata})"
+                    )
+                else:
+                    self.logger.debug(
+                        f"Symbol {symbol} rejected: {reason} "
+                        f"(metadata: {metadata})"
+                    )
+                
                 if currently_in:
                     # Removal
                     ticker = self.fetch_ticker_data(symbol)
@@ -567,6 +619,24 @@ class UniverseSelector:
         
         # Log snapshot
         self.universe_store.log_universe_snapshot(current_date, eligible_symbols, changes)
+        
+        # Log summary of rejections (diagnostic)
+        if rejection_reasons:
+            self.logger.info("Universe filter summary:")
+            for reason, symbols in sorted(rejection_reasons.items(), key=lambda x: len(x[1]), reverse=True):
+                self.logger.info(f"  {reason}: {len(symbols)} symbols rejected")
+                if len(symbols) <= 10:
+                    self.logger.info(f"    Examples: {', '.join(symbols[:10])}")
+        
+        # Warn if universe is empty
+        if not eligible_symbols:
+            self.logger.warning(
+                "⚠️  Universe is empty! All symbols were filtered out. "
+                "Check filter thresholds and data availability. "
+                f"Consider: (1) Lowering min_24h_volume_entry (current: {self.config.min_24h_volume_entry:,.0f}), "
+                f"(2) Reducing min_history_days (current: {self.config.min_history_days}), "
+                f"(3) Checking if data exists for symbols (timeframe: {timeframe})"
+            )
         
         self.logger.info(
             f"Universe built: {len(eligible_symbols)} symbols "
