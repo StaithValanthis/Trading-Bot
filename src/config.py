@@ -150,7 +150,7 @@ class StrategyConfig:
 @dataclass
 class RiskConfig:
     """Risk management configuration."""
-    per_trade_risk_fraction: float = 0.005  # 0.5% per trade
+    per_trade_risk_fraction: float = 0.02  # 2% per trade (increased default for small accounts to meet min order size)
     max_leverage: float = 3.0
     max_symbol_fraction: float = 0.30
     max_positions: int = 5

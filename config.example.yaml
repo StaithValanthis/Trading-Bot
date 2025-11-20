@@ -75,8 +75,10 @@ strategy:
 
 # Risk management
 risk:
-  # Per-trade risk as fraction of equity (e.g. 0.005 = 0.5%)
-  per_trade_risk_fraction: 0.005
+  # Per-trade risk as fraction of equity (e.g. 0.005 = 0.5%, 0.02 = 2%)
+  # NOTE: For small accounts (< $500), consider 0.015-0.025 (1.5-2.5%) to meet $5 minimum order size
+  # For larger accounts (> $1000), 0.005-0.01 (0.5-1%) is more conservative
+  per_trade_risk_fraction: 0.02
   # Maximum gross leverage (sum of |notional| / equity)
   max_leverage: 3.0
   # Maximum % of equity in any single symbol (notional)

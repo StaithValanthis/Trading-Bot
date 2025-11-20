@@ -2,10 +2,20 @@
 
 import ccxt
 import time
+import hmac
+import hashlib
 from typing import Dict, List, Optional, Tuple, Any, Callable
 from datetime import datetime
 import logging
 from random import random
+import json
+
+# Optional import for direct Bybit v5 API calls (fallback when CCXT doesn't support conditional orders)
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
 
 from ..config import ExchangeConfig
 from ..logging_utils import get_logger
@@ -88,15 +98,23 @@ class BybitClient:
             )
             
             if not api_key_present or not api_secret_present:
-                self.logger.error(
+                error_msg = (
                     "API credentials are missing or empty in config!\n"
                     f"  API key present: {api_key_present} ({key_len} chars)\n"
                     f"  API secret present: {api_secret_present} ({secret_len} chars)\n"
                     "Ensure BYBIT_API_KEY and BYBIT_API_SECRET are set in .env file or config.yaml"
                 )
+                self.logger.error(error_msg)
+                raise ValueError(error_msg)
             
             self.logger.info("Creating CCXT exchange instance...")
             try:
+                # Ensure credentials are not empty strings before passing to CCXT
+                if not api_key or not api_secret:
+                    error_msg = f"API credentials are empty after stripping (key_len={len(api_key)}, secret_len={len(api_secret)})"
+                    self.logger.error(error_msg)
+                    raise ValueError(error_msg)
+                
                 self.exchange = exchange_class(
                     {
                         "apiKey": api_key,
@@ -550,19 +568,23 @@ class BybitClient:
                 )
             except (ccxt.ExchangeError, ccxt.NotSupported) as e:
                 # CCXT may not support conditional orders directly
-                # Fall back to creating via exchange-specific method if available
+                # Fall back to using Bybit v5 API directly
                 self.logger.warning(
                     f"CCXT doesn't support conditional orders directly for {symbol}: {e}. "
-                    "Using alternative method..."
+                    "Attempting direct Bybit v5 API call..."
                 )
-                # For Bybit, we might need to use private API directly
-                # This is a fallback - in practice, you'd want to use Bybit's Python SDK or direct API
-                raise NotImplementedError(
-                    "Conditional orders require Bybit v5 API. "
-                    "Please ensure CCXT version supports Bybit conditional orders, "
-                    "or use Bybit SDK directly."
+                # Use Bybit v5 API directly for conditional orders
+                order = self._create_stop_order_v5_api(
+                    symbol, side, amount, trigger_price, order_type, limit_price, reduce_only
                 )
+                # If successful, log and return
+                self.logger.info(
+                    f"Created stop {order_type} {side} order via Bybit v5 API: {symbol} {amount} @ "
+                    f"trigger={trigger_price}, order_id={order.get('id', 'N/A')}"
+                )
+                return order
             
+            # If CCXT succeeded, log and return
             self.logger.info(
                 f"Created stop {order_type} {side} order: {symbol} {amount} @ "
                 f"trigger={trigger_price}, order_id={order.get('id', 'N/A')}"
@@ -571,6 +593,143 @@ class BybitClient:
             
         except Exception as e:
             self.logger.error(f"Error creating stop order for {symbol}: {e}")
+            raise
+    
+    def _create_stop_order_v5_api(
+        self,
+        symbol: str,
+        side: str,
+        amount: float,
+        trigger_price: float,
+        order_type: str = "market",
+        limit_price: Optional[float] = None,
+        reduce_only: bool = True,
+    ) -> Dict:
+        """
+        Create stop order using Bybit v5 API directly (bypassing CCXT).
+        
+        This is used as a fallback when CCXT doesn't support conditional orders.
+        
+        Args:
+            symbol: Trading pair (e.g., "BTCUSDT")
+            side: 'buy' or 'sell'
+            amount: Order size in contracts
+            trigger_price: Trigger price
+            order_type: "market" or "limit"
+            limit_price: Limit price (for stop-limit orders)
+            reduce_only: If True, only reduce position
+        
+        Returns:
+            Order dictionary
+        """
+        # Check if requests is available
+        if not REQUESTS_AVAILABLE:
+            raise ImportError(
+                "The 'requests' library is required for direct Bybit v5 API calls. "
+                "Install it with: pip install requests"
+            )
+        
+        # Convert symbol format (BTC/USDT or BTCUSDT -> BTCUSDT for Bybit)
+        # Bybit v5 uses symbol without slash
+        bybit_symbol = symbol.replace("/", "").replace(":USDT", "USDT")
+        if not bybit_symbol.endswith("USDT"):
+            bybit_symbol = f"{bybit_symbol}USDT"
+        
+        # Determine base URL
+        if self.config.testnet:
+            base_url = "https://api-testnet.bybit.com"
+        else:
+            base_url = "https://api.bybit.com"
+        
+        endpoint = "/v5/order/create"
+        url = f"{base_url}{endpoint}"
+        
+        # Build request parameters
+        timestamp = str(int(time.time() * 1000))
+        
+        params = {
+            "category": "linear",  # USDT-margined perpetuals
+            "symbol": bybit_symbol,
+            "side": side.capitalize(),  # Buy or Sell
+            "orderType": "Market" if order_type == "market" else "Limit",
+            "qty": str(amount),
+            "positionIdx": 0,  # One-way mode
+            "reduceOnly": reduce_only,
+            "stopOrderType": "StopMarket" if order_type == "market" else "StopLimit",
+            "triggerPrice": str(trigger_price),
+        }
+        
+        if order_type == "limit" and limit_price:
+            params["price"] = str(limit_price)
+        
+        # Build query string for signing (sort keys alphabetically)
+        # For POST with JSON body, use query string format for signature
+        query_string = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
+        recv_window = "5000"
+        
+        # Get credentials (ensure they're stripped, same as in __init__)
+        api_key = (self.config.api_key or "").strip()
+        api_secret = (self.config.api_secret or "").strip()
+        
+        if not api_key or not api_secret:
+            raise ccxt.AuthenticationError("API credentials missing or empty in config")
+        
+        # Bybit v5 signature for POST: timestamp + api_key + recv_window + query_string
+        param_str = f"{timestamp}{api_key}{recv_window}{query_string}"
+        
+        # Generate signature (HMAC-SHA256)
+        signature = hmac.new(
+            api_secret.encode("utf-8"),
+            param_str.encode("utf-8"),
+            hashlib.sha256
+        ).hexdigest()
+        
+        # Prepare headers
+        headers = {
+            "X-BAPI-API-KEY": api_key,
+            "X-BAPI-SIGN": signature,
+            "X-BAPI-SIGN-TYPE": "2",  # SHA256
+            "X-BAPI-TIMESTAMP": timestamp,
+            "X-BAPI-RECV-WINDOW": recv_window,
+            "Content-Type": "application/json",
+        }
+        
+        # Make request
+        try:
+            response = requests.post(url, json=params, headers=headers, timeout=10)
+            response.raise_for_status()
+            result = response.json()
+            
+            if result.get("retCode") != 0:
+                error_msg = result.get("retMsg", "Unknown error")
+                raise ccxt.ExchangeError(f"Bybit API error: {error_msg}")
+            
+            order_data = result.get("result", {})
+            order_id = order_data.get("orderId", "")
+            
+            self.logger.info(
+                f"Created stop order via Bybit v5 API: {symbol} {amount} @ "
+                f"trigger={trigger_price}, order_id={order_id}"
+            )
+            
+            # Return CCXT-compatible order structure
+            return {
+                "id": str(order_id),
+                "symbol": symbol,
+                "side": side,
+                "amount": amount,
+                "price": limit_price or trigger_price,
+                "type": f"stop_{order_type}",
+                "status": "open",
+                "timestamp": int(time.time() * 1000),
+                "info": order_data,
+            }
+            
+        except requests.RequestException as e:
+            self.logger.error(f"HTTP error creating stop order: {e}")
+            raise ccxt.ExchangeError(f"HTTP error: {e}") from e
+        except Exception as e:
+            self.logger.error(f"Error in Bybit v5 API call: {e}")
             raise
     
     def create_take_profit_order(

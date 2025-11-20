@@ -844,6 +844,11 @@ def run_live(config_path: str):
                             logger.info(f"Position closed: {result.get('symbol')}")
                         elif result.get('status') == 'error':
                             logger.error(f"Error executing position: {result.get('error')}")
+                    
+                    # Update portfolio state after executing orders
+                    # This ensures the heartbeat shows correct position counts
+                    logger.debug("Updating portfolio state after order execution...")
+                    portfolio.update()
                 else:
                     logger.info("No position changes needed (no targets and no existing positions)")
                 
