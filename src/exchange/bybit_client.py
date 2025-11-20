@@ -25,96 +25,116 @@ class BybitClient:
         """
         self.config = config
         self.logger = get_logger(__name__)
-
-        # Configure exchange
-        exchange_options = {
-            "defaultType": "swap",  # USDT-margined perpetual futures
-            "adjustForTimeDifference": True,
-        }
-
-        if config.testnet:
-            # CCXT uses testnet when sandbox=True
-            exchange_options["sandbox"] = True
-            endpoint_url = "testnet.bybit.com (TESTNET)"
-        else:
-            endpoint_url = "api.bybit.com (LIVE PRODUCTION)"
-
-        # Create exchange instance
-        exchange_class = getattr(ccxt, config.name)
         
-        # Strip and validate credentials (strip again as safety measure)
-        api_key = (config.api_key or "").strip()
-        api_secret = (config.api_secret or "").strip()
-        
-        # Log credential status (without exposing actual values)
-        api_key_present = bool(api_key)
-        api_secret_present = bool(api_secret)
-        key_len = len(api_key)
-        secret_len = len(api_secret)
-        
-        # Log first/last few chars for debugging (without exposing full key)
-        key_preview = f"{api_key[:3]}...{api_key[-3:]}" if len(api_key) >= 6 else ("***" if api_key else "MISSING")
-        secret_preview = f"{api_secret[:3]}...{api_secret[-3:]}" if len(api_secret) >= 6 else ("***" if api_secret else "MISSING")
-        
-        # Critical warning if there's a mismatch
-        if config.mode == "live" and config.testnet:
-            self.logger.error(
-                "⚠️  CONFIGURATION MISMATCH DETECTED ⚠️\n"
-                "  Config has mode='live' but testnet=true!\n"
-                "  The bot will connect to TESTNET, but you likely want LIVE.\n"
-                "  Set testnet: false in config.yaml for live trading."
-            )
-        elif config.mode != "paper" and config.mode != "testnet" and not config.testnet:
-            self.logger.warning(
-                "⚠️  Live production mode detected!\n"
-                "  Ensure your API keys are for LIVE Bybit (not testnet).\n"
-                "  Live API keys are created at bybit.com (not testnet.bybit.com)."
-            )
-        
-        self.logger.info(
-            f"Initializing CCXT exchange - Endpoint: {endpoint_url}\n"
-            f"  API key: {api_key_present} ({key_len} chars, preview: {key_preview})\n"
-            f"  Secret: {api_secret_present} ({secret_len} chars, preview: {secret_preview})\n"
-            f"  Config testnet: {config.testnet}, mode: {config.mode}, sandbox: {exchange_options.get('sandbox', False)}"
-        )
-        
-        if not api_key_present or not api_secret_present:
-            self.logger.error(
-                "API credentials are missing or empty in config!\n"
-                f"  API key present: {api_key_present} ({key_len} chars)\n"
-                f"  API secret present: {api_secret_present} ({secret_len} chars)\n"
-                "Ensure BYBIT_API_KEY and BYBIT_API_SECRET are set in .env file or config.yaml"
-            )
-        
-        self.exchange = exchange_class(
-            {
-                "apiKey": api_key,
-                "secret": api_secret,
-                "enableRateLimit": True,
-                "options": exchange_options,
+        try:
+            self.logger.debug("Starting BybitClient initialization...")
+            
+            # Configure exchange
+            exchange_options = {
+                "defaultType": "swap",  # USDT-margined perpetual futures
+                "adjustForTimeDifference": True,
             }
-        )
-        
-        # Verify what CCXT received (just for debugging)
-        self.logger.debug(
-            f"CCXT exchange initialized - apiKey set: {bool(self.exchange.apiKey)}, "
-            f"secret set: {bool(self.exchange.secret)}, "
-            f"sandbox: {self.exchange.options.get('sandbox', False)}"
-        )
 
-        # Retry configuration (could be made configurable via ExchangeConfig)
-        self.max_retries: int = 3
-        self.base_retry_delay: float = 1.0  # seconds
+            if config.testnet:
+                # CCXT uses testnet when sandbox=True
+                exchange_options["sandbox"] = True
+                endpoint_url = "testnet.bybit.com (TESTNET)"
+            else:
+                endpoint_url = "api.bybit.com (LIVE PRODUCTION)"
 
-        # Paper mode flag
-        self.paper_mode = config.mode == "paper"
+            # Create exchange instance
+            self.logger.debug(f"Getting CCXT exchange class: {config.name}")
+            try:
+                exchange_class = getattr(ccxt, config.name)
+                self.logger.debug(f"Successfully got exchange class: {exchange_class}")
+            except AttributeError as e:
+                self.logger.error(f"CCXT exchange '{config.name}' not found: {e}")
+                raise
+            
+            # Strip and validate credentials (strip again as safety measure)
+            api_key = (config.api_key or "").strip()
+            api_secret = (config.api_secret or "").strip()
+            
+            # Log credential status (without exposing actual values)
+            api_key_present = bool(api_key)
+            api_secret_present = bool(api_secret)
+            key_len = len(api_key)
+            secret_len = len(api_secret)
+            
+            # Log first/last few chars for debugging (without exposing full key)
+            key_preview = f"{api_key[:3]}...{api_key[-3:]}" if len(api_key) >= 6 else ("***" if api_key else "MISSING")
+            secret_preview = f"{api_secret[:3]}...{api_secret[-3:]}" if len(api_secret) >= 6 else ("***" if api_secret else "MISSING")
+            
+            # Critical warning if there's a mismatch
+            if config.mode == "live" and config.testnet:
+                self.logger.error(
+                    "⚠️  CONFIGURATION MISMATCH DETECTED ⚠️\n"
+                    "  Config has mode='live' but testnet=true!\n"
+                    "  The bot will connect to TESTNET, but you likely want LIVE.\n"
+                    "  Set testnet: false in config.yaml for live trading."
+                )
+            elif config.mode != "paper" and config.mode != "testnet" and not config.testnet:
+                self.logger.warning(
+                    "⚠️  Live production mode detected!\n"
+                    "  Ensure your API keys are for LIVE Bybit (not testnet).\n"
+                    "  Live API keys are created at bybit.com (not testnet.bybit.com)."
+                )
+                import sys
+                sys.stdout.flush()  # Force flush for systemd
+            
+            self.logger.info(
+                f"Initializing CCXT exchange - Endpoint: {endpoint_url}\n"
+                f"  API key: {api_key_present} ({key_len} chars, preview: {key_preview})\n"
+                f"  Secret: {api_secret_present} ({secret_len} chars, preview: {secret_preview})\n"
+                f"  Config testnet: {config.testnet}, mode: {config.mode}, sandbox: {exchange_options.get('sandbox', False)}"
+            )
+            
+            if not api_key_present or not api_secret_present:
+                self.logger.error(
+                    "API credentials are missing or empty in config!\n"
+                    f"  API key present: {api_key_present} ({key_len} chars)\n"
+                    f"  API secret present: {api_secret_present} ({secret_len} chars)\n"
+                    "Ensure BYBIT_API_KEY and BYBIT_API_SECRET are set in .env file or config.yaml"
+                )
+            
+            self.logger.info("Creating CCXT exchange instance...")
+            try:
+                self.exchange = exchange_class(
+                    {
+                        "apiKey": api_key,
+                        "secret": api_secret,
+                        "enableRateLimit": True,
+                        "options": exchange_options,
+                    }
+                )
+                self.logger.info("CCXT exchange instance created successfully")
+            except Exception as e:
+                self.logger.error(f"Failed to create CCXT exchange instance: {e}", exc_info=True)
+                raise
+            
+            # Verify what CCXT received (just for debugging)
+            self.logger.debug(
+                f"CCXT exchange initialized - apiKey set: {bool(self.exchange.apiKey)}, "
+                f"secret set: {bool(self.exchange.secret)}, "
+                f"sandbox: {self.exchange.options.get('sandbox', False)}"
+            )
 
-        if self.paper_mode:
-            self.logger.warning("Running in PAPER MODE - no real orders will be placed")
+            # Retry configuration (could be made configurable via ExchangeConfig)
+            self.max_retries: int = 3
+            self.base_retry_delay: float = 1.0  # seconds
 
-        self.logger.info(
-            f"Initialized Bybit client (mode: {config.mode}, testnet: {config.testnet})"
-        )
+            # Paper mode flag
+            self.paper_mode = config.mode == "paper"
+
+            if self.paper_mode:
+                self.logger.warning("Running in PAPER MODE - no real orders will be placed")
+
+            self.logger.info(
+                f"Initialized Bybit client (mode: {config.mode}, testnet: {config.testnet})"
+            )
+        except Exception as e:
+            self.logger.error(f"CRITICAL: Failed to initialize BybitClient: {e}", exc_info=True)
+            raise
 
     def _call_with_retries(self, func: Callable, *args: Any, **kwargs: Any) -> Any:
         """
