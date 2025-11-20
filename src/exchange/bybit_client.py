@@ -530,6 +530,7 @@ class BybitClient:
         order_type: str = "market",  # "market" or "limit"
         limit_price: Optional[float] = None,
         reduce_only: bool = True,
+        current_price: Optional[float] = None,  # Optional current price for validation
     ) -> Dict:
         """
         Create a stop-loss or stop-entry order (conditional order).
@@ -581,11 +582,23 @@ class BybitClient:
             else:
                 ccxt_symbol = symbol
             
+            # Fetch current price if not provided (for triggerDirection validation)
+            if current_price is None:
+                try:
+                    ticker = self.fetch_ticker(symbol)
+                    current_price = ticker.get('last')
+                    if current_price:
+                        self.logger.debug(f"Fetched current price for {symbol}: {current_price}")
+                except Exception as e:
+                    self.logger.warning(f"Could not fetch current price for {symbol}: {e}")
+                    current_price = None
+            
             time.sleep(self.exchange.rateLimit / 1000)
             
             # Bybit v5 conditional order params
             # CCXT may support this via params or may need direct API call
             # For now, we'll use CCXT's create_order with conditional order params
+            # NOTE: CCXT likely won't support this properly, so we'll fall back to direct API
             order_params = {
                 "stopPrice": trigger_price,  # Trigger price
                 "stopLossPrice": trigger_price,  # Alternative field name
@@ -620,7 +633,8 @@ class BybitClient:
                 # Use Bybit v5 API directly for conditional orders
                 # Fall back to direct API call since CCXT doesn't support conditional orders
                 order = self._create_stop_order_v5_api(
-                    symbol, side, amount, trigger_price, order_type, limit_price, reduce_only
+                    symbol, side, amount, trigger_price, order_type, 
+                    limit_price, reduce_only, current_price
                 )
                 # If successful, log and return
                 self.logger.info(
@@ -649,6 +663,7 @@ class BybitClient:
         order_type: str = "market",
         limit_price: Optional[float] = None,
         reduce_only: bool = True,
+        current_price: Optional[float] = None,  # For triggerDirection validation
     ) -> Dict:
         """
         Create stop order using Bybit v5 API directly (bypassing CCXT).
@@ -692,10 +707,34 @@ class BybitClient:
         # Build request parameters
         timestamp = str(int(time.time() * 1000))
         
+        # Determine triggerDirection based on stop order side:
+        # - For SELL stop (closing long position): price falls → triggerDirection = 2
+        # - For BUY stop (closing short position): price rises → triggerDirection = 1
+        # CRITICAL: triggerDirection is REQUIRED for conditional stop orders in Bybit v5
+        if side.lower() == 'sell':
+            # Stop-loss for long position: triggers when price falls below trigger
+            trigger_direction = 2  # Price falls to trigger price
+        else:  # side.lower() == 'buy'
+            # Stop-loss for short position: triggers when price rises above trigger
+            trigger_direction = 1  # Price rises to trigger price
+        
+        # Optional validation: Check trigger price relative to current price
+        if current_price is not None:
+            if side.lower() == 'sell' and trigger_price >= current_price:
+                self.logger.warning(
+                    f"Stop-loss trigger price ({trigger_price}) should be below current price "
+                    f"({current_price}) for SELL stop order. Proceeding anyway..."
+                )
+            elif side.lower() == 'buy' and trigger_price <= current_price:
+                self.logger.warning(
+                    f"Stop-loss trigger price ({trigger_price}) should be above current price "
+                    f"({current_price}) for BUY stop order. Proceeding anyway..."
+                )
+        
         # Build parameters matching Bybit v5 API format
         # CRITICAL: All numeric values (qty, triggerPrice, price) must be strings
         # Boolean values (reduceOnly) must be boolean (JSON will serialize as true/false)
-        # Integer values (positionIdx) must be integers (JSON will serialize as numbers)
+        # Integer values (positionIdx, triggerDirection) must be integers (JSON will serialize as numbers)
         params = {
             "category": "linear",  # USDT-margined perpetuals
             "symbol": bybit_symbol,
@@ -706,6 +745,8 @@ class BybitClient:
             "reduceOnly": bool(reduce_only),  # Boolean (will serialize as true/false)
             "stopOrderType": "StopMarket" if order_type == "market" else "StopLimit",  # Capitalized
             "triggerPrice": str(trigger_price),  # Must be string
+            "triggerDirection": trigger_direction,  # REQUIRED: 1 = price rises, 2 = price falls
+            "triggerBy": "LastPrice",  # Optional but recommended: LastPrice, MarkPrice, or IndexPrice
         }
         
         if order_type == "limit" and limit_price:
@@ -713,10 +754,13 @@ class BybitClient:
         
         # Log parameters for debugging (without exposing full amounts)
         self.logger.debug(
-            f"Bybit v5 stop order params: category={params['category']}, "
+            f"Bybit v5 stop order request: "
             f"symbol={params['symbol']}, side={params['side']}, "
-            f"orderType={params['orderType']}, stopOrderType={params['stopOrderType']}, "
-            f"positionIdx={params['positionIdx']}, reduceOnly={params['reduceOnly']}"
+            f"stopOrderType={params['stopOrderType']}, "
+            f"triggerPrice={params['triggerPrice']}, "
+            f"triggerDirection={params['triggerDirection']} ({'price rises' if params['triggerDirection'] == 1 else 'price falls'}), "
+            f"triggerBy={params['triggerBy']}, "
+            f"qty={params['qty']}, reduceOnly={params['reduceOnly']}"
         )
         
         # Get credentials (ensure they're stripped, same as in __init__)
@@ -793,8 +837,12 @@ class BybitClient:
             result = response.json()
             
             if result.get("retCode") != 0:
-                error_msg = result.get("retMsg", "Unknown error")
                 error_code = result.get("retCode", "unknown")
+                error_msg = result.get("retMsg", "Unknown error")
+                self.logger.error(
+                    f"Bybit v5 API error (code {error_code}): {error_msg}\n"
+                    f"Request params: {json.dumps(params, indent=2)}"
+                )
                 
                 # Enhanced error logging for signature errors
                 if "error sign" in error_msg.lower() or error_code == 10004:
@@ -851,6 +899,7 @@ class BybitClient:
         order_type: str = "limit",  # Usually limit for TP
         limit_price: Optional[float] = None,
         reduce_only: bool = True,
+        current_price: Optional[float] = None,  # Optional current price for validation
     ) -> Dict:
         """
         Create a take-profit order (conditional limit order).
@@ -885,7 +934,28 @@ class BybitClient:
             }
         
         try:
-            ccxt_symbol = symbol.replace("USDT", "/USDT") if "/" not in symbol else symbol
+            # Convert symbol format for CCXT (BTCUSDT -> BTC/USDT:USDT for perpetual futures)
+            if "/" not in symbol:
+                if symbol.endswith("USDT"):
+                    base = symbol[:-4]
+                    ccxt_symbol = f"{base}/USDT:USDT"
+                else:
+                    ccxt_symbol = f"{symbol}/USDT:USDT"
+            elif ":USDT" not in symbol:
+                ccxt_symbol = f"{symbol}:USDT"
+            else:
+                ccxt_symbol = symbol
+            
+            # Fetch current price if not provided (for triggerDirection validation)
+            if current_price is None:
+                try:
+                    ticker = self.fetch_ticker(symbol)
+                    current_price = ticker.get('last')
+                    if current_price:
+                        self.logger.debug(f"Fetched current price for {symbol} (TP): {current_price}")
+                except Exception as e:
+                    self.logger.warning(f"Could not fetch current price for {symbol} (TP): {e}")
+                    current_price = None
             
             time.sleep(self.exchange.rateLimit / 1000)
             
@@ -911,14 +981,25 @@ class BybitClient:
                     order_params,
                 )
             except (ccxt.ExchangeError, ccxt.NotSupported) as e:
+                # CCXT may not support take-profit orders directly
+                # Fall back to using Bybit v5 API directly
                 self.logger.warning(
-                    f"CCXT doesn't support take-profit orders directly for {symbol}: {e}"
+                    f"CCXT doesn't support take-profit orders directly for {symbol}: {e}. "
+                    "Attempting direct Bybit v5 API call..."
                 )
-                raise NotImplementedError(
-                    "Take-profit orders require Bybit v5 API. "
-                    "Please ensure CCXT version supports Bybit conditional orders."
+                # Use Bybit v5 API directly for take-profit orders
+                order = self._create_take_profit_order_v5_api(
+                    symbol, side, amount, trigger_price, order_type, 
+                    limit_price, reduce_only, current_price
                 )
+                # If successful, log and return
+                self.logger.info(
+                    f"Created take-profit {order_type} {side} order via Bybit v5 API: {symbol} {amount} @ "
+                    f"trigger={trigger_price}, order_id={order.get('id', 'N/A')}"
+                )
+                return order
             
+            # If CCXT succeeded, log and return
             self.logger.info(
                 f"Created take-profit {order_type} {side} order: {symbol} {amount} @ "
                 f"trigger={trigger_price}, order_id={order.get('id', 'N/A')}"
@@ -927,6 +1008,196 @@ class BybitClient:
             
         except Exception as e:
             self.logger.error(f"Error creating take-profit order for {symbol}: {e}")
+            raise
+    
+    def _create_take_profit_order_v5_api(
+        self,
+        symbol: str,
+        side: str,
+        amount: float,
+        trigger_price: float,
+        order_type: str = "limit",
+        limit_price: Optional[float] = None,
+        reduce_only: bool = True,
+        current_price: Optional[float] = None,  # For triggerDirection validation
+    ) -> Dict:
+        """
+        Create take-profit order using Bybit v5 API directly (bypassing CCXT).
+        
+        This is used as a fallback when CCXT doesn't support conditional orders.
+        
+        Args:
+            symbol: Trading pair (e.g., "BTCUSDT")
+            side: 'buy' or 'sell' (opposite of position side)
+            amount: Order size in contracts
+            trigger_price: Trigger price
+            order_type: "limit" or "market"
+            limit_price: Limit price (for take-profit limit orders)
+            reduce_only: If True, only reduce position
+            current_price: Optional current market price (for triggerDirection calculation)
+        
+        Returns:
+            Order dictionary
+        """
+        # Check if requests is available
+        if not REQUESTS_AVAILABLE:
+            raise ImportError(
+                "The 'requests' library is required for direct Bybit v5 API calls. "
+                "Install it with: pip install requests"
+            )
+        
+        # Convert symbol format (BTC/USDT or BTCUSDT -> BTCUSDT for Bybit)
+        bybit_symbol = symbol.replace("/", "").replace(":USDT", "USDT")
+        if not bybit_symbol.endswith("USDT"):
+            bybit_symbol = f"{bybit_symbol}USDT"
+        
+        # Determine base URL
+        if self.config.testnet:
+            base_url = "https://api-testnet.bybit.com"
+        else:
+            base_url = "https://api.bybit.com"
+        
+        endpoint = "/v5/order/create"
+        url = f"{base_url}{endpoint}"
+        
+        # Build request parameters
+        timestamp = str(int(time.time() * 1000))
+        
+        # Determine triggerDirection based on take-profit order side:
+        # - For SELL TP (closing long position): price rises → triggerDirection = 1
+        # - For BUY TP (closing short position): price falls → triggerDirection = 2
+        # CRITICAL: triggerDirection is REQUIRED for conditional take-profit orders in Bybit v5
+        if side.lower() == 'sell':
+            # Take-profit for long position: triggers when price rises above trigger
+            trigger_direction = 1  # Price rises to trigger price
+        else:  # side.lower() == 'buy'
+            # Take-profit for short position: triggers when price falls below trigger
+            trigger_direction = 2  # Price falls to trigger price
+        
+        # Optional validation: Check trigger price relative to current price
+        if current_price is not None:
+            if side.lower() == 'sell' and trigger_price <= current_price:
+                self.logger.warning(
+                    f"Take-profit trigger price ({trigger_price}) should be above current price "
+                    f"({current_price}) for SELL take-profit order. Proceeding anyway..."
+                )
+            elif side.lower() == 'buy' and trigger_price >= current_price:
+                self.logger.warning(
+                    f"Take-profit trigger price ({trigger_price}) should be below current price "
+                    f"({current_price}) for BUY take-profit order. Proceeding anyway..."
+                )
+        
+        # Build parameters matching Bybit v5 API format
+        params = {
+            "category": "linear",  # USDT-margined perpetuals
+            "symbol": bybit_symbol,
+            "side": side.capitalize(),  # Buy or Sell (capitalized)
+            "orderType": "Market" if order_type == "market" else "Limit",  # Capitalized
+            "qty": str(amount),  # Must be string
+            "positionIdx": 0,  # One-way mode
+            "reduceOnly": bool(reduce_only),  # Boolean
+            "stopOrderType": "TakeProfitMarket" if order_type == "market" else "TakeProfit",  # Capitalized
+            "triggerPrice": str(trigger_price),  # Must be string
+            "triggerDirection": trigger_direction,  # REQUIRED: 1 = price rises, 2 = price falls
+            "triggerBy": "LastPrice",  # Optional but recommended
+        }
+        
+        if order_type == "limit":
+            if limit_price is None:
+                limit_price = trigger_price
+            params["price"] = str(limit_price)  # Must be string
+            params["timeInForce"] = "GTC"  # Good till cancel
+        
+        # Log full params for debugging (redact sensitive data)
+        self.logger.debug(
+            f"Bybit v5 take-profit order request: "
+            f"symbol={params['symbol']}, side={params['side']}, "
+            f"stopOrderType={params['stopOrderType']}, "
+            f"triggerPrice={params['triggerPrice']}, "
+            f"triggerDirection={params['triggerDirection']} ({'price rises' if params['triggerDirection'] == 1 else 'price falls'}), "
+            f"triggerBy={params['triggerBy']}, "
+            f"qty={params['qty']}, reduceOnly={params['reduceOnly']}"
+        )
+        
+        # Get credentials
+        api_key = (self.config.api_key or "").strip()
+        api_secret = (self.config.api_secret or "").strip()
+        
+        if not api_key or not api_secret:
+            raise ccxt.AuthenticationError("API credentials missing or empty in config")
+        
+        recv_window = "5000"
+        
+        # Create compact JSON string (no spaces, sorted keys)
+        json_string = json.dumps(params, separators=(',', ':'), sort_keys=True, ensure_ascii=True)
+        
+        self.logger.debug(f"Bybit v5 API request JSON (TP, length={len(json_string)}): {json_string}")
+        
+        # Build signature string: timestamp + api_key + recv_window + json_string
+        param_str = str(timestamp) + str(api_key) + str(recv_window) + json_string
+        
+        # Generate signature (HMAC-SHA256)
+        param_str_bytes = param_str.encode("utf-8")
+        api_secret_bytes = api_secret.encode("utf-8")
+        
+        signature_bytes = hmac.new(
+            api_secret_bytes,
+            param_str_bytes,
+            hashlib.sha256
+        ).digest()
+        signature = signature_bytes.hex()
+        
+        # Prepare headers
+        headers = {
+            "X-BAPI-API-KEY": api_key,
+            "X-BAPI-SIGN": signature,
+            "X-BAPI-SIGN-TYPE": "2",  # SHA256
+            "X-BAPI-TIMESTAMP": timestamp,
+            "X-BAPI-RECV-WINDOW": recv_window,
+            "Content-Type": "application/json",
+        }
+        
+        # Make request
+        try:
+            response = requests.post(url, data=json_string.encode('utf-8'), headers=headers, timeout=10)
+            response.raise_for_status()
+            result = response.json()
+            
+            if result.get("retCode") != 0:
+                error_code = result.get("retCode", "unknown")
+                error_msg = result.get("retMsg", "Unknown error")
+                self.logger.error(
+                    f"Bybit v5 API error (code {error_code}): {error_msg}\n"
+                    f"Request params: {json.dumps(params, indent=2)}"
+                )
+                raise ccxt.ExchangeError(f"Bybit API error (code {error_code}): {error_msg}")
+            
+            order_data = result.get("result", {})
+            order_id = order_data.get("orderId", "")
+            
+            self.logger.info(
+                f"Created take-profit order via Bybit v5 API: {symbol} {amount} @ "
+                f"trigger={trigger_price}, order_id={order_id}"
+            )
+            
+            # Return CCXT-compatible order structure
+            return {
+                "id": str(order_id),
+                "symbol": symbol,
+                "side": side,
+                "amount": amount,
+                "price": limit_price or trigger_price,
+                "type": f"take_profit_{order_type}",
+                "status": "open",
+                "timestamp": int(time.time() * 1000),
+                "info": order_data,
+            }
+            
+        except requests.RequestException as e:
+            self.logger.error(f"HTTP error creating take-profit order: {e}")
+            raise ccxt.ExchangeError(f"HTTP error: {e}") from e
+        except Exception as e:
+            self.logger.error(f"Error in Bybit v5 API call (TP): {e}")
             raise
     
     def cancel_order(self, order_id: str, symbol: str) -> Dict:

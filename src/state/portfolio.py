@@ -38,7 +38,34 @@ class PortfolioState:
             
             self.positions = {}
             for pos in positions:
-                symbol = pos.get('symbol', '').replace('/USDT', 'USDT')
+                # Normalize symbol format: CCXT returns "SOL/USDT:USDT" for perpetual futures
+                # Convert to "SOLUSDT" for internal use
+                pos_symbol = pos.get('symbol', '')
+                # Handle different CCXT symbol formats:
+                # - "SOL/USDT:USDT" (perpetual futures) → "SOLUSDT"
+                # - "SOL/USDT" (spot) → "SOLUSDT"
+                # - "SOLUSDT" (already normalized) → "SOLUSDT"
+                # Normalize CCXT symbol format to internal format (BASEUSDT)
+                # CCXT returns different formats:
+                # - "SOL/USDT:USDT" for perpetual futures
+                # - "SOL/USDT" for spot
+                # We want: "SOLUSDT"
+                
+                # Step 1: Remove :USDT suffix if present (for perpetual futures)
+                if ':USDT' in pos_symbol:
+                    normalized = pos_symbol.replace(':USDT', '')  # "SOL/USDT:USDT" → "SOL/USDT"
+                else:
+                    normalized = pos_symbol
+                
+                # Step 2: Replace /USDT with USDT (handles both spot and futures after step 1)
+                if '/USDT' in normalized:
+                    symbol = normalized.replace('/USDT', 'USDT')  # "SOL/USDT" → "SOLUSDT"
+                else:
+                    # Already in BASEUSDT format (shouldn't happen but handle it)
+                    symbol = normalized
+                
+                self.logger.debug(f"Normalized position symbol: {pos_symbol} → {symbol}")
+                
                 contracts = float(pos.get('contracts', 0))
                 entry_price = float(pos.get('entryPrice', 0))
                 mark_price = float(pos.get('markPrice', 0))

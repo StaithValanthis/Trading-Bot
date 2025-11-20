@@ -50,6 +50,7 @@ class OrderExecutor:
         size: float,
         stop_loss_price: float,
         portfolio_state: Optional[PortfolioState] = None,
+        entry_price: Optional[float] = None,  # Entry price for validation
     ) -> Optional[str]:
         """
         Place a stop-loss order for a position.
@@ -82,9 +83,16 @@ class OrderExecutor:
             # Determine stop order type
             stop_order_type = self.risk_config.stop_order_type if self.risk_config else "stop_market"
             
+            # Use entry price or current mark price as reference for triggerDirection validation
+            current_price_ref = entry_price
+            if not current_price_ref and portfolio_state:
+                pos = portfolio_state.get_position(symbol)
+                if pos:
+                    current_price_ref = pos.get('mark_price') or pos.get('entry_price')
+            
             self.logger.info(
                 f"Placing stop-loss order for {symbol}: {stop_side} {size} @ trigger={stop_price_rounded} "
-                f"(type={stop_order_type})"
+                f"(type={stop_order_type}, entry_ref={current_price_ref})"
             )
             
             # Place stop order
@@ -97,6 +105,7 @@ class OrderExecutor:
                 order_type="market" if stop_order_type == "stop_market" else "limit",
                 limit_price=limit_price,
                 reduce_only=True,
+                current_price=current_price_ref,  # Pass current price reference for validation
             )
             
             stop_order_id = stop_order.get("id")
@@ -151,8 +160,16 @@ class OrderExecutor:
             # Round TP price to exchange precision
             tp_price_rounded = self.exchange.round_price(symbol, take_profit_price)
             
+            # Use entry price or current mark price as reference for triggerDirection validation
+            current_price_ref = None
+            if portfolio_state:
+                pos = portfolio_state.get_position(symbol)
+                if pos:
+                    current_price_ref = pos.get('mark_price') or pos.get('entry_price')
+            
             self.logger.info(
-                f"Placing take-profit order for {symbol}: {tp_side} {size} @ trigger={tp_price_rounded}"
+                f"Placing take-profit order for {symbol}: {tp_side} {size} @ trigger={tp_price_rounded} "
+                f"(entry_ref={current_price_ref})"
             )
             
             # Place TP order (usually limit order)
@@ -164,6 +181,7 @@ class OrderExecutor:
                 order_type="limit",
                 limit_price=tp_price_rounded,
                 reduce_only=True,
+                current_price=current_price_ref,  # Pass current price reference for validation
             )
             
             tp_order_id = tp_order.get("id")
@@ -350,7 +368,26 @@ class OrderExecutor:
                     try:
                         positions = self.exchange.fetch_positions(symbol=symbol)
                         for pos in positions:
-                            pos_symbol = pos.get('symbol', '').replace('/USDT', 'USDT')
+                            # Normalize symbol format: CCXT returns "SOL/USDT:USDT" for perpetual futures
+                            # Convert to "SOLUSDT" for comparison (same logic as portfolio.py)
+                            pos_symbol_raw = pos.get('symbol', '')
+                            
+                            # First, remove :USDT suffix if present (for perpetual futures)
+                            if ':USDT' in pos_symbol_raw:
+                                pos_symbol = pos_symbol_raw.replace(':USDT', '')  # "SOL/USDT:USDT" → "SOL/USDT"
+                            else:
+                                pos_symbol = pos_symbol_raw
+                            
+                            # Then, replace /USDT with USDT (handles both spot and futures after removing :USDT)
+                            if '/USDT' in pos_symbol:
+                                pos_symbol = pos_symbol.replace('/USDT', 'USDT')  # "SOL/USDT" → "SOLUSDT"
+                            # else: already in BASEUSDT format, use as-is
+                            
+                            self.logger.debug(
+                                f"Position verification: comparing {pos_symbol_raw} (normalized: {pos_symbol}) "
+                                f"with target {symbol}"
+                            )
+                            
                             contracts = float(pos.get('contracts', 0))
                             if pos_symbol == symbol and abs(contracts) > 0.001:
                                 position_verified = True
@@ -403,6 +440,7 @@ class OrderExecutor:
                     actual_size,  # Use actual position size
                     stop_loss_price,
                     portfolio_state,
+                    entry_price,  # Pass entry price for validation
                 )
             
             # Place take-profit order if configured
