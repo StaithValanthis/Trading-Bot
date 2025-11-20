@@ -234,44 +234,67 @@ def run_live(config_path: str):
         )
     
     # Initialize exchange client
-    exchange = BybitClient(config.exchange)
+    logger.info("Initializing Bybit exchange client...")
+    try:
+        exchange = BybitClient(config.exchange)
+        logger.info("Bybit client initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize Bybit client: {e}", exc_info=True)
+        sys.exit(1)
     
     # Test connection and validate credentials before proceeding
+    logger.info("Testing connection to Bybit exchange...")
     try:
         exchange.test_connection()
+        logger.info("Connection test successful - API credentials are valid")
     except Exception as e:
         logger.error(
             f"Failed to connect to Bybit exchange: {e}\n"
             "The bot cannot start without valid API credentials.\n"
-            "Please fix your API credentials and try again."
+            "Please fix your API credentials and try again.",
+            exc_info=True
         )
         sys.exit(1)
     
     # Initialize remaining components
-    store = OHLCVStore(config.data.db_path)
-    downloader = DataDownloader(exchange, store)
-    portfolio = PortfolioState(exchange)
-    trend_gen = TrendSignalGenerator(config.strategy.trend)
-    cross_sectional_gen = CrossSectionalSignalGenerator(config.strategy.cross_sectional)
-    funding_bias = FundingBiasGenerator(config.strategy.funding_bias, exchange)
-    position_sizer = PositionSizer(config.risk, exchange)
-    portfolio_limits = PortfolioLimits(config.risk, exchange)
-    trades_store = TradesStore(config.data.db_path)
-    orders_store = OrdersStore(config.data.db_path)
-    executor = OrderExecutor(
-        exchange,
-        trades_store=trades_store,
-        orders_store=orders_store,
-        risk_config=config.risk,
-        strategy_config=config.strategy.trend,
-    )
+    logger.info("Initializing data stores and strategy components...")
+    try:
+        store = OHLCVStore(config.data.db_path)
+        downloader = DataDownloader(exchange, store)
+        portfolio = PortfolioState(exchange)
+        trend_gen = TrendSignalGenerator(config.strategy.trend)
+        cross_sectional_gen = CrossSectionalSignalGenerator(config.strategy.cross_sectional)
+        funding_bias = FundingBiasGenerator(config.strategy.funding_bias, exchange)
+        position_sizer = PositionSizer(config.risk, exchange)
+        portfolio_limits = PortfolioLimits(config.risk, exchange)
+        trades_store = TradesStore(config.data.db_path)
+        orders_store = OrdersStore(config.data.db_path)
+        logger.info("Data stores initialized successfully")
+        
+        executor = OrderExecutor(
+            exchange,
+            trades_store=trades_store,
+            orders_store=orders_store,
+            risk_config=config.risk,
+            strategy_config=config.strategy.trend,
+        )
+        logger.info("Order executor initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize components: {e}", exc_info=True)
+        sys.exit(1)
 
     logger.info(f"Loaded config version: {config.config_version}")
+    logger.info("All components initialized successfully")
 
     # Update portfolio state and recover any existing positions
     logger.info("Checking for existing open positions...")
-    portfolio.update()
-    portfolio_limits.update_daily_start(portfolio.equity)
+    try:
+        portfolio.update()
+        logger.info(f"Portfolio state updated - Equity: ${portfolio.equity:,.2f}, Positions: {len(portfolio.positions)}")
+        portfolio_limits.update_daily_start(portfolio.equity)
+    except Exception as e:
+        logger.error(f"Failed to update portfolio state: {e}", exc_info=True)
+        sys.exit(1)
     
     # Log recovered positions
     if portfolio.positions:
@@ -320,6 +343,7 @@ def run_live(config_path: str):
     logger.info(f"Bot initialized. Mode: {config.exchange.mode}, Equity: ${portfolio.equity:,.2f}")
     logger.info("Starting main trading loop...")
     logger.info(f"Rebalance frequency: every {rebalance_frequency_hours} hours")
+    logger.info("Entering main loop - bot will run until interrupted or error occurs")
     
     loop_iteration = 0
     try:
@@ -327,6 +351,7 @@ def run_live(config_path: str):
             loop_iteration += 1
             logger.info(f"="*60)
             logger.info(f"Loop iteration #{loop_iteration} - {datetime.now(timezone.utc).isoformat()}")
+            logger.debug("Starting loop iteration processing...")
             
             try:
                 # Update portfolio state
