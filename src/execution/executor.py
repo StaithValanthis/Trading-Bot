@@ -240,27 +240,54 @@ class OrderExecutor:
         """
         Reconcile current positions with target positions and execute changes.
         
+        This method ensures that existing positions opened by previous bot runs
+        (or manually) are properly managed according to the current strategy.
+        
         Args:
-            portfolio_state: Current portfolio state
-            target_positions: Dictionary of target positions
+            portfolio_state: Current portfolio state (includes existing positions)
+            target_positions: Dictionary of target positions from strategy
         
         Returns:
             List of execution results
         """
         results = []
         
-        # Get current positions
+        # Get current positions from portfolio state
         current_positions = {}
         for symbol, pos in portfolio_state.positions.items():
             contracts = pos.get('contracts', 0)
+            side = pos.get('side', 'long')
             if abs(contracts) > 0.001:
-                current_positions[symbol] = contracts
+                # Store signed contracts (positive for long, negative for short)
+                signed_contracts = abs(contracts) if side == 'long' else -abs(contracts)
+                current_positions[symbol] = signed_contracts
+                
+                if symbol in target_positions:
+                    target = target_positions[symbol]
+                    target_size = target.get('size', 0)
+                    self.logger.info(
+                        f"Reconciling {symbol}: current={signed_contracts:.4f}, "
+                        f"target={target_size:.4f}"
+                    )
+        
+        # Log positions that will be closed (not in target)
+        positions_to_close = [s for s in current_positions if s not in target_positions]
+        if positions_to_close:
+            self.logger.info(
+                f"Closing {len(positions_to_close)} position(s) not in target portfolio: {positions_to_close}"
+            )
         
         # Close positions not in target
-        for symbol in current_positions:
-            if symbol not in target_positions:
-                result = self.close_position(symbol)
-                results.append(result)
+        for symbol in positions_to_close:
+            pos = portfolio_state.positions.get(symbol, {})
+            side = pos.get('side', 'long')
+            contracts = abs(pos.get('contracts', 0))
+            self.logger.info(
+                f"Closing {symbol}: {side.upper()} {contracts:.4f} contracts "
+                f"(not in target portfolio)"
+            )
+            result = self.close_position(symbol)
+            results.append(result)
         
         # Open or adjust positions
         for symbol, target in target_positions.items():

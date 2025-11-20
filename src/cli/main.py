@@ -262,9 +262,38 @@ def run_live(config_path: str):
 
     logger.info(f"Loaded config version: {config.config_version}")
 
-    # Update portfolio state
+    # Update portfolio state and recover any existing positions
+    logger.info("Checking for existing open positions...")
     portfolio.update()
     portfolio_limits.update_daily_start(portfolio.equity)
+    
+    # Log recovered positions
+    if portfolio.positions:
+        logger.info(f"Found {len(portfolio.positions)} existing open position(s) on exchange:")
+        total_notional = 0.0
+        for symbol, pos in portfolio.positions.items():
+            side = pos.get('side', 'long')
+            contracts = pos.get('contracts', 0)
+            entry_price = pos.get('entry_price', 0)
+            mark_price = pos.get('mark_price', 0)
+            unrealized_pnl = pos.get('unrealized_pnl', 0)
+            notional = abs(pos.get('notional', 0))
+            total_notional += notional
+            
+            logger.info(
+                f"  {symbol}: {side.upper()} {abs(contracts):.4f} contracts | "
+                f"Entry: ${entry_price:,.2f} | Mark: ${mark_price:,.2f} | "
+                f"Notional: ${notional:,.2f} | PnL: ${unrealized_pnl:,.2f}"
+            )
+        
+        logger.info(
+            f"Total position notional: ${total_notional:,.2f} | "
+            f"Effective leverage: {portfolio.get_leverage():.2f}x | "
+            f"Equity: ${portfolio.equity:,.2f}"
+        )
+        logger.info("Bot will manage these positions according to strategy rules.")
+    else:
+        logger.info("No existing open positions found. Bot will start fresh.")
     
     # Track last rebalance time
     last_rebalance_time = None
@@ -283,12 +312,21 @@ def run_live(config_path: str):
         logger.info("Dynamic universe selection enabled")
     
     logger.info(f"Bot initialized. Mode: {config.exchange.mode}, Equity: ${portfolio.equity:,.2f}")
+    logger.info("Starting main trading loop...")
+    logger.info(f"Rebalance frequency: every {rebalance_frequency_hours} hours")
     
+    loop_iteration = 0
     try:
         while True:
+            loop_iteration += 1
+            logger.info(f"="*60)
+            logger.info(f"Loop iteration #{loop_iteration} - {datetime.now(timezone.utc).isoformat()}")
+            
             try:
                 # Update portfolio state
+                logger.info("Updating portfolio state...")
                 portfolio.update()
+                logger.info(f"Portfolio updated - Equity: ${portfolio.equity:,.2f}, Positions: {len(portfolio.positions)}")
             except ccxt.AuthenticationError as e:
                 # Authentication errors are fatal - stop the bot
                 logger.critical(
@@ -296,39 +334,49 @@ def run_live(config_path: str):
                     "The bot will stop. Please check your API credentials and restart."
                 )
                 sys.exit(1)
-                
-                # Check daily loss limits
-                can_trade, loss_reason = portfolio_limits.check_daily_loss_limits(
-                    portfolio.equity,
-                    realized_pnl=0.0  # TODO: Calculate from closed trades
-                )
-                
-                if not can_trade:
-                    logger.warning(f"Daily loss limit breached: {loss_reason}")
-                    # Wait until next day
-                    time.sleep(3600)  # Check again in 1 hour
-                    continue
-                
-                # Update data
-                logger.info("Updating market data...")
-                downloader.update_all_symbols(
-                    config.exchange.symbols,
-                    config.exchange.timeframe,
-                    lookback_days=30
-                )
-                
-                # Determine if we should rebalance
-                now = datetime.now(timezone.utc)
-                should_rebalance = False
-                
-                if last_rebalance_time is None:
+            
+            # Check daily loss limits
+            can_trade, loss_reason = portfolio_limits.check_daily_loss_limits(
+                portfolio.equity,
+                realized_pnl=0.0  # TODO: Calculate from closed trades
+            )
+            
+            if not can_trade:
+                logger.warning(f"Daily loss limit breached: {loss_reason}")
+                logger.info("Waiting 1 hour before checking again...")
+                # Wait until next day
+                time.sleep(3600)  # Check again in 1 hour
+                continue
+            
+            # Update data
+            logger.info("Updating market data...")
+            downloader.update_all_symbols(
+                config.exchange.symbols,
+                config.exchange.timeframe,
+                lookback_days=30
+            )
+            logger.info("Market data updated successfully")
+            
+            # Determine if we should rebalance
+            now = datetime.now(timezone.utc)
+            should_rebalance = False
+            
+            if last_rebalance_time is None:
+                logger.info("First iteration - will rebalance now")
+                should_rebalance = True
+            else:
+                hours_diff = (now - last_rebalance_time).total_seconds() / 3600
+                logger.info(f"Last rebalance: {last_rebalance_time.isoformat()} ({hours_diff:.1f} hours ago)")
+                if hours_diff >= rebalance_frequency_hours:
+                    logger.info(f"Rebalance threshold reached ({hours_diff:.1f}h >= {rebalance_frequency_hours}h) - will rebalance")
                     should_rebalance = True
                 else:
-                    hours_diff = (now - last_rebalance_time).total_seconds() / 3600
-                    if hours_diff >= rebalance_frequency_hours:
-                        should_rebalance = True
+                    logger.info(f"Rebalance threshold not reached ({hours_diff:.1f}h < {rebalance_frequency_hours}h) - skipping rebalance")
                 
-                if should_rebalance:
+            if should_rebalance:
+                logger.info("="*60)
+                logger.info("REBALANCING PORTFOLIO")
+                logger.info("="*60)
                     logger.info("Rebalancing portfolio...")
                     
                     # Get current universe (dynamic or fixed)
@@ -491,30 +539,45 @@ def run_live(config_path: str):
                         }
                     
                     # Execute position changes
-                    if target_positions:
-                        logger.info(f"Executing {len(target_positions)} position changes...")
+                    # Note: reconcile_positions handles both:
+                    # 1. Positions to open/adjust (in target_positions)
+                    # 2. Positions to close (existing but not in target_positions)
+                    # This ensures that positions opened before restart are properly managed
+                    if target_positions or portfolio.positions:
+                        existing_count = len(portfolio.positions)
+                        target_count = len(target_positions)
+                        logger.info(
+                            f"Reconciling positions: {existing_count} existing position(s), "
+                            f"{target_count} target position(s)"
+                        )
                         results = executor.reconcile_positions(portfolio, target_positions)
                         
                         for result in results:
                             if result.get('status') == 'filled':
                                 logger.info(f"Position updated: {result.get('symbol')}")
+                            elif result.get('status') == 'closed':
+                                logger.info(f"Position closed: {result.get('symbol')}")
                             elif result.get('status') == 'error':
                                 logger.error(f"Error executing position: {result.get('error')}")
+                    else:
+                        logger.info("No position changes needed (no targets and no existing positions)")
                     
                     last_rebalance_time = now
 
                 # Heartbeat / health summary
                 logger.info(
-                    "Heartbeat | mode=%s | config_version=%s | equity=%.2f | positions=%d",
+                    "Heartbeat | mode=%s | config_version=%s | equity=%.2f | positions=%d | open_symbols=%s",
                     config.exchange.mode,
                     config.config_version,
                     portfolio.equity,
                     len(portfolio.positions),
+                    ", ".join(portfolio.positions.keys()) if portfolio.positions else "none"
                 )
 
                 # Sleep until next iteration (check every hour for rebalancing)
                 sleep_seconds = 3600  # 1 hour
-                logger.info(f"Sleeping for {sleep_seconds}s until next check...")
+                logger.info(f"Loop iteration #{loop_iteration} complete. Sleeping for {sleep_seconds}s ({sleep_seconds/60:.0f} minutes) until next check...")
+                logger.info("="*60)
                 time.sleep(sleep_seconds)
                 
             except KeyboardInterrupt:

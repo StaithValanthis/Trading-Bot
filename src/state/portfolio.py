@@ -57,7 +57,14 @@ class PortfolioState:
                     }
             
             self.last_update = datetime.now()
-            self.logger.debug(f"Portfolio updated: equity={self.equity:.2f}, positions={len(self.positions)}")
+            
+            if self.positions:
+                self.logger.info(
+                    f"Portfolio updated: equity=${self.equity:,.2f}, "
+                    f"{len(self.positions)} open position(s): {', '.join(self.positions.keys())}"
+                )
+            else:
+                self.logger.debug(f"Portfolio updated: equity=${self.equity:,.2f}, no open positions")
             
         except Exception as e:
             self.logger.error(f"Error updating portfolio state: {e}")
