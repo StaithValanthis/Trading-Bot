@@ -12,6 +12,7 @@ from ..data.ohlcv_store import OHLCVStore
 from ..universe.store import UniverseStore
 from ..logging_utils import get_logger
 from ..utils import parse_timeframe_to_hours
+from ..utils import parse_timeframe_to_hours
 
 logger = get_logger(__name__)
 
@@ -94,46 +95,80 @@ class UniverseSelector:
         Fetch 24h ticker data for a symbol (cached).
         
         Args:
-            symbol: Symbol name
+            symbol: Symbol name (internal format, e.g. 'BTCUSDT')
         
         Returns:
             Ticker dictionary with volume, etc., or None if error
         """
         # Check cache
         now = time.time()
-        if (symbol in self._ticker_cache and
-            symbol in self._ticker_cache_time and
-            now - self._ticker_cache_time[symbol] < self._cache_ttl):
+        if (
+            symbol in self._ticker_cache
+            and symbol in self._ticker_cache_time
+            and now - self._ticker_cache_time[symbol] < self._cache_ttl
+        ):
             return self._ticker_cache[symbol]
         
-        try:
-            # Fetch ticker via CCXT
-            ccxt_symbol = symbol.replace('USDT', '/USDT') if not '/' in symbol else symbol
-            ticker = self.exchange.exchange.fetch_ticker(ccxt_symbol)
+        # Build candidate CCXT symbols for Bybit linear USDT perps
+        candidates = []
+        if '/' in symbol:
+            candidates.append(symbol)
+        else:
+            # Internal format is typically 'BASEUSDT'
+            if symbol.endswith('USDT'):
+                base = symbol[:-4]
+                # Bybit unified linear perp symbols are usually 'BASE/USDT:USDT'
+                candidates.append(f"{base}/USDT:USDT")
+                # Fallback to spot-style symbol if perp symbol fails
+                candidates.append(f"{base}/USDT")
+            else:
+                # Fallback: try generic '/USDT'
+                candidates.append(f"{symbol}/USDT")
+        
+        last_error: Optional[Exception] = None
+        
+        for ccxt_symbol in candidates:
+            try:
+                ticker = self.exchange.exchange.fetch_ticker(ccxt_symbol)
+                
+                data = {
+                    'volume_24h': ticker.get('quoteVolume', 0),  # USDT volume
+                    'open_interest': None,  # OI not always available in CCXT
+                    'last_price': ticker.get('last', 0),
+                    'bid': ticker.get('bid', 0),
+                    'ask': ticker.get('ask', 0),
+                    'spread_bps': 0,
+                    'ccxt_symbol': ccxt_symbol,
+                }
+                
+                # Calculate spread if bid/ask available
+                if data['bid'] > 0 and data['ask'] > 0:
+                    spread = (data['ask'] - data['bid']) / data['bid']
+                    data['spread_bps'] = spread * 10000  # Convert to basis points
+                
+                # Update cache
+                self._ticker_cache[symbol] = data
+                self._ticker_cache_time[symbol] = now
+                
+                return data
             
-            data = {
-                'volume_24h': ticker.get('quoteVolume', 0),  # USDT volume
-                'open_interest': None,  # OI not always available in CCXT
-                'last_price': ticker.get('last', 0),
-                'bid': ticker.get('bid', 0),
-                'ask': ticker.get('ask', 0),
-                'spread_bps': 0
-            }
-            
-            # Calculate spread if bid/ask available
-            if data['bid'] > 0 and data['ask'] > 0:
-                spread = (data['ask'] - data['bid']) / data['bid']
-                data['spread_bps'] = spread * 10000  # Convert to basis points
-            
-            # Update cache
-            self._ticker_cache[symbol] = data
-            self._ticker_cache_time[symbol] = now
-            
-            return data
-            
-        except Exception as e:
-            self.logger.debug(f"Error fetching ticker for {symbol}: {e}")
-            return None
+            except Exception as e:
+                # Save last error and try next candidate
+                last_error = e
+                self.logger.debug(
+                    f"Error fetching ticker for {symbol} using {ccxt_symbol}: {e}"
+                )
+                continue
+        
+        # All candidates failed
+        if last_error is not None:
+            # Log at INFO for visibility, but only once per symbol per cache window
+            self.logger.info(
+                f"Ticker data unavailable for {symbol} after trying candidates "
+                f"{candidates}. Last error: {last_error}"
+            )
+        
+        return None
     
     def check_liquidity_filters(
         self,

@@ -227,21 +227,22 @@ class ReportingConfig:
 class UniverseConfig:
     """Universe selection configuration."""
     # Liquidity filters
-    min_24h_volume_entry: float = 10_000_000.0  # $10M USDT
-    min_24h_volume_exit: float = 7_000_000.0    # $7M USDT (hysteresis)
-    volume_check_days: int = 7                   # Consecutive days for entry/exit
+    # More forgiving defaults for a retail-sized account
+    min_24h_volume_entry: float = 2_000_000.0  # $2M USDT
+    min_24h_volume_exit: float = 1_000_000.0   # $1M USDT (hysteresis)
+    volume_check_days: int = 3                 # Consecutive days for entry/exit
     min_open_interest: Optional[float] = None    # Optional, $5M USDT
-    max_spread_bps: Optional[float] = None       # Optional, 20 basis points
+    max_spread_bps: Optional[float] = 25.0       # Optional, 25 basis points (0.25%)
     
     # Historical data
     min_history_days: int = 30
-    warmup_days: int = 14                        # Warm-up period for new listings
-    max_data_gap_pct: float = 5.0                # Max % missing candles
-    max_days_since_last_update: int = 7          # Max days since last data update
+    warmup_days: int = 7                         # Warm-up period for new listings
+    max_data_gap_pct: float = 10.0               # Max % missing candles
+    max_days_since_last_update: int = 3          # Max days since last data update
     
     # Volatility & price
     min_price_usdt: float = 0.01                 # Minimum price
-    max_realized_vol_pct: float = 200.0          # Annualized volatility %
+    max_realized_vol_pct: float = 300.0          # Annualized volatility %
     limit_move_frequency_pct: float = 5.0        # Max % of days with limit moves
     
     # Universe stability

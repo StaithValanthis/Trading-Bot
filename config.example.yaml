@@ -111,32 +111,32 @@ data:
 # Universe selection
 universe:
   # Liquidity filters
-  # Minimum 24h notional volume for entry ($10M USDT default)
-  min_24h_volume_entry: 10_000_000
-  # Minimum 24h volume to stay in universe ($7M USDT default, hysteresis)
-  min_24h_volume_exit: 7_000_000
-  # Number of consecutive days volume must be above threshold
-  volume_check_days: 7
-  # Optional: minimum open interest ($5M USDT, set null to disable)
+  # Minimum 24h notional volume for entry ($2M USDT default for retail-sized account)
+  min_24h_volume_entry: 2_000_000
+  # Minimum 24h volume to stay in universe ($1M USDT default, hysteresis)
+  min_24h_volume_exit: 1_000_000
+  # Number of consecutive days volume must be above/below threshold
+  volume_check_days: 3
+  # Optional: minimum open interest (set e.g. 2_000_000 for stricter OI filter; null to disable)
   min_open_interest: null
-  # Optional: maximum bid-ask spread in basis points (20 = 0.20%, set null to disable)
-  max_spread_bps: null
+  # Optional: maximum bid-ask spread in basis points (25 = 0.25%, set null to disable)
+  max_spread_bps: 25.0
   
   # Historical data requirements
   # Minimum days of continuous OHLCV history required
   min_history_days: 30
   # Warm-up period: new listings must pass filters for this many days before entry
-  warmup_days: 14
-  # Maximum percentage of missing candles allowed
-  max_data_gap_pct: 5.0
-  # Maximum days since last data update
-  max_days_since_last_update: 7
+  warmup_days: 7
+  # Maximum percentage of missing candles allowed (timeframe-aware)
+  max_data_gap_pct: 10.0
+  # Maximum days since last data update (data must be fairly recent)
+  max_days_since_last_update: 3
   
   # Volatility & price filters
   # Minimum price in USDT (reject dust coins)
   min_price_usdt: 0.01
   # Maximum annualized realized volatility (%)
-  max_realized_vol_pct: 200.0
+  max_realized_vol_pct: 300.0
   # Maximum percentage of days with limit-up/limit-down moves
   # Advanced: currently not enforced in code; reserved for future volatility sanity checks
   limit_move_frequency_pct: 5.0
@@ -153,7 +153,7 @@ universe:
   
   # Override lists
   # Symbols that are always included (bypass all filters)
-  include_list: [BTCUSDT, ETHUSDT]
+  include_list: [BTCUSDT, ETHUSDT, SOLUSDT, BNBUSDT, DOGEUSDT, AVAXUSDT]
   # Symbols that are never included (always excluded)
   exclude_list: []
   
