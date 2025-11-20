@@ -57,12 +57,16 @@ class UniverseSelector:
             symbols = []
             for symbol_id, market in markets.items():
                 # Filter for USDT-margined perpetuals
+                # Only include actively trading symbols (explicitly check active flag)
+                is_active = market.get('active', False)  # Default to False if not present
                 if (market.get('type') == 'swap' and
                     market.get('settle') == 'USDT' and
-                    market.get('active', True) and
+                    is_active and  # Only active symbols
                     market.get('quote') == 'USDT'):
                     # Extract base symbol (remove /USDT suffix)
                     base_symbol = market.get('base', '')
+                    if not base_symbol:
+                        continue  # Skip if no base symbol
                     symbol = f"{base_symbol}USDT"
                     symbols.append(symbol)
                     

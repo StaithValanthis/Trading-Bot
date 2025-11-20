@@ -3,6 +3,7 @@
 import time
 from typing import List, Optional
 from datetime import datetime, timedelta
+import ccxt
 
 from ..exchange.bybit_client import BybitClient
 from ..data.ohlcv_store import OHLCVStore
@@ -76,7 +77,16 @@ class DataDownloader:
             else:
                 self.logger.warning(f"No new data for {symbol} {timeframe}")
             
+        except ccxt.BadSymbol as e:
+            # Symbol doesn't exist on exchange (delisted, inactive, etc.)
+            # This is expected for some symbols - log at debug level, not error
+            self.logger.debug(
+                f"Symbol {symbol} not available on exchange (may be delisted or inactive): {e}"
+            )
+            # Don't raise - continue with other symbols
+            return
         except Exception as e:
+            # Other errors (network, rate limit, etc.) - log as error
             self.logger.error(f"Error downloading data for {symbol} {timeframe}: {e}")
             raise
     
@@ -96,13 +106,28 @@ class DataDownloader:
         """
         self.logger.info(f"Updating OHLCV data for {len(symbols)} symbols")
         
+        successful = 0
+        skipped = 0
+        failed = 0
+        
         for symbol in symbols:
             try:
                 self.download_and_store(symbol, timeframe, lookback_days)
+                successful += 1
                 # Rate limiting between symbols
                 time.sleep(1)
+            except ccxt.BadSymbol:
+                # Symbol doesn't exist - already logged in download_and_store
+                skipped += 1
+                continue
             except Exception as e:
                 self.logger.error(f"Failed to update {symbol}: {e}")
+                failed += 1
                 # Continue with other symbols
                 continue
+        
+        if skipped > 0:
+            self.logger.info(
+                f"Data update complete: {successful} successful, {skipped} skipped (not available), {failed} failed"
+            )
 

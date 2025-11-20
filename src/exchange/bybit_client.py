@@ -186,7 +186,17 @@ class BybitClient:
         """
         try:
             # CCXT uses '/' separator
-            ccxt_symbol = symbol.replace("USDT", "/USDT") if "/" not in symbol else symbol
+            # Handle both formats: "BTCUSDT" -> "BTC/USDT", "BTC/USDT" -> unchanged
+            if "/" not in symbol:
+                # Convert "BASEUSDT" to "BASE/USDT"
+                if symbol.endswith("USDT"):
+                    base = symbol[:-4]  # Remove "USDT" suffix
+                    ccxt_symbol = f"{base}/USDT"
+                else:
+                    # Fallback: try adding "/USDT" if no slash
+                    ccxt_symbol = f"{symbol}/USDT"
+            else:
+                ccxt_symbol = symbol
 
             # Respect rate limit
             time.sleep(self.exchange.rateLimit / 1000)
