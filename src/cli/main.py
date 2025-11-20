@@ -704,6 +704,7 @@ def run_live(config_path: str):
             except Exception as e:
                 logger.error(f"Error in trading loop: {e}", exc_info=True)
                 time.sleep(60)  # Wait before retrying
+                continue
     
     except Exception as e:
         logger.error(f"Fatal error in live bot: {e}", exc_info=True)
