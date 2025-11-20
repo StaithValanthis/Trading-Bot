@@ -712,11 +712,16 @@ def run_live(config_path: str):
                         metadata = signal.get('metadata', {})
                         momentum = metadata.get('momentum', 0) * 100
                         
+                        if stop_loss is not None:
+                            stop_str = f"{stop_loss:.4f}"
+                        else:
+                            stop_str = "N/A"
+                        
                         logger.info(
                             f"  {symbol}: {signal_type.upper()} @ ${entry_price:.4f} | "
                             f"Confidence: {confidence:.2f} | "
                             f"Momentum: {momentum:+.2f}% | "
-                            f"Stop Loss: ${stop_loss:.4f if stop_loss else 'N/A'}"
+                            f"Stop Loss: ${stop_str}"
                         )
                 
                 # Generate target positions
