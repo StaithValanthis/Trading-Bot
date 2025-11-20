@@ -92,89 +92,187 @@ def setup_logging(
     
     Returns:
         None (configures root logger globally)
+    
+    Raises:
+        Exception: If logging setup fails (e.g., cannot create log directory or file)
     """
     global _logging_initialized
     
-    if _logging_initialized and not force:
-        # Logging already initialized, just update level if needed
+    # CRITICAL: Write directly to stderr to ensure we see errors even if logging fails
+    import sys
+    import traceback
+    
+    try:
+        # Write to stderr directly (before logging is configured)
+        sys.stderr.write(f"[SETUP_LOGGING] Starting logging setup: service_name={service_name}, force={force}, log_dir={log_dir}\n")
+        sys.stderr.flush()
+        
+        if _logging_initialized and not force:
+            # Logging already initialized, just update level if needed
+            root_logger = logging.getLogger()
+            root_logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+            sys.stderr.write(f"[SETUP_LOGGING] Logging already initialized, just updating level to {level}\n")
+            sys.stderr.flush()
+            return
+        
+        # Create log directory if it doesn't exist
+        log_path = Path(log_dir)
+        sys.stderr.write(f"[SETUP_LOGGING] Creating log directory: {log_path.absolute()}\n")
+        sys.stderr.flush()
+        
+        try:
+            log_path.mkdir(parents=True, exist_ok=True)
+            sys.stderr.write(f"[SETUP_LOGGING] Log directory created/verified: {log_path.absolute()}\n")
+            sys.stderr.flush()
+        except Exception as e:
+            sys.stderr.write(f"[SETUP_LOGGING] CRITICAL ERROR: Failed to create log directory: {e}\n")
+            sys.stderr.write(traceback.format_exc())
+            sys.stderr.flush()
+            raise
+        
+        # Get root logger (this affects all loggers)
+        sys.stderr.write("[SETUP_LOGGING] Getting root logger\n")
+        sys.stderr.flush()
+        
         root_logger = logging.getLogger()
         root_logger.setLevel(getattr(logging, level.upper(), logging.INFO))
-        return
+        
+        # Remove existing handlers to avoid duplicates
+        sys.stderr.write(f"[SETUP_LOGGING] Clearing existing handlers (found {len(root_logger.handlers)} handlers)\n")
+        sys.stderr.flush()
+        root_logger.handlers.clear()
+        
+        # Prevent propagation to avoid duplicate logs (we handle everything here)
+        root_logger.propagate = False
+        
+        # Create secret filter
+        secret_filter = SecretFilter()
+        
+        # Console handler (stderr for systemd/journald)
+        sys.stderr.write("[SETUP_LOGGING] Creating console handler (stderr)\n")
+        sys.stderr.flush()
+        
+        # Use stderr instead of stdout to ensure unbuffered output and proper systemd integration
+        console_handler = logging.StreamHandler(sys.stderr)
+        console_handler.setLevel(logging.INFO)  # Console shows INFO and above
+        console_formatter = UTCFormatter(
+            '%(asctime)s [%(levelname)8s] %(name)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S UTC'
+        )
+        console_handler.setFormatter(console_formatter)
+        console_handler.addFilter(secret_filter)
+        # Force unbuffered output for systemd when supported
+        stream = console_handler.stream
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(line_buffering=True)
+            except Exception:
+                # Best-effort; don't let logging fail if reconfigure isn't supported
+                pass
+        root_logger.addHandler(console_handler)
+        sys.stderr.write("[SETUP_LOGGING] Console handler added to root logger\n")
+        sys.stderr.flush()
+        
+        # File handler with rotation
+        # Use service-specific filename if provided, otherwise generic
+        if service_name:
+            log_filename = f"bot-{service_name}.log"
+        else:
+            log_filename = "bot.log"
+        
+        log_file = log_path / log_filename
+        max_bytes = max_log_size_mb * 1024 * 1024
+        
+        sys.stderr.write(f"[SETUP_LOGGING] Creating file handler: {log_file.absolute()}\n")
+        sys.stderr.flush()
+        
+        try:
+            file_handler = RotatingFileHandler(
+                log_file,
+                maxBytes=max_bytes,
+                backupCount=backup_count,
+                encoding='utf-8',  # Ensure UTF-8 encoding
+            )
+            file_handler.setLevel(logging.DEBUG)  # File logs everything (DEBUG and above)
+            file_formatter = UTCFormatter(
+                '%(asctime)s [%(levelname)8s] %(name)s:%(lineno)d - %(funcName)s() - %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S UTC'
+            )
+            file_handler.setFormatter(file_formatter)
+            file_handler.addFilter(secret_filter)
+            root_logger.addHandler(file_handler)
+            sys.stderr.write(f"[SETUP_LOGGING] File handler created and added: {log_file.absolute()}\n")
+            sys.stderr.flush()
+        except Exception as e:
+            sys.stderr.write(f"[SETUP_LOGGING] CRITICAL ERROR: Failed to create file handler: {e}\n")
+            sys.stderr.write(traceback.format_exc())
+            sys.stderr.flush()
+            raise
     
-    # Create log directory if it doesn't exist
-    log_path = Path(log_dir)
-    log_path.mkdir(parents=True, exist_ok=True)
-    
-    # Get root logger (this affects all loggers)
-    root_logger = logging.getLogger()
-    root_logger.setLevel(getattr(logging, level.upper(), logging.INFO))
-    
-    # Remove existing handlers to avoid duplicates
-    root_logger.handlers.clear()
-    
-    # Prevent propagation to avoid duplicate logs (we handle everything here)
-    root_logger.propagate = False
-    
-    # Create secret filter
-    secret_filter = SecretFilter()
-    
-    # Console handler (stderr for systemd/journald)
-    # Use stderr instead of stdout to ensure unbuffered output and proper systemd integration
-    console_handler = logging.StreamHandler(sys.stderr)
-    console_handler.setLevel(logging.INFO)  # Console shows INFO and above
-    console_formatter = UTCFormatter(
-        '%(asctime)s [%(levelname)8s] %(name)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S UTC'
-    )
-    console_handler.setFormatter(console_formatter)
-    console_handler.addFilter(secret_filter)
-    # Force unbuffered output for systemd
-    console_handler.stream.reconfigure(line_buffering=True)
-    root_logger.addHandler(console_handler)
-    
-    # File handler with rotation
-    # Use service-specific filename if provided, otherwise generic
-    if service_name:
-        log_filename = f"bot-{service_name}.log"
-    else:
-        log_filename = "bot.log"
-    
-    log_file = log_path / log_filename
-    max_bytes = max_log_size_mb * 1024 * 1024
-    
-    file_handler = RotatingFileHandler(
-        log_file,
-        maxBytes=max_bytes,
-        backupCount=backup_count,
-        encoding='utf-8',  # Ensure UTF-8 encoding
-    )
-    file_handler.setLevel(logging.DEBUG)  # File logs everything (DEBUG and above)
-    file_formatter = UTCFormatter(
-        '%(asctime)s [%(levelname)8s] %(name)s:%(lineno)d - %(funcName)s() - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S UTC'
-    )
-    file_handler.setFormatter(file_formatter)
-    file_handler.addFilter(secret_filter)
-    root_logger.addHandler(file_handler)
-    
-    # Also configure a named logger for backwards compatibility
-    named_logger = logging.getLogger("trading_bot")
-    named_logger.setLevel(getattr(logging, level.upper(), logging.INFO))
-    named_logger.propagate = True  # Propagate to root
-    
-    # Log initialization
-    root_logger.info("=" * 80)
-    root_logger.info("Logging system initialized")
-    root_logger.info(f"  Log level: {level.upper()}")
-    root_logger.info(f"  Log directory: {log_path.absolute()}")
-    root_logger.info(f"  Log file: {log_file.absolute()}")
-    root_logger.info(f"  Service name: {service_name or 'default'}")
-    root_logger.info("=" * 80)
-    
-    # Force flush to ensure logs appear immediately
-    sys.stderr.flush()
-    
-    _logging_initialized = True
+        # Also configure a named logger for backwards compatibility
+        named_logger = logging.getLogger("trading_bot")
+        named_logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+        named_logger.propagate = True  # Propagate to root
+        
+        # Verify logging is working by writing a test message
+        sys.stderr.write(f"[SETUP_LOGGING] Testing logging system...\n")
+        sys.stderr.flush()
+        
+        # Log initialization (this should now work via root logger)
+        try:
+            root_logger.info("=" * 80)
+            root_logger.info("Logging system initialized")
+            root_logger.info(f"  Log level: {level.upper()}")
+            root_logger.info(f"  Log directory: {log_path.absolute()}")
+            root_logger.info(f"  Log file: {log_file.absolute()}")
+            root_logger.info(f"  Service name: {service_name or 'default'}")
+            root_logger.info("=" * 80)
+            sys.stderr.write(f"[SETUP_LOGGING] Logging test messages sent successfully\n")
+            sys.stderr.flush()
+        except Exception as e:
+            sys.stderr.write(f"[SETUP_LOGGING] ERROR: Failed to write test log messages: {e}\n")
+            sys.stderr.write(traceback.format_exc())
+            sys.stderr.flush()
+            raise
+        
+        # Verify log file exists and is writable
+        try:
+            if log_file.exists():
+                sys.stderr.write(f"[SETUP_LOGGING] Log file exists: {log_file.absolute()} ({log_file.stat().st_size} bytes)\n")
+            else:
+                sys.stderr.write(f"[SETUP_LOGGING] WARNING: Log file does not exist yet: {log_file.absolute()}\n")
+                # Try to create it by writing a test message
+                test_logger = logging.getLogger("setup_test")
+                test_logger.info("Test log message to create file")
+                if log_file.exists():
+                    sys.stderr.write(f"[SETUP_LOGGING] Log file created successfully\n")
+                else:
+                    sys.stderr.write(f"[SETUP_LOGGING] ERROR: Log file still does not exist after test write\n")
+            sys.stderr.flush()
+        except Exception as e:
+            sys.stderr.write(f"[SETUP_LOGGING] WARNING: Could not verify log file: {e}\n")
+            sys.stderr.flush()
+        
+        # Force flush to ensure logs appear immediately
+        sys.stderr.flush()
+        for handler in root_logger.handlers:
+            try:
+                handler.flush()
+            except:
+                pass
+        
+        _logging_initialized = True
+        
+        sys.stderr.write(f"[SETUP_LOGGING] Logging setup completed successfully\n")
+        sys.stderr.flush()
+        
+    except Exception as e:
+        # CRITICAL: If setup fails, write error to stderr directly
+        sys.stderr.write(f"\n[SETUP_LOGGING] CRITICAL ERROR: Logging setup failed!\n")
+        sys.stderr.write(f"Error: {e}\n")
+        sys.stderr.write(f"Traceback:\n{traceback.format_exc()}\n")
+        sys.stderr.flush()
+        # Don't raise - let the caller handle it, but at least we've logged the error
 
 
 def get_logger(name: Optional[str] = None) -> logging.Logger:

@@ -79,8 +79,6 @@ class BybitClient:
                     "  Ensure your API keys are for LIVE Bybit (not testnet).\n"
                     "  Live API keys are created at bybit.com (not testnet.bybit.com)."
                 )
-                import sys
-                sys.stdout.flush()  # Force flush for systemd
             
             self.logger.info(
                 f"Initializing CCXT exchange - Endpoint: {endpoint_url}\n"
