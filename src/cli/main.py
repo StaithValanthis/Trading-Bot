@@ -381,6 +381,7 @@ def run_live(config_path: str):
                 
                 # Check time-based exits and trailing stops for existing positions
                 now_utc = datetime.now(timezone.utc)
+                logger.debug(f"Current UTC time: {now_utc.isoformat()}")
                 
                 # Check time-based exits for existing positions
                 if config.strategy.trend.max_holding_hours:
@@ -474,19 +475,13 @@ def run_live(config_path: str):
                         except Exception as e:
                             logger.warning(f"Error updating trailing stop for {symbol}: {e}")
                 
-            except ccxt.AuthenticationError as e:
-                # Authentication errors are fatal - stop the bot
-                logger.critical(
-                    f"Authentication error during trading loop: {e}\n"
-                    "The bot will stop. Please check your API credentials and restart."
-                )
-                sys.exit(1)
-            
-                # Check daily loss limits
+                # Check daily loss limits (MUST be inside try block)
+                logger.debug("Checking daily loss limits...")
                 can_trade, loss_reason = portfolio_limits.check_daily_loss_limits(
                     portfolio.equity,
                     realized_pnl=0.0  # TODO: Calculate from closed trades
                 )
+                logger.debug(f"Daily loss check result: can_trade={can_trade}, loss_reason={loss_reason}")
                 
                 if not can_trade:
                     logger.warning(f"Daily HARD loss limit breached: {loss_reason}")
@@ -511,7 +506,7 @@ def run_live(config_path: str):
                 elif loss_reason:  # Soft loss cap reached
                     logger.warning(f"Daily soft loss cap reached: {loss_reason}. Continuing with reduced risk.")
                 
-                # Update data
+                # Update data (only if we can trade)
                 logger.info("Updating market data...")
                 downloader.update_all_symbols(
                     config.exchange.symbols,
@@ -747,8 +742,16 @@ def run_live(config_path: str):
                 logger.info("Received interrupt, shutting down...")
                 break
             except Exception as e:
-                logger.error(f"Error in trading loop: {e}", exc_info=True)
-                time.sleep(60)  # Wait before retrying
+                # CRITICAL: Log the full exception with stack trace
+                logger.error("=" * 60)
+                logger.error(f"EXCEPTION in trading loop iteration #{loop_iteration}: {type(e).__name__}: {e}")
+                logger.error(f"Exception location: {e.__class__.__module__}.{e.__class__.__name__}")
+                logger.error("Full traceback:", exc_info=True)
+                logger.error("=" * 60)
+                # Wait 60 seconds before retrying to avoid rapid error loops
+                logger.warning(f"Sleeping 60 seconds before retrying loop iteration...")
+                time.sleep(60)
+                logger.info(f"Resuming loop after exception recovery")
                 continue
     
     except Exception as e:
