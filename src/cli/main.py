@@ -437,65 +437,65 @@ def run_live(config_path: str):
                 )
                 sys.exit(1)
             
-            # Check daily loss limits
-            can_trade, loss_reason = portfolio_limits.check_daily_loss_limits(
-                portfolio.equity,
-                realized_pnl=0.0  # TODO: Calculate from closed trades
-            )
-            
-            if not can_trade:
-                logger.warning(f"Daily HARD loss limit breached: {loss_reason}")
-                
-                # Flatten all positions on hard loss cap
-                if portfolio.positions:
-                    logger.critical(
-                        f"Flattening all {len(portfolio.positions)} position(s) due to hard loss cap"
-                    )
-                    for symbol in list(portfolio.positions.keys()):
-                        executor._cancel_stop_orders(symbol, portfolio)
-                        result = executor.close_position(symbol)
-                        if result.get('status') == 'closed':
-                            logger.info(f"Flattened {symbol} due to hard loss cap")
-                
-                logger.error(
-                    "Trading disabled until next UTC day. Bot will sleep and check again."
+                # Check daily loss limits
+                can_trade, loss_reason = portfolio_limits.check_daily_loss_limits(
+                    portfolio.equity,
+                    realized_pnl=0.0  # TODO: Calculate from closed trades
                 )
-                # Wait until next day
-                time.sleep(3600)  # Check again in 1 hour
-                continue
-            elif loss_reason:  # Soft loss cap reached
-                logger.warning(f"Daily soft loss cap reached: {loss_reason}. Continuing with reduced risk.")
-            
-            # Update data
-            logger.info("Updating market data...")
-            downloader.update_all_symbols(
-                config.exchange.symbols,
-                config.exchange.timeframe,
-                lookback_days=30
-            )
-            logger.info("Market data updated successfully")
-            
-            # Determine if we should rebalance
-            now = datetime.now(timezone.utc)
-            should_rebalance = False
-            
-            if last_rebalance_time is None:
-                logger.info("First iteration - will rebalance now")
-                should_rebalance = True
-            else:
-                hours_diff = (now - last_rebalance_time).total_seconds() / 3600
-                logger.info(f"Last rebalance: {last_rebalance_time.isoformat()} ({hours_diff:.1f} hours ago)")
-                if hours_diff >= rebalance_frequency_hours:
-                    logger.info(f"Rebalance threshold reached ({hours_diff:.1f}h >= {rebalance_frequency_hours}h) - will rebalance")
+                
+                if not can_trade:
+                    logger.warning(f"Daily HARD loss limit breached: {loss_reason}")
+                    
+                    # Flatten all positions on hard loss cap
+                    if portfolio.positions:
+                        logger.critical(
+                            f"Flattening all {len(portfolio.positions)} position(s) due to hard loss cap"
+                        )
+                        for symbol in list(portfolio.positions.keys()):
+                            executor._cancel_stop_orders(symbol, portfolio)
+                            result = executor.close_position(symbol)
+                            if result.get('status') == 'closed':
+                                logger.info(f"Flattened {symbol} due to hard loss cap")
+                    
+                    logger.error(
+                        "Trading disabled until next UTC day. Bot will sleep and check again."
+                    )
+                    # Wait until next day
+                    time.sleep(3600)  # Check again in 1 hour
+                    continue
+                elif loss_reason:  # Soft loss cap reached
+                    logger.warning(f"Daily soft loss cap reached: {loss_reason}. Continuing with reduced risk.")
+                
+                # Update data
+                logger.info("Updating market data...")
+                downloader.update_all_symbols(
+                    config.exchange.symbols,
+                    config.exchange.timeframe,
+                    lookback_days=30
+                )
+                logger.info("Market data updated successfully")
+                
+                # Determine if we should rebalance
+                now = datetime.now(timezone.utc)
+                should_rebalance = False
+                
+                if last_rebalance_time is None:
+                    logger.info("First iteration - will rebalance now")
                     should_rebalance = True
                 else:
-                    logger.info(f"Rebalance threshold not reached ({hours_diff:.1f}h < {rebalance_frequency_hours}h) - skipping rebalance")
-                
-            if should_rebalance:
-                logger.info("="*60)
-                logger.info("REBALANCING PORTFOLIO")
-                logger.info("="*60)
-                logger.info("Rebalancing portfolio...")
+                    hours_diff = (now - last_rebalance_time).total_seconds() / 3600
+                    logger.info(f"Last rebalance: {last_rebalance_time.isoformat()} ({hours_diff:.1f} hours ago)")
+                    if hours_diff >= rebalance_frequency_hours:
+                        logger.info(f"Rebalance threshold reached ({hours_diff:.1f}h >= {rebalance_frequency_hours}h) - will rebalance")
+                        should_rebalance = True
+                    else:
+                        logger.info(f"Rebalance threshold not reached ({hours_diff:.1f}h < {rebalance_frequency_hours}h) - skipping rebalance")
+                    
+                if should_rebalance:
+                    logger.info("="*60)
+                    logger.info("REBALANCING PORTFOLIO")
+                    logger.info("="*60)
+                    logger.info("Rebalancing portfolio...")
                 
                 # Get current universe (dynamic or fixed)
                 if universe_selector is not None:
@@ -677,11 +677,11 @@ def run_live(config_path: str):
                             logger.info(f"Position closed: {result.get('symbol')}")
                         elif result.get('status') == 'error':
                             logger.error(f"Error executing position: {result.get('error')}")
-                    else:
-                        logger.info("No position changes needed (no targets and no existing positions)")
-                    
-                    last_rebalance_time = now
-
+                else:
+                    logger.info("No position changes needed (no targets and no existing positions)")
+                
+                last_rebalance_time = now
+                
                 # Heartbeat / health summary
                 logger.info(
                     "Heartbeat | mode=%s | config_version=%s | equity=%.2f | positions=%d | open_symbols=%s",
@@ -697,7 +697,7 @@ def run_live(config_path: str):
                 logger.info(f"Loop iteration #{loop_iteration} complete. Sleeping for {sleep_seconds}s ({sleep_seconds/60:.0f} minutes) until next check...")
                 logger.info("="*60)
                 time.sleep(sleep_seconds)
-                
+            
             except KeyboardInterrupt:
                 logger.info("Received interrupt, shutting down...")
                 break
