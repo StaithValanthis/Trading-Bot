@@ -315,23 +315,104 @@ main() {
     fi
     
     # Account type / testnet
+    USE_TESTNET_VALUE=""
     if ! grep -q "^BYBIT_TESTNET=" "$ENV_FILE" 2>/dev/null; then
         if [ "$NON_INTERACTIVE" != "true" ]; then
             echo -e "${YELLOW}Use Bybit testnet? (Y/n)${NC}"
             read -r USE_TESTNET
             if [[ "$USE_TESTNET" =~ ^[Nn]$ ]]; then
                 echo "BYBIT_TESTNET=false" >> "$ENV_FILE"
+                USE_TESTNET_VALUE="false"
             else
                 echo "BYBIT_TESTNET=true" >> "$ENV_FILE"
+                USE_TESTNET_VALUE="true"
             fi
             info "Bybit testnet setting saved"
         else
             # Default to testnet in non-interactive mode
             echo "BYBIT_TESTNET=true" >> "$ENV_FILE"
+            USE_TESTNET_VALUE="true"
             info "BYBIT_TESTNET set to true (non-interactive default)"
         fi
     else
-        info "Bybit testnet setting already configured"
+        # Read existing value
+        USE_TESTNET_VALUE=$(grep "^BYBIT_TESTNET=" "$ENV_FILE" | cut -d'=' -f2 | tr -d '"' | tr -d "'" | tr -d ' ')
+        info "Bybit testnet setting already configured: $USE_TESTNET_VALUE"
+    fi
+    
+    # Update config.yaml with testnet and mode settings
+    if [ -f "$CONFIG_FILE" ] && [ -n "$USE_TESTNET_VALUE" ]; then
+        info "Updating config.yaml with testnet setting: $USE_TESTNET_VALUE"
+        
+        # Determine testnet boolean and mode based on user's choice
+        if [ "$USE_TESTNET_VALUE" = "true" ] || [ "$USE_TESTNET_VALUE" = "True" ] || [ "$USE_TESTNET_VALUE" = "TRUE" ] || [ "$USE_TESTNET_VALUE" = "1" ]; then
+            TESTNET_BOOL="true"
+            EXCHANGE_MODE="testnet"
+        else
+            TESTNET_BOOL="false"
+            EXCHANGE_MODE="live"
+        fi
+        
+        # Use Python to safely update YAML file (more reliable than sed)
+        # This preserves YAML structure and formatting
+        "$VENV_DIR/bin/python" << EOF 2>/dev/null || warn "Failed to update config.yaml (this is non-critical)"
+import yaml
+import sys
+
+try:
+    config_path = "$CONFIG_FILE"
+    testnet_bool_str = "$TESTNET_BOOL"
+    exchange_mode = "$EXCHANGE_MODE"
+    
+    # Convert string to boolean
+    testnet_bool = testnet_bool_str.lower() in ('true', '1', 'yes', 'on')
+    
+    # Read existing config
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f) or {}
+    
+    # Ensure exchange section exists
+    if 'exchange' not in config:
+        config['exchange'] = {}
+    
+    # Update testnet and mode
+    config['exchange']['testnet'] = testnet_bool
+    config['exchange']['mode'] = exchange_mode
+    
+    # Write back to file, preserving comments and structure as much as possible
+    with open(config_path, 'w') as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+    
+    sys.exit(0)
+except Exception as e:
+    print(f"Error updating config.yaml: {e}", file=sys.stderr)
+    sys.exit(1)
+EOF
+        
+        if [ $? -eq 0 ]; then
+            info "Updated config.yaml: testnet=$TESTNET_BOOL, mode=$EXCHANGE_MODE"
+        else
+            # Fallback to sed if Python fails
+            warn "Python YAML update failed, using sed fallback..."
+            if grep -q "^  testnet:" "$CONFIG_FILE" 2>/dev/null; then
+                if [[ "$OSTYPE" == "darwin"* ]]; then
+                    sed -i '' "s/^  testnet:.*/  testnet: $TESTNET_BOOL/" "$CONFIG_FILE"
+                else
+                    sed -i "s/^  testnet:.*/  testnet: $TESTNET_BOOL/" "$CONFIG_FILE"
+                fi
+            fi
+            if grep -q "^  mode:" "$CONFIG_FILE" 2>/dev/null; then
+                if [[ "$OSTYPE" == "darwin"* ]]; then
+                    sed -i '' "s/^  mode:.*/  mode: $EXCHANGE_MODE/" "$CONFIG_FILE"
+                else
+                    sed -i "s/^  mode:.*/  mode: $EXCHANGE_MODE/" "$CONFIG_FILE"
+                fi
+            fi
+        fi
+    else
+        if [ ! -f "$CONFIG_FILE" ]; then
+            warn "config.yaml not found, cannot update testnet/mode settings"
+        fi
     fi
     
     # Discord webhook
