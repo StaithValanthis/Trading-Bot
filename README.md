@@ -48,6 +48,32 @@ A fully-automated, self-improving crypto trading bot for Bybit perpetual futures
 - **Daily Loss Caps**: Soft and hard daily loss limits (default: -2% / -4%)
 - **Exchange Constraints**: Respects Bybit precision, min sizes, fees
 
+## Logging
+
+The bot uses a centralized logging system that writes to both files and systemd/journald.
+
+### Viewing Logs
+
+**File Logs:**
+```bash
+# View live bot logs
+tail -f logs/bot-live.log
+
+# View all logs
+tail -f logs/*.log
+```
+
+**Systemd/Journald:**
+```bash
+# View live bot service logs
+sudo journalctl -u bybit-bot.service -f
+
+# View all bot services
+sudo journalctl -u bybit-bot* -f
+```
+
+See [LOGGING_SYSTEM.md](LOGGING_SYSTEM.md) for detailed logging documentation.
+
 ## Installation
 
 ### Prerequisites

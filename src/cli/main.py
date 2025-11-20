@@ -33,17 +33,22 @@ import sqlite3
 
 def run_universe_build(config_path: str):
     """Build/update the universe."""
+    # Load config FIRST
+    config = BotConfig.from_yaml(config_path)
+    
+    # Setup logging with config
+    setup_logging(
+        log_dir=config.logging.log_dir,
+        level=config.logging.level,
+        max_log_size_mb=config.logging.max_log_size_mb,
+        backup_count=config.logging.backup_count,
+        service_name="universe",
+        force=True,
+    )
+    
+    # Now get logger (will inherit from root logger)
     logger = get_logger(__name__)
     logger.info("Building universe")
-    
-    # Load config
-    config = BotConfig.from_yaml(config_path)
-    setup_logging(
-        config.logging.log_dir,
-        config.logging.level,
-        config.logging.max_log_size_mb,
-        config.logging.backup_count
-    )
     
     # Initialize components
     exchange = BybitClient(config.exchange)
@@ -73,16 +78,21 @@ def run_universe_build(config_path: str):
 
 def run_universe_show(config_path: str):
     """Show current universe."""
-    logger = get_logger(__name__)
-    
-    # Load config
+    # Load config FIRST
     config = BotConfig.from_yaml(config_path)
+    
+    # Setup logging with config
     setup_logging(
-        config.logging.log_dir,
-        config.logging.level,
-        config.logging.max_log_size_mb,
-        config.logging.backup_count
+        log_dir=config.logging.log_dir,
+        level=config.logging.level,
+        max_log_size_mb=config.logging.max_log_size_mb,
+        backup_count=config.logging.backup_count,
+        service_name="universe",
+        force=True,
     )
+    
+    # Now get logger
+    logger = get_logger(__name__)
     
     # Initialize components
     exchange = BybitClient(config.exchange)
@@ -112,16 +122,21 @@ def run_universe_show(config_path: str):
 
 def run_universe_history(config_path: str, symbol: str = None):
     """Show universe history."""
-    logger = get_logger(__name__)
-    
-    # Load config
+    # Load config FIRST
     config = BotConfig.from_yaml(config_path)
+    
+    # Setup logging with config
     setup_logging(
-        config.logging.log_dir,
-        config.logging.level,
-        config.logging.max_log_size_mb,
-        config.logging.backup_count
+        log_dir=config.logging.log_dir,
+        level=config.logging.level,
+        max_log_size_mb=config.logging.max_log_size_mb,
+        backup_count=config.logging.backup_count,
+        service_name="universe",
+        force=True,
     )
+    
+    # Now get logger
+    logger = get_logger(__name__)
     
     # Initialize components
     universe_store = UniverseStore(config.data.db_path)
@@ -154,23 +169,28 @@ def run_universe_history(config_path: str, symbol: str = None):
 
 def run_live(config_path: str):
     """Run live trading bot."""
-    logger = get_logger(__name__)
-    logger.info("Starting live trading bot")
-    
-    # Load config
+    # Load config FIRST (before any logging that depends on config)
     config = BotConfig.from_yaml(config_path)
     errors = config.validate()
     if errors:
-        logger.error(f"Config validation errors: {errors}")
+        # Use basic logging for early errors
+        import logging
+        logging.error(f"Config validation errors: {errors}")
         sys.exit(1)
     
-    # Setup logging
+    # Setup logging with config (this configures root logger)
     setup_logging(
-        config.logging.log_dir,
-        config.logging.level,
-        config.logging.max_log_size_mb,
-        config.logging.backup_count
+        log_dir=config.logging.log_dir,
+        level=config.logging.level,
+        max_log_size_mb=config.logging.max_log_size_mb,
+        backup_count=config.logging.backup_count,
+        service_name="live",  # Separate log file for live service
+        force=True,  # Force reinitialization
     )
+    
+    # Now get logger (will inherit from root logger)
+    logger = get_logger(__name__)
+    logger.info("Starting live trading bot")
     
     # Validate API credentials early
     if config.exchange.mode != "paper":
@@ -738,17 +758,22 @@ def run_live(config_path: str):
 
 def run_backtest(config_path: str, symbols: list = None, output_file: str = None):
     """Run backtest."""
+    # Load config FIRST
+    config = BotConfig.from_yaml(config_path)
+    
+    # Setup logging with config
+    setup_logging(
+        log_dir=config.logging.log_dir,
+        level=config.logging.level,
+        max_log_size_mb=config.logging.max_log_size_mb,
+        backup_count=config.logging.backup_count,
+        service_name="backtest",
+        force=True,
+    )
+    
+    # Now get logger
     logger = get_logger(__name__)
     logger.info("Starting backtest")
-    
-    # Load config
-    config = BotConfig.from_yaml(config_path)
-    setup_logging(
-        config.logging.log_dir,
-        config.logging.level,
-        config.logging.max_log_size_mb,
-        config.logging.backup_count
-    )
     
     # Initialize components
     store = OHLCVStore(config.data.db_path)
@@ -809,16 +834,21 @@ def run_backtest(config_path: str, symbols: list = None, output_file: str = None
 
 def run_health(config_path: str):
     """Basic healthcheck: DB + exchange connectivity."""
-    logger = get_logger(__name__)
-
-    # Load config
+    # Load config FIRST
     config = BotConfig.from_yaml(config_path)
+    
+    # Setup logging with config
     setup_logging(
-        config.logging.log_dir,
-        config.logging.level,
-        config.logging.max_log_size_mb,
-        config.logging.backup_count,
+        log_dir=config.logging.log_dir,
+        level=config.logging.level,
+        max_log_size_mb=config.logging.max_log_size_mb,
+        backup_count=config.logging.backup_count,
+        service_name="health",
+        force=True,
     )
+    
+    # Now get logger
+    logger = get_logger(__name__)
 
     ok = True
 
@@ -847,17 +877,22 @@ def run_health(config_path: str):
 
 def run_optimize(config_path: str):
     """Run parameter optimization."""
+    # Load config FIRST
+    config = BotConfig.from_yaml(config_path)
+    
+    # Setup logging with config
+    setup_logging(
+        log_dir=config.logging.log_dir,
+        level=config.logging.level,
+        max_log_size_mb=config.logging.max_log_size_mb,
+        backup_count=config.logging.backup_count,
+        service_name="optimizer",
+        force=True,
+    )
+    
+    # Now get logger
     logger = get_logger(__name__)
     logger.info("Starting optimization")
-    
-    # Load config
-    config = BotConfig.from_yaml(config_path)
-    setup_logging(
-        config.logging.log_dir,
-        config.logging.level,
-        config.logging.max_log_size_mb,
-        config.logging.backup_count
-    )
     
     # Initialize components
     store = OHLCVStore(config.data.db_path)
@@ -901,17 +936,22 @@ def run_optimize_universe(
     output_file: Optional[str] = None
 ):
     """Run universe parameter optimization."""
+    # Load config FIRST
+    config = BotConfig.from_yaml(config_path)
+    
+    # Setup logging with config
+    setup_logging(
+        log_dir=config.logging.log_dir,
+        level=config.logging.level,
+        max_log_size_mb=config.logging.max_log_size_mb,
+        backup_count=config.logging.backup_count,
+        service_name="universe-optimizer",
+        force=True,
+    )
+    
+    # Now get logger
     logger = get_logger(__name__)
     logger.info("Starting universe parameter optimization")
-    
-    # Load config
-    config = BotConfig.from_yaml(config_path)
-    setup_logging(
-        config.logging.log_dir,
-        config.logging.level,
-        config.logging.max_log_size_mb,
-        config.logging.backup_count
-    )
     
     # Parse dates
     try:
@@ -1062,17 +1102,22 @@ def run_optimize_universe(
 
 def run_report(config_path: str):
     """Send daily Discord report."""
+    # Load config FIRST
+    config = BotConfig.from_yaml(config_path)
+    
+    # Setup logging with config
+    setup_logging(
+        log_dir=config.logging.log_dir,
+        level=config.logging.level,
+        max_log_size_mb=config.logging.max_log_size_mb,
+        backup_count=config.logging.backup_count,
+        service_name="report",
+        force=True,
+    )
+    
+    # Now get logger
     logger = get_logger(__name__)
     logger.info("Sending daily Discord report")
-    
-    # Load config
-    config = BotConfig.from_yaml(config_path)
-    setup_logging(
-        config.logging.log_dir,
-        config.logging.level,
-        config.logging.max_log_size_mb,
-        config.logging.backup_count
-    )
     
     # Initialize components
     exchange = BybitClient(config.exchange)
