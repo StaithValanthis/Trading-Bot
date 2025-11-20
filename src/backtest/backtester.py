@@ -14,6 +14,35 @@ from ..logging_utils import get_logger
 
 logger = get_logger(__name__)
 
+_TIMEFRAME_TO_HOURS = {
+    "1m": 1 / 60,
+    "3m": 3 / 60,
+    "5m": 5 / 60,
+    "15m": 15 / 60,
+    "30m": 30 / 60,
+    "45m": 45 / 60,
+    "1h": 1.0,
+    "2h": 2.0,
+    "4h": 4.0,
+    "6h": 6.0,
+    "12h": 12.0,
+    "1d": 24.0,
+}
+
+
+def parse_timeframe_to_hours(timeframe: str) -> float:
+    """Convert timeframe string (e.g. '4h') to hours."""
+    tf = timeframe.lower().strip()
+    if tf in _TIMEFRAME_TO_HOURS:
+        return _TIMEFRAME_TO_HOURS[tf]
+    if tf.endswith("m"):
+        return int(tf[:-1]) / 60.0
+    if tf.endswith("h"):
+        return float(tf[:-1])
+    if tf.endswith("d"):
+        return float(tf[:-1]) * 24.0
+    raise ValueError(f"Unsupported timeframe: {timeframe}")
+
 
 class _SimulatedExchange:
     """
@@ -120,6 +149,7 @@ class Backtester:
         # Track cross-sectional rebalance time
         last_rebalance_time = None
         rebalance_frequency_hours = self.config.strategy.cross_sectional.rebalance_frequency_hours
+        hours_in_bar = parse_timeframe_to_hours(self.config.exchange.timeframe)
         
         # Process each timestamp
         for i, timestamp in enumerate(timestamps):
@@ -274,7 +304,6 @@ class Backtester:
 
             # Apply funding PnL approximation for open positions (if configured)
             if funding_rate_per_8h != 0.0 and positions:
-                hours_in_bar = 1.0  # Assumes 1h bars; for other timeframes this should be adjusted
                 funding_pnl_bar = 0.0
                 for symbol, pos in positions.items():
                     notional_here = abs(pos.get("notional", 0.0))

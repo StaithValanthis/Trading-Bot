@@ -20,23 +20,23 @@ exchange:
     - SOLUSDT
     - BNBUSDT
     - ADAUSDT
-  # Trading timeframe (1h recommended for retail latency)
-  timeframe: 1h
+  # Trading timeframe (default 4h: cleaner signals & aligned with 8h funding cycle)
+  timeframe: 4h
 
 # Strategy parameters
 strategy:
   # Sleeve A: Time-series trend-following
   trend:
-    # Short moving average period (bars)
-    ma_short: 20
-    # Long moving average period (bars)
-    ma_long: 100
-    # Momentum lookback (bars, e.g. 24 = 24 hours)
-    momentum_lookback: 24
+    # Short moving average period (bars; 5 bars @4h ≈ 20h)
+    ma_short: 5
+    # Long moving average period (bars; 25 bars @4h ≈ 100h)
+    ma_long: 25
+    # Momentum lookback (bars; 6 bars @4h ≈ 24h)
+    momentum_lookback: 6
     # ATR multiplier for stop-loss distance
     atr_stop_multiplier: 2.5
-    # ATR lookback for volatility calculation
-    atr_period: 14
+    # ATR lookback for volatility calculation (bars; 4 bars @4h ≈ 16h)
+    atr_period: 4
     # Minimum ATR filter: skip trades if ATR < min_atr_threshold * price
     min_atr_threshold: 0.001  # 0.1% of price
     # Position management
@@ -53,12 +53,12 @@ strategy:
     
   # Sleeve B: Cross-sectional momentum overlay
   cross_sectional:
-    # Ranking window (bars, e.g. 72 = 3 days of 1h bars)
-    ranking_window: 72
+    # Ranking window (bars; 18 bars @4h ≈ 3 days)
+    ranking_window: 18
     # Number of top symbols to trade
     top_k: 3
-    # Rebalance frequency in hours (e.g. 4 = every 4 hours)
-    rebalance_frequency_hours: 4
+    # Rebalance frequency in hours (8h aligns with funding settlements)
+    rebalance_frequency_hours: 8
     # Only trade symbols that also have positive time-series trend
     require_trend_alignment: true
     

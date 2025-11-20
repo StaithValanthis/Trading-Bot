@@ -33,7 +33,7 @@ class ExchangeConfig:
     api_key: Optional[str] = None
     api_secret: Optional[str] = None
     symbols: List[str] = field(default_factory=lambda: ["BTCUSDT", "ETHUSDT"])
-    timeframe: str = "1h"
+    timeframe: str = "4h"
     
     def __post_init__(self):
         """Load API keys from environment if not provided."""
@@ -105,11 +105,11 @@ class ExchangeConfig:
 @dataclass
 class TrendStrategyConfig:
     """Time-series trend-following strategy parameters."""
-    ma_short: int = 20
-    ma_long: int = 100
-    momentum_lookback: int = 24
+    ma_short: int = 5  # Bars; interpretation depends on timeframe (5 bars @4h ≈ 20h)
+    ma_long: int = 25  # Bars; 25 bars @4h ≈ 100h
+    momentum_lookback: int = 6  # Bars; 6 bars @4h ≈ 24h
     atr_stop_multiplier: float = 2.5
-    atr_period: int = 14
+    atr_period: int = 4  # Bars; 4 bars @4h ≈ 16h
     min_atr_threshold: float = 0.001
     # Position management
     max_holding_hours: Optional[int] = None  # Optional time-based exit (None = no limit)
@@ -124,9 +124,9 @@ class TrendStrategyConfig:
 @dataclass
 class CrossSectionalStrategyConfig:
     """Cross-sectional momentum strategy parameters."""
-    ranking_window: int = 72
+    ranking_window: int = 18  # Bars; 18 bars @4h ≈ 3 days
     top_k: int = 3
-    rebalance_frequency_hours: int = 4
+    rebalance_frequency_hours: int = 8
     require_trend_alignment: bool = True
 
 

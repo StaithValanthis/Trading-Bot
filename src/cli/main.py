@@ -5,7 +5,7 @@ import sys
 import time
 from pathlib import Path
 from datetime import datetime, timezone, date, timedelta
-from typing import Optional
+from typing import Optional, List
 import ccxt
 
 from ..config import BotConfig
@@ -25,6 +25,7 @@ from ..state.portfolio import PortfolioState
 from ..backtest.backtester import Backtester
 from ..optimizer.optimizer import Optimizer
 from ..optimizer.universe_optimizer import UniverseOptimizer
+from ..optimizer.timeframe_analyzer import TimeframeAnalyzer
 from ..reporting.discord_reporter import DiscordReporter
 from ..universe.selector import UniverseSelector
 from ..universe.store import UniverseStore
@@ -359,6 +360,29 @@ def run_live(config_path: str):
             universe_store
         )
         logger.info("Dynamic universe selection enabled")
+        
+        # Pre-download data for initial universe to ensure data exists at startup
+        logger.info("Pre-downloading data for initial universe...")
+        try:
+            initial_universe = list(universe_selector.get_universe())
+            if not initial_universe:
+                # Build universe if empty
+                logger.info("Universe is empty, building initial universe...")
+                initial_universe, _ = universe_selector.build_universe(config.exchange.timeframe)
+            
+            if initial_universe:
+                # Download data for all symbols in initial universe
+                downloader.update_all_symbols(
+                    initial_universe,
+                    config.exchange.timeframe,
+                    lookback_days=30
+                )
+                logger.info(f"Pre-downloaded data for {len(initial_universe)} symbols in initial universe")
+            else:
+                logger.warning("Initial universe is empty after build - no symbols to download")
+        except Exception as e:
+            logger.warning(f"Error pre-downloading universe data: {e}. Continuing anyway.")
+            # Continue - data will be downloaded in main loop
     
     logger.info(f"Bot initialized. Mode: {config.exchange.mode}, Equity: ${portfolio.equity:,.2f}")
     logger.info("Starting main trading loop...")
@@ -508,12 +532,31 @@ def run_live(config_path: str):
                 
                 # Update data (only if we can trade)
                 logger.info("Updating market data...")
+                
+                # Determine which symbols to download data for
+                if universe_selector is not None:
+                    # Dynamic universe mode: download for current universe + potential new symbols
+                    current_universe = list(universe_selector.get_universe())
+                    # Also fetch all symbols from exchange to check for new listings
+                    # Limit to top 100 for performance
+                    try:
+                        all_exchange_symbols = universe_selector.fetch_all_symbols()
+                        # Combine current universe with exchange symbols (limit to top 100 to avoid excessive API calls)
+                        symbols_to_download = list(set(current_universe + all_exchange_symbols[:100]))
+                        logger.debug(f"Downloading data for {len(symbols_to_download)} symbols (universe: {len(current_universe)}, exchange: {len(all_exchange_symbols)})")
+                    except Exception as e:
+                        logger.warning(f"Error fetching all exchange symbols, using current universe only: {e}")
+                        symbols_to_download = current_universe
+                else:
+                    # Fixed list mode
+                    symbols_to_download = config.exchange.symbols
+                
                 downloader.update_all_symbols(
-                    config.exchange.symbols,
+                    symbols_to_download,
                     config.exchange.timeframe,
                     lookback_days=30
                 )
-                logger.info("Market data updated successfully")
+                logger.info(f"Market data updated successfully for {len(symbols_to_download)} symbols")
                 
                 # Determine if we should rebalance
                 now = datetime.now(timezone.utc)
@@ -575,7 +618,19 @@ def run_live(config_path: str):
                             limit=config.data.lookback_bars
                         )
                         
-                        if df.empty or len(df) < config.strategy.trend.ma_long:
+                        if df.empty:
+                            logger.warning(
+                                f"Symbol {symbol} is in trading universe but has no data in database. "
+                                f"Ensure downloader has fetched data for all universe symbols. "
+                                f"Skipping signal generation for this symbol."
+                            )
+                            continue
+                        
+                        if len(df) < config.strategy.trend.ma_long:
+                            logger.debug(
+                                f"Symbol {symbol} has insufficient data: {len(df)} bars "
+                                f"(need {config.strategy.trend.ma_long})"
+                            )
                             continue
                         
                         symbol_data[symbol] = df
@@ -1103,6 +1158,113 @@ def run_optimize_universe(
         logger.info(f"Results saved to {output_file}")
 
 
+def run_compare_timeframes(
+    config_path: str,
+    timeframes: List[str],
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    symbols: Optional[List[str]] = None,
+    output_file: Optional[str] = None,
+    is_oos_split: float = 0.7
+):
+    """Compare strategy performance across different timeframes."""
+    # Load config FIRST
+    config = BotConfig.from_yaml(config_path)
+    
+    # Setup logging with config
+    setup_logging(
+        log_dir=config.logging.log_dir,
+        level=config.logging.level,
+        max_log_size_mb=config.logging.max_log_size_mb,
+        backup_count=config.logging.backup_count,
+        service_name="timeframe-compare",
+        force=True,
+    )
+    
+    # Now get logger
+    logger = get_logger(__name__)
+    logger.info("Starting timeframe comparison")
+    
+    # Parse dates
+    start_dt = None
+    end_dt = None
+    if start_date:
+        start_dt = datetime.strptime(start_date, '%Y-%m-%d')
+    if end_date:
+        end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+    
+    # Use symbols from config if not provided
+    if symbols is None:
+        symbols = config.exchange.symbols
+    
+    # Default output file
+    if output_file is None:
+        output_file = "results/timeframe_comparison.json"
+    
+    # Initialize components
+    store = OHLCVStore(config.data.db_path)
+    analyzer = TimeframeAnalyzer(config, store)
+    
+    # Run comparison
+    results = analyzer.compare_timeframes(
+        symbols=symbols,
+        timeframes=timeframes,
+        start_date=start_dt,
+        end_date=end_dt,
+        is_oos_split=is_oos_split,
+        classify_regimes=False  # Simplified for initial version
+    )
+    
+    if not results:
+        logger.error("No results from timeframe comparison")
+        sys.exit(1)
+    
+    # Print results table
+    print("\n" + "="*100)
+    print("TIMEFRAME COMPARISON RESULTS")
+    print("="*100)
+    print(f"{'TF':<6} {'Return%':<10} {'AnnRet%':<10} {'Sharpe':<8} {'Sortino':<8} {'MaxDD%':<8} {'PF':<6} {'WR%':<6} {'Trades':<8} {'Trades/Day':<10} {'AvgHoldH':<10}")
+    print("-"*100)
+    
+    for r in results:
+        print(
+            f"{r.timeframe:<6} "
+            f"{r.total_return_pct:>9.2f}% "
+            f"{r.annualized_return_pct:>9.2f}% "
+            f"{r.sharpe_ratio:>7.2f} "
+            f"{r.sortino_ratio:>7.2f} "
+            f"{r.max_drawdown_pct:>7.2f}% "
+            f"{r.profit_factor:>5.2f} "
+            f"{r.win_rate*100:>5.1f}% "
+            f"{r.total_trades:>7d} "
+            f"{r.trades_per_day:>9.2f} "
+            f"{r.avg_holding_hours:>9.1f}h"
+        )
+    
+    print("="*100)
+    
+    # Print best timeframe
+    best = results[0]  # Already sorted by Sharpe
+    print(f"\nBest Timeframe (by Sharpe): {best.timeframe}")
+    print(f"  Annualized Return: {best.annualized_return_pct:.2f}%")
+    print(f"  Sharpe Ratio: {best.sharpe_ratio:.2f}")
+    print(f"  Max Drawdown: {best.max_drawdown_pct:.2f}%")
+    print(f"  Total Trades: {best.total_trades}")
+    print(f"  Trades/Day: {best.trades_per_day:.2f}")
+    
+    if best.oos_return_pct is not None:
+        print(f"\nOut-of-Sample Performance:")
+        print(f"  OOS Return: {best.oos_return_pct:.2f}%")
+        print(f"  OOS Sharpe: {best.oos_sharpe:.2f}")
+        print(f"  OOS Drawdown: {best.oos_drawdown_pct:.2f}%")
+    
+    print("="*100 + "\n")
+    
+    # Save results
+    analyzer.save_results(results, output_file)
+    logger.info(f"Results saved to {output_file}")
+
+
 def run_report(config_path: str):
     """Send daily Discord report."""
     # Load config FIRST
@@ -1164,6 +1326,15 @@ def main():
     optimize_universe_parser.add_argument('--method', choices=['random', 'grid'], default='random', help='Search method')
     optimize_universe_parser.add_argument('--output', help='Output file for results (JSON)')
     
+    # Compare timeframes command
+    compare_tf_parser = subparsers.add_parser('compare-timeframes', help='Compare strategy performance across different timeframes')
+    compare_tf_parser.add_argument('--timeframes', nargs='+', default=['15m', '30m', '1h', '2h', '4h', '6h', '1d'], help='Timeframes to compare (default: 15m 30m 1h 2h 4h 6h 1d)')
+    compare_tf_parser.add_argument('--start', help='Start date (YYYY-MM-DD, default: 1 year ago)')
+    compare_tf_parser.add_argument('--end', help='End date (YYYY-MM-DD, default: now)')
+    compare_tf_parser.add_argument('--symbols', nargs='+', help='Symbols to test (default: from config)')
+    compare_tf_parser.add_argument('--output', help='Output file for results (JSON, default: results/timeframe_comparison.json)')
+    compare_tf_parser.add_argument('--is-oos-split', type=float, default=0.7, help='In-sample split ratio (default: 0.7)')
+    
     # Report command
     report_parser = subparsers.add_parser('report', help='Send daily Discord report')
     
@@ -1208,6 +1379,16 @@ def main():
             getattr(args, 'n_combinations', 200),
             getattr(args, 'method', 'random'),
             getattr(args, 'output', None)
+        )
+    elif args.command == 'compare-timeframes':
+        run_compare_timeframes(
+            config_path,
+            getattr(args, 'timeframes', ['15m', '30m', '1h', '2h', '4h', '6h', '1d']),
+            getattr(args, 'start', None),
+            getattr(args, 'end', None),
+            getattr(args, 'symbols', None),
+            getattr(args, 'output', None),
+            getattr(args, 'is_oos_split', 0.7)
         )
     elif args.command == 'report':
         run_report(config_path)
