@@ -160,6 +160,10 @@ class BybitClient:
                 # Fatal: bad API key/secret or permissions
                 self.logger.error(f"Authentication error in {func.__name__}: {e}")
                 raise
+            except ccxt.BadSymbol as e:
+                # Symbol doesn't exist (delisted, inactive, etc.) - not an error, just log at debug
+                self.logger.debug(f"Symbol not available in {func.__name__}: {e}")
+                raise  # Re-raise so caller can handle it appropriately
             except ccxt.ExchangeError as e:
                 # Non-retriable exchange error (e.g., invalid order)
                 self.logger.error(f"Exchange error in {func.__name__}: {e}")
@@ -212,6 +216,10 @@ class BybitClient:
             self.logger.debug(f"Fetched {len(ohlcv)} candles for {symbol} {timeframe}")
             return ohlcv
 
+        except ccxt.BadSymbol:
+            # Symbol doesn't exist - already logged at debug level in _call_with_retries
+            # Re-raise so downloader can handle it gracefully
+            raise
         except Exception as e:
             self.logger.error(f"Error fetching OHLCV for {symbol}: {e}")
             raise
