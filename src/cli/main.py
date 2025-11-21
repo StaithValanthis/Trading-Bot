@@ -574,6 +574,9 @@ def run_live(config_path: str):
                     else:
                         logger.info(f"Rebalance threshold not reached ({hours_diff:.1f}h < {rebalance_frequency_hours}h) - skipping rebalance")
                     
+                # Initialize target_positions (empty if not rebalancing, populated if rebalancing)
+                target_positions = {}
+                
                 if should_rebalance:
                     logger.info("="*60)
                     logger.info("REBALANCING PORTFOLIO")
@@ -581,67 +584,68 @@ def run_live(config_path: str):
                     logger.info("Rebalancing portfolio...")
                 
                 # Get current universe (dynamic or fixed)
-                if universe_selector is not None:
-                    # Get current universe
-                    trading_symbols = list(universe_selector.get_universe())
-                    
-                    # Rebuild universe if needed (based on rebalance frequency)
-                    universe_rebalance_hours = config.universe.rebalance_frequency_hours
-                    hours_since_last_universe_rebuild = (
-                        (now - last_rebalance_time).total_seconds() / 3600
-                        if last_rebalance_time else float('inf')
-                    )
-                    
-                    if hours_since_last_universe_rebuild >= universe_rebalance_hours:
-                        logger.info("Rebuilding universe...")
-                        trading_symbols, universe_changes = universe_selector.build_universe(
-                            config.exchange.timeframe
-                        )
-                        logger.info(
-                            f"Universe updated: {len(trading_symbols)} symbols "
-                            f"({len([c for c in universe_changes.values() if c['action'] == 'added'])} added, "
-                            f"{len([c for c in universe_changes.values() if c['action'] == 'removed'])} removed)"
-                        )
-                else:
-                    # Use fixed symbol list from config
-                    trading_symbols = config.exchange.symbols
-                
-                # Generate signals for all symbols in universe
-                symbol_signals = {}
-                symbol_data = {}
-                
-                for symbol in trading_symbols:
-                    try:
-                        df = store.get_ohlcv(
-                            symbol,
-                            config.exchange.timeframe,
-                            limit=config.data.lookback_bars
+                if should_rebalance:
+                    if universe_selector is not None:
+                        # Get current universe
+                        trading_symbols = list(universe_selector.get_universe())
+                        
+                        # Rebuild universe if needed (based on rebalance frequency)
+                        universe_rebalance_hours = config.universe.rebalance_frequency_hours
+                        hours_since_last_universe_rebuild = (
+                            (now - last_rebalance_time).total_seconds() / 3600
+                            if last_rebalance_time else float('inf')
                         )
                         
-                        if df.empty:
-                            logger.warning(
-                                f"Symbol {symbol} is in trading universe but has no data in database. "
-                                f"Ensure downloader has fetched data for all universe symbols. "
-                                f"Skipping signal generation for this symbol."
+                        if hours_since_last_universe_rebuild >= universe_rebalance_hours:
+                            logger.info("Rebuilding universe...")
+                            trading_symbols, universe_changes = universe_selector.build_universe(
+                                config.exchange.timeframe
                             )
-                            continue
-                        
-                        if len(df) < config.strategy.trend.ma_long:
-                            logger.debug(
-                                f"Symbol {symbol} has insufficient data: {len(df)} bars "
-                                f"(need {config.strategy.trend.ma_long})"
+                            logger.info(
+                                f"Universe updated: {len(trading_symbols)} symbols "
+                                f"({len([c for c in universe_changes.values() if c['action'] == 'added'])} added, "
+                                f"{len([c for c in universe_changes.values() if c['action'] == 'removed'])} removed)"
                             )
+                    else:
+                        # Use fixed symbol list from config
+                        trading_symbols = config.exchange.symbols
+                    
+                    # Generate signals for all symbols in universe
+                    symbol_signals = {}
+                    symbol_data = {}
+                    
+                    for symbol in trading_symbols:
+                        try:
+                            df = store.get_ohlcv(
+                                symbol,
+                                config.exchange.timeframe,
+                                limit=config.data.lookback_bars
+                            )
+                            
+                            if df.empty:
+                                logger.warning(
+                                    f"Symbol {symbol} is in trading universe but has no data in database. "
+                                    f"Ensure downloader has fetched data for all universe symbols. "
+                                    f"Skipping signal generation for this symbol."
+                                )
+                                continue
+                            
+                            if len(df) < config.strategy.trend.ma_long:
+                                logger.debug(
+                                    f"Symbol {symbol} has insufficient data: {len(df)} bars "
+                                    f"(need {config.strategy.trend.ma_long})"
+                                )
+                                continue
+                            
+                            symbol_data[symbol] = df
+                            
+                            # Generate trend signal
+                            trend_signal = trend_gen.generate_signal(df)
+                            symbol_signals[symbol] = trend_signal
+                            
+                        except Exception as e:
+                            logger.warning(f"Error generating signal for {symbol}: {e}")
                             continue
-                        
-                        symbol_data[symbol] = df
-                        
-                        # Generate trend signal
-                        trend_signal = trend_gen.generate_signal(df)
-                        symbol_signals[symbol] = trend_signal
-                        
-                    except Exception as e:
-                        logger.warning(f"Error generating signal for {symbol}: {e}")
-                        continue
                 
                 # Log all signals generated (for monitoring)
                 if symbol_signals:
@@ -700,6 +704,28 @@ def run_live(config_path: str):
                 
                 logger.info(f"Selected symbols for trading: {selected_symbols}")
                 
+                # Log diagnostics if no symbols selected
+                if not selected_symbols:
+                    logger.warning("No symbols selected for trading. Diagnosing...")
+                    rankings = cross_sectional_gen.rank_symbols(symbol_data)
+                    if not rankings:
+                        logger.warning("  - No symbols with sufficient history for ranking")
+                    else:
+                        logger.info(f"  - {len(rankings)} symbols ranked successfully")
+                        # Show top ranked symbols that didn't pass filter
+                        long_count = len([s for s, sig in symbol_signals.items() if sig.get('signal') == 'long'])
+                        short_count = len([s for s, sig in symbol_signals.items() if sig.get('signal') == 'short'])
+                        logger.info(f"  - Trend signals: {long_count} long, {short_count} short")
+                        
+                        if config.strategy.cross_sectional.require_trend_alignment:
+                            logger.warning("  - Trend alignment is enabled: symbols need matching trend signals")
+                            # Show top ranked symbols that didn't pass filter
+                            logger.info("Top ranked symbols (not selected due to trend filter):")
+                            for i, (symbol, return_pct) in enumerate(rankings[:5], 1):
+                                signal = symbol_signals.get(symbol, {}).get('signal', 'flat')
+                                icon = "📈" if signal == 'long' else "📉" if signal == 'short' else "➖"
+                                logger.info(f"    {i}. {icon} {symbol}: {return_pct*100:+.2f}% (trend: {signal})")
+                
                 # Log detailed info for selected symbols
                 if selected_symbols:
                     logger.info("Selected symbols details:")
@@ -724,113 +750,118 @@ def run_live(config_path: str):
                             f"Stop Loss: ${stop_str}"
                         )
                 
-                # Generate target positions
-                target_positions = {}
-                
-                for symbol in selected_symbols:
-                    signal_dict = symbol_signals.get(symbol)
-                    if not signal_dict or signal_dict['signal'] == 'flat':
-                        continue
-                    
-                    signal = signal_dict['signal']
-                    entry_price = signal_dict['entry_price']
-                    stop_loss = signal_dict['stop_loss']
-                    
-                    if not stop_loss:
-                        continue
-                    
-                    # Calculate position size
-                    size, error = position_sizer.calculate_position_size(
-                        symbol,
-                        portfolio.equity,
-                        entry_price,
-                        stop_loss,
-                        signal
-                    )
-                    
-                    if size <= 0:
-                        logger.warning(f"Skipping {symbol}: {error}")
-                        continue
-                    
-                    # Apply funding bias adjustment
-                    adjusted_size = funding_bias.calculate_size_adjustment(
-                        symbol,
-                        signal,
-                        size
-                    )
-                    
-                    # Check portfolio limits
-                    market_info = exchange.get_market_info(symbol)
-                    contract_size = market_info.get('contractSize', 1.0)
-                    notional = adjusted_size * entry_price * contract_size
-                    
-                    within_limits, limit_error = portfolio_limits.check_leverage_limit(
-                        portfolio,
-                        notional,
-                        signal
-                    )
-                    
-                    if not within_limits:
-                        logger.warning(f"Position for {symbol} exceeds leverage: {limit_error}")
-                        # Scale down
-                        adjusted_size, scale_reason = portfolio_limits.scale_position_for_limits(
-                            portfolio,
+                # Generate target positions (only during rebalance)
+                if should_rebalance:
+                    for symbol in selected_symbols:
+                        signal_dict = symbol_signals.get(symbol)
+                        if not signal_dict or signal_dict['signal'] == 'flat':
+                            continue
+                        
+                        signal = signal_dict['signal']
+                        entry_price = signal_dict['entry_price']
+                        stop_loss = signal_dict['stop_loss']
+                        
+                        if not stop_loss:
+                            continue
+                        
+                        # Calculate position size
+                        size, error = position_sizer.calculate_position_size(
                             symbol,
-                            adjusted_size,
+                            portfolio.equity,
                             entry_price,
+                            stop_loss,
                             signal
                         )
-                        if adjusted_size <= 0:
-                            logger.warning(f"Cannot scale {symbol} to fit limits: {scale_reason}")
+                        
+                        if size <= 0:
+                            logger.warning(f"Skipping {symbol}: {error}")
                             continue
-                    
-                    # Check symbol concentration
-                    within_concentration, conc_error = portfolio_limits.check_symbol_concentration(
-                        portfolio,
-                        symbol,
-                        notional
-                    )
-                    
-                    if not within_concentration:
-                        logger.warning(f"Position for {symbol} exceeds concentration: {conc_error}")
-                        adjusted_size, scale_reason = portfolio_limits.scale_position_for_limits(
-                            portfolio,
+                        
+                        # Apply funding bias adjustment
+                        adjusted_size = funding_bias.calculate_size_adjustment(
                             symbol,
-                            adjusted_size,
-                            entry_price,
+                            signal,
+                            size
+                        )
+                        
+                        # Check portfolio limits
+                        market_info = exchange.get_market_info(symbol)
+                        contract_size = market_info.get('contractSize', 1.0)
+                        notional = adjusted_size * entry_price * contract_size
+                        
+                        within_limits, limit_error = portfolio_limits.check_leverage_limit(
+                            portfolio,
+                            notional,
                             signal
                         )
-                        if adjusted_size <= 0:
+                        
+                        if not within_limits:
+                            logger.warning(f"Position for {symbol} exceeds leverage: {limit_error}")
+                            # Scale down
+                            adjusted_size, scale_reason = portfolio_limits.scale_position_for_limits(
+                                portfolio,
+                                symbol,
+                                adjusted_size,
+                                entry_price,
+                                signal
+                            )
+                            if adjusted_size <= 0:
+                                logger.warning(f"Cannot scale {symbol} to fit limits: {scale_reason}")
+                                continue
+                        
+                        # Check symbol concentration
+                        within_concentration, conc_error = portfolio_limits.check_symbol_concentration(
+                            portfolio,
+                            symbol,
+                            notional
+                        )
+                        
+                        if not within_concentration:
+                            logger.warning(f"Position for {symbol} exceeds concentration: {conc_error}")
+                            adjusted_size, scale_reason = portfolio_limits.scale_position_for_limits(
+                                portfolio,
+                                symbol,
+                                adjusted_size,
+                                entry_price,
+                                signal
+                            )
+                            if adjusted_size <= 0:
+                                continue
+                        
+                        # Check max positions
+                        within_max, max_error = portfolio_limits.check_max_positions(
+                            portfolio,
+                            symbol
+                        )
+                        
+                        if not within_max:
+                            logger.warning(f"Max positions reached: {max_error}")
                             continue
-                    
-                    # Check max positions
-                    within_max, max_error = portfolio_limits.check_max_positions(
-                        portfolio,
-                        symbol
-                    )
-                    
-                    if not within_max:
-                        logger.warning(f"Max positions reached: {max_error}")
-                        continue
-                    
-                    # Convert to signed size (positive for long, negative for short)
-                    signed_size = adjusted_size if signal == 'long' else -adjusted_size
-                    
-                    target_positions[symbol] = {
-                        'size': signed_size,
-                        'signal': signal,
-                        'entry_price': entry_price,
-                        'stop_loss': stop_loss
-                    }
+                        
+                        # Convert to signed size (positive for long, negative for short)
+                        signed_size = adjusted_size if signal == 'long' else -adjusted_size
+                        
+                        target_positions[symbol] = {
+                            'size': signed_size,
+                            'signal': signal,
+                            'entry_price': entry_price,
+                            'stop_loss': stop_loss
+                        }
                 
                 # Execute position changes
                 # Note: reconcile_positions handles both:
                 # 1. Positions to open/adjust (in target_positions)
                 # 2. Positions to close (existing but not in target_positions)
                 # This ensures that positions opened before restart are properly managed
+                
+                # CRITICAL: Always reconcile positions if we have open positions OR target positions
+                # This ensures positions close immediately when signals change to flat,
+                # even if we're not in a rebalance cycle. We need to check open positions
+                # every iteration to see if any should be closed due to signal changes.
                 if target_positions or portfolio.positions:
                     existing_count = len(portfolio.positions)
                     target_count = len(target_positions)
+                    
                     logger.info(
                         f"Reconciling positions: {existing_count} existing position(s), "
                         f"{target_count} target position(s)"
@@ -849,10 +880,38 @@ def run_live(config_path: str):
                     # This ensures the heartbeat shows correct position counts
                     logger.debug("Updating portfolio state after order execution...")
                     portfolio.update()
+                    
+                    # Check for positions without stop-losses and place them
+                    # This handles cases where entry order was placed but position verification timed out
+                    if config.risk and config.risk.use_server_side_stops:
+                        for symbol, pos in list(portfolio.positions.items()):
+                            stop_order_id = pos.get('stop_order_id')
+                            stop_loss_price = pos.get('stop_loss_price')
+                            contracts = abs(pos.get('contracts', 0))
+                            side = pos.get('side', 'long')
+                            
+                            # If position exists but no stop-loss order ID, try to place one
+                            if stop_order_id is None and stop_loss_price is not None and contracts >= 0.001:
+                                logger.info(
+                                    f"Position {symbol} found without stop-loss order. "
+                                    f"Attempting to place stop-loss at {stop_loss_price:.2f}..."
+                                )
+                                try:
+                                    executor._place_stop_loss_order(
+                                        symbol,
+                                        side,
+                                        contracts,
+                                        stop_loss_price,
+                                        portfolio,
+                                        pos.get('entry_price'),
+                                    )
+                                except Exception as e:
+                                    logger.warning(f"Failed to place stop-loss for {symbol}: {e}")
                 else:
                     logger.info("No position changes needed (no targets and no existing positions)")
                 
-                last_rebalance_time = now
+                if should_rebalance:
+                    last_rebalance_time = now
                 
                 # Heartbeat / health summary
                 logger.info(

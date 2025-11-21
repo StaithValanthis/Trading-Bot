@@ -73,14 +73,46 @@ class PositionSizer:
         # contracts = Risk / ((entry - stop) * contract_size)
         position_size = risk_amount / (stop_distance * contract_size)
         
+        self.logger.debug(
+            f"Position size calculation for {symbol}: "
+            f"risk=${risk_amount:.2f}, stop_distance=${stop_distance:.2f}, "
+            f"contract_size={contract_size}, calculated_size={position_size:.8f}"
+        )
+        
         # Apply fractional Kelly if configured
         if self.config.kelly_fraction < 1.0:
             position_size = position_size * self.config.kelly_fraction
+            self.logger.debug(f"Applied Kelly fraction {self.config.kelly_fraction}: {position_size:.8f}")
         
-        # Round to exchange precision
+        # Get minimum order size from exchange
+        market_info = self.exchange.get_market_info(symbol)
+        min_amount = market_info['limits']['amount']['min']
+        min_cost = market_info['limits']['cost']['min']
+        
+        # Check if calculated size is below minimum
+        # If so, round up to minimum instead of skipping the trade
+        position_size_before_round = position_size
         position_size = self.exchange.round_amount(symbol, position_size)
         
-        # Validate order size
+        # If rounded size is below minimum, use minimum instead
+        if min_amount is not None and min_amount > 0:
+            if position_size < min_amount:
+                self.logger.info(
+                    f"Position size {position_size:.8f} for {symbol} below minimum {min_amount}. "
+                    f"Using minimum order size instead (calculated risk was ${risk_amount:.2f})"
+                )
+                position_size = min_amount
+                # Re-round to ensure it meets precision requirements
+                position_size = self.exchange.round_amount(symbol, position_size)
+                # Ensure it's still at least minimum after rounding
+                if position_size < min_amount:
+                    position_size = min_amount
+        
+        self.logger.debug(
+            f"Rounded position size for {symbol}: {position_size_before_round:.8f} → {position_size:.8f}"
+        )
+        
+        # Validate order size (this should pass now since we ensured minimum)
         is_valid, error_msg = self.exchange.validate_order_size(
             symbol,
             position_size,
@@ -88,6 +120,21 @@ class PositionSizer:
         )
         
         if not is_valid:
+            # If still invalid (e.g., cost below minimum), we've already tried minimum amount
+            # Check if it's a cost issue and log accordingly
+            if min_cost is not None and min_cost > 0:
+                cost = position_size * entry_price * contract_size
+                if cost < min_cost:
+                    self.logger.warning(
+                        f"Position size {position_size:.8f} for {symbol} meets amount minimum but "
+                        f"order cost ${cost:.2f} below minimum ${min_cost:.2f}. "
+                        f"This trade cannot be placed with current risk settings."
+                    )
+            else:
+                self.logger.warning(
+                    f"Position size validation failed for {symbol}: {error_msg}. "
+                    f"Size={position_size:.8f}, entry_price=${entry_price:.2f}"
+                )
             return 0.0, error_msg
         
         return position_size, None

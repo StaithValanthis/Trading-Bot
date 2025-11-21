@@ -66,14 +66,26 @@ class PortfolioState:
                 
                 self.logger.debug(f"Normalized position symbol: {pos_symbol} → {symbol}")
                 
-                contracts = float(pos.get('contracts', 0))
-                entry_price = float(pos.get('entryPrice', 0))
-                mark_price = float(pos.get('markPrice', 0))
-                notional = float(pos.get('notional', 0))
-                unrealized_pnl = float(pos.get('unrealizedPnl', 0))
+                # Safely convert to float, handling None values
+                # Use get() with default 0, then check if None before converting
+                contracts_raw = pos.get('contracts', 0)
+                contracts = float(contracts_raw) if contracts_raw is not None else 0.0
+                
+                entry_price_raw = pos.get('entryPrice', 0)
+                entry_price = float(entry_price_raw) if entry_price_raw is not None else 0.0
+                
+                mark_price_raw = pos.get('markPrice', 0)
+                mark_price = float(mark_price_raw) if mark_price_raw is not None else 0.0
+                
+                notional_raw = pos.get('notional', 0)
+                notional = float(notional_raw) if notional_raw is not None else 0.0
+                
+                unrealized_pnl_raw = pos.get('unrealizedPnl', 0)
+                unrealized_pnl = float(unrealized_pnl_raw) if unrealized_pnl_raw is not None else 0.0
+                
                 side = pos.get('side', 'long')
                 
-                if abs(contracts) > 0.001:  # Only include open positions
+                if abs(contracts) >= 0.001:  # Only include open positions (>= to include minimum order size)
                     # Extract SL/TP from position info if available
                     # Bybit may provide stopLoss/takeProfit in position info
                     position_info = pos.get('info', {})
@@ -119,7 +131,7 @@ class PortfolioState:
     def has_position(self, symbol: str) -> bool:
         """Check if we have an open position in a symbol."""
         pos = self.positions.get(symbol)
-        return pos is not None and abs(pos.get('contracts', 0)) > 0.001
+        return pos is not None and abs(pos.get('contracts', 0)) >= 0.001
     
     def get_total_notional(self) -> float:
         """Get total absolute notional value of all positions."""

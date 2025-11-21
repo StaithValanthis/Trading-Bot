@@ -4,6 +4,7 @@ import ccxt
 import time
 import hmac
 import hashlib
+import math
 from typing import Dict, List, Optional, Tuple, Any, Callable
 from datetime import datetime
 import logging
@@ -613,6 +614,8 @@ class BybitClient:
             
             # Try using CCXT's create_order with conditional order type
             # If CCXT doesn't support it directly, we may need to use exchange-specific API
+            # NOTE: This is EXPECTED to fail - CCXT doesn't support Bybit conditional orders properly
+            # We'll catch the error and fall back to direct Bybit v5 API (this is normal, not an error)
             try:
                 order = self._call_with_retries(
                     self.exchange.create_order,
@@ -623,12 +626,14 @@ class BybitClient:
                     None,  # price (handled in params)
                     order_params,
                 )
-            except (ccxt.ExchangeError, ccxt.NotSupported) as e:
-                # CCXT may not support conditional orders directly
-                # Fall back to using Bybit v5 API directly
-                self.logger.warning(
-                    f"CCXT doesn't support conditional orders directly for {symbol}: {e}. "
-                    "Attempting direct Bybit v5 API call..."
+            except (ccxt.ExchangeError, ccxt.NotSupported, Exception) as e:
+                # CCXT may not support conditional orders directly - this is EXPECTED behavior
+                # Fall back to using Bybit v5 API directly (this is normal, not an error condition)
+                # Use WARNING level since this is expected and handled gracefully
+                error_msg = str(e)
+                self.logger.debug(
+                    f"CCXT doesn't support conditional stop orders directly for {symbol}: {error_msg}. "
+                    "This is expected - falling back to direct Bybit v5 API call..."
                 )
                 # Use Bybit v5 API directly for conditional orders
                 # Fall back to direct API call since CCXT doesn't support conditional orders
@@ -651,7 +656,9 @@ class BybitClient:
             return order
             
         except Exception as e:
-            self.logger.error(f"Error creating stop order for {symbol}: {e}")
+            # Only log ERROR if we truly can't handle it (fallback also failed)
+            # Most errors should be caught above and handled via fallback to Bybit v5 API
+            self.logger.error(f"Error creating stop order for {symbol} (fallback also failed): {e}")
             raise
     
     def _create_stop_order_v5_api(
@@ -1259,14 +1266,31 @@ class BybitClient:
             Market info dictionary with precision, limits, etc.
         """
         try:
-            ccxt_symbol = symbol.replace("USDT", "/USDT") if "/" not in symbol else symbol
+            # Convert internal symbol format to CCXT format for perpetual futures
+            # Internal: "ETHUSDT" → CCXT: "ETH/USDT:USDT" (perpetual futures, not spot)
+            if "/" not in symbol:
+                if symbol.endswith("USDT"):
+                    base = symbol[:-4]  # Remove "USDT" suffix
+                    ccxt_symbol = f"{base}/USDT:USDT"  # Perpetual futures format
+                else:
+                    ccxt_symbol = f"{symbol}/USDT:USDT"
+            elif ":USDT" not in symbol:
+                ccxt_symbol = f"{symbol}:USDT"
+            else:
+                ccxt_symbol = symbol
+            
             markets = self.fetch_markets()
             
             if ccxt_symbol not in markets:
-                raise ValueError(f"Symbol {symbol} not found in markets")
+                self.logger.warning(
+                    f"Symbol {symbol} (CCXT: {ccxt_symbol}) not found in markets. "
+                    f"Available symbols (first 10): {list(markets.keys())[:10]}"
+                )
+                raise ValueError(f"Symbol {symbol} (CCXT: {ccxt_symbol}) not found in markets")
             
             market = markets[ccxt_symbol]
-            return {
+            
+            market_info = {
                 'precision': {
                     'price': market.get('precision', {}).get('price', 2),
                     'amount': market.get('precision', {}).get('amount', 8),
@@ -1282,6 +1306,16 @@ class BybitClient:
                 },
                 'contractSize': market.get('contractSize') or 1.0,
             }
+            
+            self.logger.debug(
+                f"Market info for {symbol} (CCXT: {ccxt_symbol}): "
+                f"min_amount={market_info['limits']['amount']['min']}, "
+                f"min_cost={market_info['limits']['cost']['min']}, "
+                f"precision_amount={market_info['precision']['amount']}, "
+                f"contract_size={market_info['contractSize']}"
+            )
+            
+            return market_info
             
         except Exception as e:
             self.logger.error(f"Error getting market info for {symbol}: {e}")
@@ -1321,11 +1355,44 @@ class BybitClient:
                 return 8  # Default to 8 decimal places for amounts
     
     def round_amount(self, symbol: str, amount: float) -> float:
-        """Round amount to exchange precision."""
+        """
+        Round amount to exchange precision.
+        
+        Also ensures the rounded amount meets the minimum order size.
+        If rounding would result in an amount below minimum, rounds up to minimum.
+        """
+        if amount <= 0:
+            return 0.0
+        
         market_info = self.get_market_info(symbol)
         precision = market_info['precision']['amount']
         decimals = self._precision_to_decimals(precision)
-        return round(amount, decimals)
+        
+        # Round to exchange precision
+        rounded = round(amount, decimals)
+        
+        # Ensure rounded amount meets minimum order size
+        # If rounding down would result in value below minimum, round up to minimum
+        min_amount = market_info['limits']['amount']['min']
+        if rounded < min_amount and amount >= min_amount:
+            # Round up to minimum (or next valid increment above minimum)
+            # Use the precision to find the next valid increment
+            if decimals > 0:
+                # Round up to minimum using precision
+                # For example, if min is 0.01 and precision is 2 decimals, round up to 0.01
+                multiplier = 10 ** decimals
+                min_rounded = math.ceil(min_amount * multiplier) / multiplier
+                # Ensure it's at least the minimum
+                rounded = max(min_rounded, min_amount)
+            else:
+                # Integer precision - round up to next integer above minimum
+                rounded = max(math.ceil(min_amount), min_amount)
+        
+        # Final check: ensure we don't return 0 if original amount was positive
+        if rounded <= 0 and amount > 0:
+            rounded = min_amount
+        
+        return rounded
     
     def round_price(self, symbol: str, price: float) -> float:
         """Round price to exchange precision."""
@@ -1347,14 +1414,16 @@ class BybitClient:
         
         # Check minimum amount
         min_amount = limits['amount']['min']
-        if amount < min_amount:
-            return False, f"Amount {amount} below minimum {min_amount}"
+        if min_amount is not None and min_amount > 0:
+            if amount < min_amount:
+                return False, f"Amount {amount} below minimum {min_amount}"
         
         # Check minimum cost (notional)
         min_cost = limits['cost']['min']
-        cost = amount * price * contract_size
-        if cost < min_cost:
-            return False, f"Order cost {cost} below minimum {min_cost}"
+        if min_cost is not None and min_cost > 0:
+            cost = amount * price * contract_size
+            if cost < min_cost:
+                return False, f"Order cost {cost} below minimum {min_cost}"
         
         return True, None
 

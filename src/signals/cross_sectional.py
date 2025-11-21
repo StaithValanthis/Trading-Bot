@@ -46,8 +46,23 @@ class CrossSectionalSignalGenerator:
             # Calculate return over ranking window
             if len(close) >= self.config.ranking_window:
                 start_price = close.iloc[-self.config.ranking_window]
-                end_price = close.iloc[-1]
+                # Use previous completed bar for ranking (avoid look-ahead bias)
+                # Entry execution will still use current price (correct)
+                end_price = close.iloc[-2] if len(close) > 1 else close.iloc[-1]
+                
+                # Validate prices (handle NaN, infinity, zero/negative prices)
+                if pd.isna(start_price) or pd.isna(end_price):
+                    continue  # Skip symbols with NaN data
+                
+                if start_price <= 0 or end_price <= 0:
+                    continue  # Skip delisted symbols (zero/negative prices)
+                
                 return_pct = (end_price - start_price) / start_price
+                
+                # Check for infinity or NaN result
+                if not np.isfinite(return_pct):
+                    continue  # Skip invalid returns
+                
                 rankings.append((symbol, return_pct))
         
         # Sort by return descending (best performers first)
@@ -64,13 +79,20 @@ class CrossSectionalSignalGenerator:
         """
         Select top K symbols based on cross-sectional ranking.
         
+        Supports both long and short signals:
+        - For positive momentum (best performers): selects symbols with 'long' trend signals
+        - For negative momentum (worst performers): selects symbols with 'short' trend signals
+        
         Args:
             symbol_data: Dictionary mapping symbol to OHLCV DataFrame
             trend_signals: Optional dictionary mapping symbol to trend signal
-            require_trend_alignment: If True, only select symbols with positive trend signals
+            require_trend_alignment: If True, only select symbols where trend signal matches momentum
+                - For positive momentum (best performers): require 'long' trend signal
+                - For negative momentum (worst performers): require 'short' trend signal
+                - If False: select based purely on momentum regardless of trend signal
         
         Returns:
-            List of top K symbol names
+            List of top K symbol names (mix of longs and shorts based on momentum and trend alignment)
         """
         rankings = self.rank_symbols(symbol_data)
         
@@ -79,18 +101,60 @@ class CrossSectionalSignalGenerator:
         
         selected = []
         
+        # Collect candidates for longs (positive momentum) and shorts (negative momentum)
+        long_candidates = []  # (symbol, return_pct) for symbols with positive momentum
+        short_candidates = []  # (symbol, return_pct) for symbols with negative momentum
+        
         for symbol, return_pct in rankings:
             # Check trend alignment if required
             if require_trend_alignment and trend_signals:
                 trend_signal = trend_signals.get(symbol, {})
-                if trend_signal.get('signal') != 'long':
-                    # Skip symbols without long trend signal
+                signal_direction = trend_signal.get('signal', 'flat')
+                
+                # Skip symbols without valid trend signal
+                if signal_direction == 'flat':
                     continue
-            
-            selected.append(symbol)
-            
+                
+                # When require_trend_alignment=True:
+                # - For positive momentum (best performers): require 'long' trend signal
+                # - For negative momentum (worst performers): require 'short' trend signal
+                if return_pct > 0:
+                    # Positive momentum: require long signal
+                    if signal_direction == 'long':
+                        long_candidates.append((symbol, return_pct))
+                else:
+                    # Negative momentum: require short signal
+                    if signal_direction == 'short':
+                        short_candidates.append((symbol, return_pct))
+            elif not require_trend_alignment:
+                # No trend alignment required: accept all signals
+                trend_signal = trend_signals.get(symbol, {}) if trend_signals else {}
+                signal_direction = trend_signal.get('signal', 'flat')
+                if signal_direction != 'flat':
+                    if return_pct > 0:
+                        long_candidates.append((symbol, return_pct))
+                    else:
+                        short_candidates.append((symbol, return_pct))
+            else:
+                # require_trend_alignment=True but no trend_signals provided: skip
+                continue
+        
+        # Select top candidates from both groups
+        # Prioritize best performers (longs) and worst performers (shorts)
+        # Distribute top_k between longs and shorts based on availability
+        
+        # Start with best longs (positive momentum, descending)
+        for symbol, _ in long_candidates:
             if len(selected) >= self.config.top_k:
                 break
+            selected.append(symbol)
+        
+        # Then add worst performers with short signals (negative momentum, ascending by absolute return)
+        short_candidates_sorted = sorted(short_candidates, key=lambda x: x[1])  # Most negative first
+        for symbol, _ in short_candidates_sorted:
+            if len(selected) >= self.config.top_k:
+                break
+            selected.append(symbol)
         
         return selected
     

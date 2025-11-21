@@ -270,6 +270,54 @@ class OrderExecutor:
             )
             return {'status': 'skipped', 'reason': 'rate_limit'}
         
+        # CRITICAL: If a position already exists for this symbol, skip placing a new order entirely
+        # This prevents stacking positions regardless of size differences.
+        # Size differences (due to profit, equity changes, etc.) should NOT trigger new orders.
+        # Only close/reverse if direction changes or signal goes flat (handled in reconcile_positions).
+        if portfolio_state:
+            existing_pos = portfolio_state.get_position(symbol)
+            if existing_pos:
+                existing_contracts = existing_pos.get('contracts', 0)
+                existing_side = existing_pos.get('side', 'long')
+                # Convert to signed size for comparison
+                existing_signed_size = abs(existing_contracts) if existing_side == 'long' else -abs(existing_contracts)
+                
+                # Check if direction matches (same sign = same direction)
+                same_direction = (
+                    (target_size > 0 and existing_signed_size > 0) or
+                    (target_size < 0 and existing_signed_size < 0)
+                )
+                
+                if same_direction:
+                    # Position exists with same direction - skip entirely regardless of size difference
+                    # Size differences due to profit/equity changes should NOT trigger new orders
+                    self.logger.info(
+                        f"Skipping {symbol}: position already exists (same direction). "
+                        f"Current={existing_signed_size:.4f}, Target={target_size:.4f}. "
+                        f"Size difference ignored - no new order to prevent stacking."
+                    )
+                    return {
+                        'status': 'skipped',
+                        'symbol': symbol,
+                        'reason': 'position_already_exists_same_direction',
+                        'current_size': existing_signed_size,
+                        'target_size': target_size
+                    }
+                else:
+                    # Direction changed - position should be closed first in reconcile_positions
+                    # But if we reach here, it means reconciliation didn't close it - skip to prevent stacking
+                    self.logger.warning(
+                        f"Direction mismatch for {symbol}: existing={existing_signed_size:.4f} ({existing_side}), "
+                        f"target={target_size:.4f}. Position should be closed first. Skipping to prevent stacking."
+                    )
+                    return {
+                        'status': 'skipped',
+                        'symbol': symbol,
+                        'reason': 'position_exists_opposite_direction',
+                        'current_size': existing_signed_size,
+                        'target_size': target_size
+                    }
+        
         # Determine side and absolute size
         if target_size > 0:
             side = 'buy'
@@ -335,10 +383,11 @@ class OrderExecutor:
             # CCXT may return status=None for market orders that fill instantly
             # So we check position existence rather than relying on order status
             
-            # Wait and retry position verification (up to 5 seconds total)
+            # Wait and retry position verification (up to 20 seconds total for small positions)
+            # Small positions (like BTC minimum 0.001) may take longer to appear in portfolio
             position_verified = False
             actual_size = size  # Use target size as default
-            max_retries = 5
+            max_retries = 10  # Increased from 5 to handle small positions
             retry_delay = 1.0  # Start with 1 second delay
             
             for attempt in range(max_retries):
@@ -389,7 +438,7 @@ class OrderExecutor:
                             )
                             
                             contracts = float(pos.get('contracts', 0))
-                            if pos_symbol == symbol and abs(contracts) > 0.001:
+                            if pos_symbol == symbol and abs(contracts) >= 0.001:
                                 position_verified = True
                                 actual_size = abs(contracts)
                                 self.logger.info(
@@ -406,11 +455,21 @@ class OrderExecutor:
                     break
             
             if not position_verified:
+                # Calculate total wait time (sum of all delays)
+                total_wait_time = sum(min(1.0 * (1.5 ** i), 3.0) for i in range(max_retries - 1))
                 self.logger.warning(
-                    f"Position for {symbol} not verified after {max_retries} attempts ({max_retries * retry_delay:.1f}s total). "
+                    f"Position for {symbol} not verified after {max_retries} attempts (~{total_wait_time:.1f}s total). "
                     f"Entry order {order_id} was placed, but position not yet visible. "
-                    "SL/TP orders will be placed on next rebalance cycle."
+                    "Stop-loss will be placed when position appears on next cycle."
                 )
+                # Store the entry info so we can place SL/TP when position appears
+                if portfolio_state:
+                    portfolio_state.set_position_metadata(
+                        symbol,
+                        entry_time=datetime.now(timezone.utc),
+                        stop_loss_price=stop_loss_price,
+                        take_profit_price=take_profit_price,
+                    )
                 return {
                     'status': 'partial',
                     'order': order,
@@ -418,6 +477,9 @@ class OrderExecutor:
                     'side': side,
                     'size': size,
                     'price': entry_price,
+                    'stop_loss_price': stop_loss_price,
+                    'take_profit_price': take_profit_price,
+                    'signal': signal,
                     'message': 'Entry order placed, but position not yet verified. SL/TP will be placed on next cycle.'
                 }
             
@@ -442,6 +504,8 @@ class OrderExecutor:
                     portfolio_state,
                     entry_price,  # Pass entry price for validation
                 )
+            else:
+                self.logger.warning(f"No stop-loss price provided for {symbol}, skipping SL order")
             
             # Place take-profit order if configured
             if take_profit_price and self.strategy_config:
@@ -452,6 +516,19 @@ class OrderExecutor:
                     take_profit_price,
                     portfolio_state,
                 )
+            else:
+                if not take_profit_price:
+                    take_profit_rr_val = None
+                    if self.strategy_config:
+                        take_profit_rr_val = self.strategy_config.take_profit_rr
+                    self.logger.info(
+                        f"Take-profit not configured for {symbol} "
+                        f"(take_profit_rr={take_profit_rr_val}). "
+                        f"To enable TP orders, set strategy.trend.take_profit_rr in config.yaml (e.g., 2.0 for 2x risk-reward). "
+                        f"Skipping TP order."
+                    )
+                elif not self.strategy_config:
+                    self.logger.warning(f"No strategy_config available for {symbol}, skipping TP order")
             
             # Set entry time in portfolio state if provided
             if portfolio_state:
@@ -601,7 +678,7 @@ class OrderExecutor:
         for symbol, pos in portfolio_state.positions.items():
             contracts = pos.get('contracts', 0)
             side = pos.get('side', 'long')
-            if abs(contracts) > 0.001:
+            if abs(contracts) >= 0.001:  # Include minimum order size (0.001 for BTC)
                 # Store signed contracts (positive for long, negative for short)
                 signed_contracts = abs(contracts) if side == 'long' else -abs(contracts)
                 current_positions[symbol] = signed_contracts
@@ -642,19 +719,48 @@ class OrderExecutor:
             target_size = target.get('size', 0)
             current_size = current_positions.get(symbol, 0)
             
-            # Only execute if size difference is significant (>1% of target or >0.001 contracts)
-            size_diff = abs(target_size - current_size)
-            if size_diff < 0.001 and abs(target_size) < 0.001:
-                # Both are effectively zero, skip
+            # CRITICAL: If a position already exists for this symbol, skip placing a new order
+            # This prevents stacking positions on each iteration, regardless of size differences
+            # We only act if:
+            # 1. Signal changed direction (handled by checking sign mismatch below)
+            # 2. Signal changed to flat (symbol not in target_positions - handled above)
+            # 3. Position needs to be closed (target_size == 0)
+            if abs(current_size) >= 0.001:  # Position already exists (>= to include minimum order size)
+                # Check if direction matches (same sign = same direction)
+                same_direction = (
+                    (target_size > 0 and current_size > 0) or
+                    (target_size < 0 and current_size < 0)
+                )
+                
+                if same_direction:
+                    # Position exists with same direction - skip entirely to prevent stacking
+                    # Size differences (due to profit, equity changes, etc.) should NOT trigger new orders
+                    self.logger.info(
+                        f"Skipping {symbol}: position already exists (same direction). "
+                        f"Current={current_size:.4f}, Target={target_size:.4f}. "
+                        f"No new order will be placed to prevent stacking."
+                    )
+                    continue
+                else:
+                    # Direction changed - need to close existing position first
+                    # This will be handled by closing the position (it's not in target), then opening new one
+                    self.logger.warning(
+                        f"Direction mismatch for {symbol}: existing={current_size:.4f}, "
+                        f"target={target_size:.4f}. Position should be closed first."
+                    )
+                    # Close existing position first - it will be handled in the close loop above
+                    continue
+            
+            # Only execute if no position exists (new position to open)
+            if abs(target_size) < 0.001:
+                # Target size is zero, skip
                 continue
             
-            if size_diff < max(0.001, abs(target_size) * 0.01):
-                # Size difference is small, skip to avoid over-trading
-                continue
-            
-            # If position already exists, cancel old stop/TP orders before adjusting
-            if symbol in portfolio_state.positions:
-                self._cancel_stop_orders(symbol, portfolio_state)
+            # Open new position
+            self.logger.info(
+                f"Opening new position for {symbol}: "
+                f"target={target_size:.4f} ({target.get('signal', 'long').upper()})"
+            )
             
             # Calculate take-profit price if configured
             take_profit_price = None
