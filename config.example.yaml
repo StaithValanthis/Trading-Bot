@@ -21,7 +21,7 @@ exchange:
     - BNBUSDT
     - ADAUSDT
   # Trading timeframe (default 4h: cleaner signals & aligned with 8h funding cycle)
-  timeframe: 4h
+  timeframe: 1h
 
 # Strategy parameters
 strategy:
@@ -59,7 +59,7 @@ strategy:
     exit_band: 2
     ranking_window: 18
     # Number of top symbols to trade
-    top_k: 5
+    top_k: 10
     # Rebalance frequency in hours (8h aligns with funding settlements)
     rebalance_frequency_hours: 8
     # Only trade symbols that also have positive time-series trend
@@ -87,7 +87,7 @@ risk:
   # Maximum % of equity in any single symbol (notional)
   max_symbol_fraction: 0.30
   # Maximum number of concurrent open positions
-  max_positions: 5
+  max_positions: 10
   # Soft daily loss cap: reduce risk after this loss (% of equity)
   daily_soft_loss_pct: -2.0
   # Hard daily loss cap: stop trading after this loss (% of equity)

@@ -574,8 +574,10 @@ def run_live(config_path: str):
                     else:
                         logger.info(f"Rebalance threshold not reached ({hours_diff:.1f}h < {rebalance_frequency_hours}h) - skipping rebalance")
                     
-                # Initialize target_positions (empty if not rebalancing, populated if rebalancing)
+                # Initialize variables (will be populated whether rebalancing or not)
                 target_positions = {}
+                symbol_signals = {}
+                symbol_data = {}
                 
                 if should_rebalance:
                     logger.info("="*60)
@@ -584,7 +586,38 @@ def run_live(config_path: str):
                     logger.info("Rebalancing portfolio...")
                 
                 # Get current universe (dynamic or fixed)
-                if should_rebalance:
+                # CRITICAL: Always get universe/symbols, even if not rebalancing
+                # We need symbol data to check if existing positions should be preserved
+                if universe_selector is not None:
+                    # Get current universe
+                    trading_symbols = list(universe_selector.get_universe())
+                    
+                    # Rebuild universe if needed (based on rebalance frequency) - only during rebalance
+                    if should_rebalance:
+                        universe_rebalance_hours = config.universe.rebalance_frequency_hours
+                        hours_since_last_universe_rebuild = (
+                            (now - last_rebalance_time).total_seconds() / 3600
+                            if last_rebalance_time else float('inf')
+                        )
+                        
+                        if hours_since_last_universe_rebuild >= universe_rebalance_hours:
+                            logger.info("Rebuilding universe...")
+                            trading_symbols, universe_changes = universe_selector.build_universe(
+                                config.exchange.timeframe
+                            )
+                            logger.info(
+                                f"Universe updated: {len(trading_symbols)} symbols "
+                                f"({len([c for c in universe_changes.values() if c['action'] == 'added'])} added, "
+                                f"{len([c for c in universe_changes.values() if c['action'] == 'removed'])} removed)"
+                            )
+                else:
+                    # Use fixed symbol list from config
+                    trading_symbols = config.exchange.symbols
+                
+                # CRITICAL: Generate signals for ALL symbols in universe, whether rebalancing or not
+                # This ensures we can check if existing positions are still in selected_symbols
+                # and preserve them between rebalance cycles
+                if should_rebalance or portfolio.positions:
                     if universe_selector is not None:
                         # Get current universe
                         trading_symbols = list(universe_selector.get_universe())
@@ -783,10 +816,17 @@ def run_live(config_path: str):
                             f"Stop Loss: ${stop_str}"
                         )
                 
-                # Generate target positions (only during rebalance)
-                # FIX 3: Defer constraint checking until after determining what to close
-                # This ensures positions are only closed when replacements can actually open
+                # Generate target positions
+                # CRITICAL: Build target positions EVERY iteration (not just during rebalance)
+                # This ensures existing positions are preserved when they're still in selected_symbols
+                # Otherwise, target_positions would be empty between rebalances and all positions would be closed
+                target_positions = {}
+                
+                # During rebalance: Build full target positions with constraint checks
+                # Between rebalances: Build minimal target positions to preserve existing positions
                 if should_rebalance:
+                    # FIX 3: Defer constraint checking until after determining what to close
+                    # This ensures positions are only closed when replacements can actually open
                     # STEP 1: Build unconstrained target positions (without max_positions/concentration checks)
                     unconstrained_targets = {}
                     for symbol in selected_symbols:
@@ -941,6 +981,80 @@ def run_live(config_path: str):
                         logger.info(
                             f"Target positions: {len(target_positions)} of {len(unconstrained_targets)} "
                             f"selected symbols passed constraint checks after accounting for closes"
+                        )
+                else:
+                    # Between rebalances: Preserve existing positions that are still in selected_symbols
+                    # This prevents positions from being closed when they're still top-ranked
+                    # but we haven't reached rebalance threshold yet
+                    logger.info(
+                        f"Not in rebalance cycle - preserving existing positions that are still in selected_symbols. "
+                        f"Selected: {selected_symbols}, Existing: {list(portfolio.positions.keys())}"
+                    )
+                    
+                    # Build minimal target positions from existing positions that are still selected
+                    # This ensures positions aren't closed just because we're not rebalancing
+                    if selected_symbols:
+                        for symbol in selected_symbols:
+                            # Check if this symbol already has a position
+                            if symbol in portfolio.positions:
+                                # Preserve existing position (use current size/signal, don't recalculate)
+                                existing_pos = portfolio.positions[symbol]
+                                current_size = existing_pos.get('contracts', 0)
+                                side = existing_pos.get('side', 'long')
+                                
+                                # Convert to signed size
+                                signed_size = abs(current_size) if side == 'long' else -abs(current_size)
+                                
+                                # Get signal info for entry/stop prices (may have changed)
+                                signal_dict = symbol_signals.get(symbol, {}) if symbol_signals else {}
+                                entry_price = signal_dict.get('entry_price', existing_pos.get('entry_price', 0))
+                                stop_loss = signal_dict.get('stop_loss', existing_pos.get('stop_loss_price'))
+                                
+                                # Use existing stop loss if signal doesn't have one
+                                if not stop_loss:
+                                    stop_loss = existing_pos.get('stop_loss_price')
+                                
+                                # Use entry_price as fallback if stop_loss is still missing
+                                # This ensures positions are preserved even without stop_loss
+                                if not stop_loss:
+                                    stop_loss = entry_price if entry_price else existing_pos.get('entry_price', 0)
+                                    if stop_loss:
+                                        logger.debug(f"No stop_loss found for {symbol}, using entry_price {stop_loss} as fallback")
+                                
+                                # CRITICAL: Always preserve positions in selected_symbols, even if stop_loss is missing
+                                # We'll add stop_loss later if needed, but don't close positions just because stop_loss is missing
+                                final_entry_price = entry_price or existing_pos.get('entry_price', 0)
+                                final_stop_loss = stop_loss or final_entry_price
+                                
+                                if final_entry_price:
+                                    target_positions[symbol] = {
+                                        'size': signed_size,
+                                        'signal': side,  # Use existing side
+                                        'entry_price': final_entry_price,
+                                        'stop_loss': final_stop_loss
+                                    }
+                                    logger.info(
+                                        f"Preserving existing position {symbol}: {side} {abs(current_size):.6f} "
+                                        f"(still in selected_symbols, between rebalance cycles)"
+                                    )
+                                else:
+                                    logger.warning(
+                                        f"Cannot preserve {symbol}: no entry_price found. "
+                                        f"Existing position: {existing_pos}"
+                                    )
+                        if target_positions:
+                            logger.info(
+                                f"Preserved {len(target_positions)} existing position(s) that are still in selected_symbols: {list(target_positions.keys())}"
+                            )
+                        else:
+                            logger.warning(
+                                f"No existing positions found in selected_symbols. Existing: {list(portfolio.positions.keys())}, "
+                                f"Selected: {selected_symbols}. Positions may be closed."
+                            )
+                    else:
+                        logger.warning(
+                            f"No selected_symbols available when not rebalancing. Cannot preserve positions. "
+                            f"Existing positions: {list(portfolio.positions.keys())}"
                         )
                 
                 # Execute position changes
