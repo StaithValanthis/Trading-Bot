@@ -128,6 +128,7 @@ class CrossSectionalStrategyConfig:
     top_k: int = 3
     rebalance_frequency_hours: int = 8
     require_trend_alignment: bool = True
+    exit_band: int = 2  # Exit band - only close if rank falls below top_k + exit_band (hysteresis to reduce churn)
 
 
 @dataclass

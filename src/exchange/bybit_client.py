@@ -400,6 +400,128 @@ class BybitClient:
             self.logger.error(f"Error fetching positions: {e}")
             raise
     
+    def fetch_open_orders(self, symbol: Optional[str] = None, params: Optional[Dict] = None) -> List[Dict]:
+        """
+        Fetch open orders (including stop-loss and take-profit orders).
+        
+        Args:
+            symbol: Optional symbol to filter by
+            params: Optional parameters to pass to CCXT (e.g., {'category': 'linear', 'orderFilter': 'Stop'})
+        
+        Returns:
+            List of open order dictionaries
+        """
+        try:
+            if self.paper_mode:
+                # Return empty orders in paper mode
+                return []
+            
+            # Convert symbol format for CCXT if needed
+            ccxt_symbol = None
+            if symbol:
+                if "/" not in symbol:
+                    if symbol.endswith("USDT"):
+                        base = symbol[:-4]
+                        ccxt_symbol = f"{base}/USDT:USDT"
+                    else:
+                        ccxt_symbol = f"{symbol}/USDT:USDT"
+                elif ":USDT" not in symbol:
+                    ccxt_symbol = f"{symbol}:USDT"
+                else:
+                    ccxt_symbol = symbol
+            
+            time.sleep(self.exchange.rateLimit / 1000)
+            
+            # Fetch open orders (CCXT method handles conditional orders)
+            # If params are provided, pass them through to CCXT
+            if params:
+                orders = self._call_with_retries(
+                    self.exchange.fetch_open_orders,
+                    ccxt_symbol if ccxt_symbol else None,
+                    params=params
+                )
+            else:
+                orders = self._call_with_retries(
+                    self.exchange.fetch_open_orders,
+                    ccxt_symbol if ccxt_symbol else None,
+                )
+            
+            return orders
+            
+        except Exception as e:
+            self.logger.error(f"Error fetching open orders for {symbol}: {e}")
+            raise
+    
+    def fetch_order(self, order_id: str, symbol: str, params: Optional[Dict] = None) -> Dict:
+        """
+        Fetch a single order by ID.
+        
+        Args:
+            order_id: Order ID
+            symbol: Trading pair symbol (e.g., "BTCUSDT")
+            params: Optional parameters to pass to CCXT (e.g., {'category': 'linear', 'orderFilter': 'Stop'})
+        
+        Returns:
+            Order dictionary
+        """
+        try:
+            if self.paper_mode:
+                # Return mock order in paper mode
+                return {
+                    'id': order_id,
+                    'symbol': symbol,
+                    'status': 'open',
+                    'type': 'stop_market',
+                    'side': 'sell',
+                    'amount': 0.0,
+                    'price': None,
+                    'triggerPrice': None,
+                    'info': {}
+                }
+            
+            # Convert symbol format for CCXT
+            ccxt_symbol = None
+            if "/" not in symbol:
+                if symbol.endswith("USDT"):
+                    base = symbol[:-4]
+                    ccxt_symbol = f"{base}/USDT:USDT"
+                else:
+                    ccxt_symbol = f"{symbol}/USDT:USDT"
+            elif ":USDT" not in symbol:
+                ccxt_symbol = f"{symbol}:USDT"
+            else:
+                ccxt_symbol = symbol
+            
+            time.sleep(self.exchange.rateLimit / 1000)
+            
+            # Call CCXT's fetch_order with optional params
+            if params:
+                order = self._call_with_retries(
+                    self.exchange.fetch_order,
+                    order_id,
+                    ccxt_symbol,
+                    params
+                )
+            else:
+                order = self._call_with_retries(
+                    self.exchange.fetch_order,
+                    order_id,
+                    ccxt_symbol
+                )
+            
+            return order
+            
+        except ccxt.OrderNotFound as e:
+            # Order not found - re-raise so caller can handle it
+            self.logger.debug(f"Order {order_id} not found for {symbol}: {e}")
+            raise
+        except ccxt.ExchangeError as e:
+            self.logger.error(f"Error fetching order {order_id} for {symbol}: {e}")
+            raise
+        except Exception as e:
+            self.logger.error(f"Unexpected error fetching order {order_id}: {e}")
+            raise
+    
     def fetch_funding_rate(self, symbol: str) -> Dict:
         """
         Fetch current funding rate for a symbol.
@@ -1207,13 +1329,14 @@ class BybitClient:
             self.logger.error(f"Error in Bybit v5 API call (TP): {e}")
             raise
     
-    def cancel_order(self, order_id: str, symbol: str) -> Dict:
+    def cancel_order(self, order_id: str, symbol: str, params: Optional[Dict] = None) -> Dict:
         """
-        Cancel an order.
+        Cancel an order (including conditional orders like stop-loss/take-profit).
         
         Args:
             order_id: Order ID
-            symbol: Trading pair symbol
+            symbol: Trading pair symbol (e.g., 'BTCUSDT' or 'BTC/USDT:USDT')
+            params: Optional parameters for conditional orders (e.g., {'category': 'linear', 'orderFilter': 'Stop'})
         
         Returns:
             Cancelled order dictionary
@@ -1223,21 +1346,174 @@ class BybitClient:
             return {"id": order_id, "status": "canceled"}
         
         try:
-            ccxt_symbol = symbol.replace("USDT", "/USDT") if "/" not in symbol else symbol
+            # Convert symbol format for CCXT (BTCUSDT -> BTC/USDT:USDT for perpetual futures)
+            if "/" not in symbol:
+                if symbol.endswith("USDT"):
+                    base = symbol[:-4]  # Remove "USDT" suffix
+                    ccxt_symbol = f"{base}/USDT:USDT"  # Perpetual futures format
+                else:
+                    ccxt_symbol = f"{symbol}/USDT:USDT"
+            elif ":USDT" not in symbol:
+                ccxt_symbol = f"{symbol}:USDT"
+            else:
+                ccxt_symbol = symbol
 
             time.sleep(self.exchange.rateLimit / 1000)
-            result = self._call_with_retries(
-                self.exchange.cancel_order,
-                order_id,
-                ccxt_symbol,
-            )
-
-            self.logger.info(f"Cancelled order {order_id} for {symbol}")
-            return result
+            
+            # Try cancelling via CCXT first (with params if provided for conditional orders)
+            try:
+                if params:
+                    result = self._call_with_retries(
+                        self.exchange.cancel_order,
+                        order_id,
+                        ccxt_symbol,
+                        params=params
+                    )
+                else:
+                    result = self._call_with_retries(
+                        self.exchange.cancel_order,
+                        order_id,
+                        ccxt_symbol,
+                    )
+                
+                self.logger.info(f"Cancelled order {order_id} for {symbol}")
+                return result
+                
+            except (ccxt.OrderNotFound, ccxt.ExchangeError) as ccxt_error:
+                # CCXT might not support conditional order cancellation - try direct Bybit v5 API
+                error_msg = str(ccxt_error)
+                if "Order does not exist" in error_msg or "not found" in error_msg.lower():
+                    # Order might already be cancelled - try direct API to be sure
+                    self.logger.debug(
+                        f"CCXT cancellation returned 'not found' for {order_id}. "
+                        f"Trying direct Bybit v5 API to verify..."
+                    )
+                else:
+                    # Other error - try direct API as fallback
+                    self.logger.debug(
+                        f"CCXT cancellation failed for {order_id}: {ccxt_error}. "
+                        f"Trying direct Bybit v5 API as fallback..."
+                    )
+                
+                # Fallback to direct Bybit v5 API for conditional orders
+                if REQUESTS_AVAILABLE:
+                    try:
+                        return self._cancel_conditional_order_v5_api(order_id, symbol, params)
+                    except Exception as v5_error:
+                        # If direct API also fails, re-raise the original CCXT error
+                        self.logger.error(
+                            f"Both CCXT and direct Bybit v5 API failed to cancel order {order_id}: "
+                            f"CCXT={ccxt_error}, v5={v5_error}"
+                        )
+                        raise ccxt_error
+                else:
+                    # No direct API fallback available - re-raise CCXT error
+                    raise ccxt_error
             
         except Exception as e:
             self.logger.error(f"Error cancelling order {order_id}: {e}")
             raise
+    
+    def _cancel_conditional_order_v5_api(self, order_id: str, symbol: str, params: Optional[Dict] = None) -> Dict:
+        """
+        Cancel a conditional order (stop-loss/take-profit) using direct Bybit v5 API.
+        
+        Args:
+            order_id: Order ID
+            symbol: Trading pair symbol (e.g., 'BTCUSDT')
+            params: Optional parameters (will default to category='linear', orderFilter='Stop')
+        
+        Returns:
+            Cancelled order dictionary
+        """
+        if not REQUESTS_AVAILABLE:
+            raise Exception("requests library not available for direct Bybit v5 API calls")
+        
+        # Default params for conditional orders
+        if params is None:
+            params = {}
+        
+        # Ensure required params for Bybit v5
+        api_params = {
+            'category': params.get('category', 'linear'),
+            'orderFilter': params.get('orderFilter', 'Stop'),  # 'Stop' for conditional orders
+            'orderLinkId': order_id  # Try orderLinkId first
+        }
+        
+        # If orderLinkId doesn't work, we'll try orderId
+        # For now, try with orderLinkId
+        api_params['orderLinkId'] = order_id
+        
+        # Convert symbol to Bybit format (BTCUSDT or BTC/USDT:USDT -> BTCUSDT)
+        bybit_symbol = symbol.replace("/USDT:USDT", "USDT").replace("/USDT", "USDT").replace(":USDT", "USDT")
+        
+        url = f"{self.exchange.urls['api']}/v5/order/cancel"
+        if self.config.testnet:
+            url = url.replace("api.bybit.com", "api-testnet.bybit.com")
+        
+        timestamp = str(int(time.time() * 1000))
+        query_string = f"category={api_params['category']}&orderFilter={api_params['orderFilter']}&orderLinkId={order_id}&symbol={bybit_symbol}&timestamp={timestamp}"
+        
+        signature = hmac.new(
+            self.config.api_secret.encode('utf-8'),
+            query_string.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+        
+        headers = {
+            'X-BAPI-API-KEY': self.config.api_key,
+            'X-BAPI-SIGN': signature,
+            'X-BAPI-TIMESTAMP': timestamp,
+            'X-BAPI-RECV-WINDOW': '5000',
+            'Content-Type': 'application/json'
+        }
+        
+        try:
+            response = requests.post(url, params=api_params, headers=headers, timeout=10)
+            response.raise_for_status()
+            result = response.json()
+            
+            if result.get('retCode') == 0:
+                self.logger.info(f"Cancelled conditional order {order_id} for {symbol} via Bybit v5 API")
+                return {"id": order_id, "status": "canceled", "info": result}
+            elif result.get('retCode') == 170213:  # Order does not exist
+                raise ccxt.OrderNotFound(f"Order {order_id} does not exist (already cancelled?)")
+            else:
+                error_msg = result.get('retMsg', 'Unknown error')
+                # If orderLinkId failed, try with orderId
+                if 'orderLinkId' in error_msg.lower() or result.get('retCode') in [170011, 170003]:
+                    self.logger.debug(f"orderLinkId failed for {order_id}, trying orderId...")
+                    api_params.pop('orderLinkId', None)
+                    api_params['orderId'] = order_id
+                    
+                    query_string = f"category={api_params['category']}&orderFilter={api_params['orderFilter']}&orderId={order_id}&symbol={bybit_symbol}&timestamp={timestamp}"
+                    signature = hmac.new(
+                        self.config.api_secret.encode('utf-8'),
+                        query_string.encode('utf-8'),
+                        hashlib.sha256
+                    ).hexdigest()
+                    headers['X-BAPI-SIGN'] = signature
+                    
+                    response = requests.post(url, params=api_params, headers=headers, timeout=10)
+                    response.raise_for_status()
+                    result = response.json()
+                    
+                    if result.get('retCode') == 0:
+                        self.logger.info(f"Cancelled conditional order {order_id} for {symbol} via Bybit v5 API (using orderId)")
+                        return {"id": order_id, "status": "canceled", "info": result}
+                    elif result.get('retCode') == 170213:
+                        raise ccxt.OrderNotFound(f"Order {order_id} does not exist (already cancelled?)")
+                    else:
+                        raise ccxt.ExchangeError(f"Bybit v5 API error (code {result.get('retCode')}): {result.get('retMsg')}")
+                else:
+                    raise ccxt.ExchangeError(f"Bybit v5 API error (code {result.get('retCode')}): {error_msg}")
+                    
+        except requests.RequestException as e:
+            raise ccxt.NetworkError(f"Network error cancelling conditional order via Bybit v5 API: {e}")
+        except ccxt.OrderNotFound:
+            raise
+        except Exception as e:
+            raise ccxt.ExchangeError(f"Error cancelling conditional order via Bybit v5 API: {e}")
     
     def fetch_markets(self) -> Dict:
         """
@@ -1395,11 +1671,45 @@ class BybitClient:
         return rounded
     
     def round_price(self, symbol: str, price: float) -> float:
-        """Round price to exchange precision."""
+        """
+        Round price to exchange precision.
+        
+        Ensures the result is never 0.0 if input price is > 0.
+        """
+        if price <= 0:
+            return 0.0
+        
         market_info = self.get_market_info(symbol)
         precision = market_info['precision']['price']
         decimals = self._precision_to_decimals(precision)
-        return round(price, decimals)
+        
+        rounded = round(price, decimals)
+        
+        # Safety check: if rounding results in 0.0 but input was > 0, use minimum viable price
+        if rounded == 0.0 and price > 0:
+            # Use the precision as tick size if it's a float, otherwise use 0.01 as minimum
+            if isinstance(precision, float) and precision > 0:
+                # Round up to the next tick
+                tick_size = precision
+                rounded = math.ceil(price / tick_size) * tick_size
+                # Re-round to ensure proper decimal places
+                decimals = self._precision_to_decimals(precision)
+                rounded = round(rounded, decimals)
+            else:
+                # Default to at least 2 decimal places if precision is unclear
+                rounded = round(price, max(2, decimals))
+            
+            # Final safety check: if still 0, use a small positive value based on price magnitude
+            if rounded == 0.0:
+                # Use 1/10th of the price magnitude, rounded to 2 decimals minimum
+                magnitude = 10 ** (math.floor(math.log10(abs(price))) - 1)
+                rounded = round(math.ceil(price / magnitude) * magnitude, max(2, decimals))
+                self.logger.warning(
+                    f"Price rounding for {symbol} resulted in 0.0 (input: {price}, precision: {precision}). "
+                    f"Using fallback: {rounded}"
+                )
+        
+        return rounded
     
     def validate_order_size(self, symbol: str, amount: float, price: float) -> Tuple[bool, Optional[str]]:
         """

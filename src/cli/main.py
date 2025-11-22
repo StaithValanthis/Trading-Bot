@@ -688,11 +688,44 @@ def run_live(config_path: str):
                     config.strategy.cross_sectional.require_trend_alignment
                 )
                 
-                # Log cross-sectional rankings
-                if symbol_data:
+                # Apply exit band/hysteresis: keep positions that are still within top_k + exit_band
+                # This prevents unnecessary churn when rankings change slightly
+                rankings = None
+                if portfolio.positions and config.strategy.cross_sectional.exit_band > 0:
                     rankings = cross_sectional_gen.rank_symbols(symbol_data)
                     if rankings:
-                        logger.info("Cross-sectional rankings (top 10):")
+                        # Create rank map: symbol -> rank (0-indexed, lower = better)
+                        symbol_ranks = {symbol: i for i, (symbol, _) in enumerate(rankings)}
+                        
+                        # Determine which existing positions to keep (within exit band)
+                        exit_threshold = config.strategy.cross_sectional.top_k + config.strategy.cross_sectional.exit_band
+                        positions_to_keep = []
+                        
+                        for symbol in portfolio.positions:
+                            if symbol not in selected_symbols:
+                                rank = symbol_ranks.get(symbol, len(rankings) + 1)  # Use worst rank if not found
+                                if rank < exit_threshold:
+                                    # Keep position - still within exit band
+                                    positions_to_keep.append(symbol)
+                                    logger.info(
+                                        f"Keeping {symbol} position (rank {rank + 1} within exit band of top-{config.strategy.cross_sectional.top_k}, "
+                                        f"threshold={exit_threshold})"
+                                    )
+                        
+                        # Add kept positions back to selected symbols
+                        selected_symbols.extend(positions_to_keep)
+                        if positions_to_keep:
+                            logger.info(
+                                f"Exit band hysteresis: keeping {len(positions_to_keep)} position(s) within exit band: {positions_to_keep}"
+                            )
+                
+                # Log cross-sectional rankings
+                if symbol_data:
+                    if rankings is None:
+                        rankings = cross_sectional_gen.rank_symbols(symbol_data)
+                    if rankings:
+                        num_to_show = min(10, len(rankings))
+                        logger.info(f"Cross-sectional rankings (top {num_to_show} of {len(rankings)} ranked):")
                         for i, (symbol, return_pct) in enumerate(rankings[:10], 1):
                             signal = symbol_signals.get(symbol, {}).get('signal', 'flat')
                             signal_icon = "📈" if signal == 'long' else "📉" if signal == 'short' else "➖"
@@ -751,7 +784,11 @@ def run_live(config_path: str):
                         )
                 
                 # Generate target positions (only during rebalance)
+                # FIX 3: Defer constraint checking until after determining what to close
+                # This ensures positions are only closed when replacements can actually open
                 if should_rebalance:
+                    # STEP 1: Build unconstrained target positions (without max_positions/concentration checks)
+                    unconstrained_targets = {}
                     for symbol in selected_symbols:
                         signal_dict = symbol_signals.get(symbol)
                         if not signal_dict or signal_dict['signal'] == 'flat':
@@ -784,7 +821,7 @@ def run_live(config_path: str):
                             size
                         )
                         
-                        # Check portfolio limits
+                        # Check leverage limits (always required, not dependent on other positions)
                         market_info = exchange.get_market_info(symbol)
                         contract_size = market_info.get('contractSize', 1.0)
                         notional = adjusted_size * entry_price * contract_size
@@ -809,44 +846,102 @@ def run_live(config_path: str):
                                 logger.warning(f"Cannot scale {symbol} to fit limits: {scale_reason}")
                                 continue
                         
-                        # Check symbol concentration
-                        within_concentration, conc_error = portfolio_limits.check_symbol_concentration(
-                            portfolio,
-                            symbol,
-                            notional
-                        )
-                        
-                        if not within_concentration:
-                            logger.warning(f"Position for {symbol} exceeds concentration: {conc_error}")
-                            adjusted_size, scale_reason = portfolio_limits.scale_position_for_limits(
-                                portfolio,
-                                symbol,
-                                adjusted_size,
-                                entry_price,
-                                signal
-                            )
-                            if adjusted_size <= 0:
-                                continue
-                        
-                        # Check max positions
-                        within_max, max_error = portfolio_limits.check_max_positions(
-                            portfolio,
-                            symbol
-                        )
-                        
-                        if not within_max:
-                            logger.warning(f"Max positions reached: {max_error}")
-                            continue
-                        
-                        # Convert to signed size (positive for long, negative for short)
+                        # Store unconstrained target (max_positions and concentration checks deferred)
                         signed_size = adjusted_size if signal == 'long' else -adjusted_size
-                        
-                        target_positions[symbol] = {
+                        unconstrained_targets[symbol] = {
                             'size': signed_size,
                             'signal': signal,
                             'entry_price': entry_price,
-                            'stop_loss': stop_loss
+                            'stop_loss': stop_loss,
+                            'notional': abs(adjusted_size * entry_price * contract_size),
+                            'adjusted_size': adjusted_size,
+                            'contract_size': contract_size
                         }
+                    
+                    # STEP 2: Determine what will be closed (symbols not in selected_symbols)
+                    positions_to_close = [s for s in portfolio.positions if s not in selected_symbols]
+                    
+                    # STEP 3: Count how many positions will remain after closes
+                    current_position_count = len(portfolio.positions)
+                    positions_remaining_after_close = current_position_count - len(positions_to_close)
+                    
+                    # STEP 4: Check constraints AFTER accounting for closes
+                    # For each unconstrained target, check if it can be added after closes
+                    target_positions = {}
+                    symbols_filtered_by_constraints = []
+                    
+                    for symbol, target_data in unconstrained_targets.items():
+                        # Check if this symbol already has a position (won't count as new)
+                        has_existing_position = symbol in portfolio.positions
+                        
+                        # Check max positions: only matters for NEW positions
+                        if not has_existing_position:
+                            # Simulate: would we be under max_positions after closes?
+                            simulated_position_count = positions_remaining_after_close
+                            
+                            # Count how many NEW positions we've already added in this loop
+                            new_positions_already_added = sum(
+                                1 for sym in target_positions 
+                                if sym not in portfolio.positions
+                            )
+                            
+                            # Total positions after closes + new positions added so far + this one
+                            total_after_this = simulated_position_count + new_positions_already_added + 1
+                            
+                            if total_after_this > config.risk.max_positions:
+                                symbols_filtered_by_constraints.append((symbol, f"max_positions (would be {total_after_this}, limit={config.risk.max_positions})"))
+                                continue
+                        
+                        # Check symbol concentration (with simulated portfolio state)
+                        # For concentration, we need to check if adding this position would exceed limits
+                        # We'll check against current portfolio, accounting that positions_to_close will be removed
+                        within_concentration, conc_error = portfolio_limits.check_symbol_concentration(
+                            portfolio,
+                            symbol,
+                            target_data['notional']
+                        )
+                        
+                        if not within_concentration:
+                            # Try scaling down for concentration
+                            scaled_size, scale_reason = portfolio_limits.scale_position_for_limits(
+                                portfolio,
+                                symbol,
+                                target_data['adjusted_size'],
+                                target_data['entry_price'],
+                                target_data['signal']
+                            )
+                            if scaled_size <= 0:
+                                symbols_filtered_by_constraints.append((symbol, f"concentration: {conc_error}"))
+                                continue
+                            
+                            # Update target data with scaled size
+                            target_data['adjusted_size'] = scaled_size
+                            target_data['size'] = scaled_size if target_data['signal'] == 'long' else -scaled_size
+                            target_data['notional'] = abs(scaled_size * target_data['entry_price'] * target_data['contract_size'])
+                        
+                        # Passed all constraint checks - add to target positions
+                        target_positions[symbol] = {
+                            'size': target_data['size'],
+                            'signal': target_data['signal'],
+                            'entry_price': target_data['entry_price'],
+                            'stop_loss': target_data['stop_loss']
+                        }
+                    
+                    # Log constraint filtering results
+                    if symbols_filtered_by_constraints:
+                        logger.info(
+                            f"After accounting for {len(positions_to_close)} closes, "
+                            f"{len(symbols_filtered_by_constraints)} symbol(s) filtered by constraints:"
+                        )
+                        for symbol, reason in symbols_filtered_by_constraints:
+                            logger.info(f"  - {symbol}: {reason}")
+                    
+                    # Log final target vs unconstrained comparison
+                    if len(unconstrained_targets) != len(target_positions):
+                        logger.info(
+                            f"Target positions: {len(target_positions)} of {len(unconstrained_targets)} "
+                            f"selected symbols passed constraint checks after accounting for closes"
+                        )
                 
                 # Execute position changes
                 # Note: reconcile_positions handles both:
@@ -869,44 +964,72 @@ def run_live(config_path: str):
                     results = executor.reconcile_positions(portfolio, target_positions)
                     
                     for result in results:
-                        if result.get('status') == 'filled':
-                            logger.info(f"Position updated: {result.get('symbol')}")
-                        elif result.get('status') == 'closed':
-                            logger.info(f"Position closed: {result.get('symbol')}")
-                        elif result.get('status') == 'error':
-                            logger.error(f"Error executing position: {result.get('error')}")
+                        symbol = result.get('symbol', 'unknown')
+                        status = result.get('status')
+                        if status == 'filled':
+                            logger.info(f"Position updated: {symbol}")
+                        elif status == 'closed':
+                            logger.info(f"✅ Position closed: {symbol}")
+                        elif status == 'error':
+                            error_msg = result.get('error', 'Unknown error')
+                            logger.error(f"❌ Error executing position {symbol}: {error_msg}")
+                        elif status == 'no_position':
+                            logger.info(f"Position {symbol} already closed or not found")
+                        elif status == 'skipped':
+                            # Position skipped (e.g., already exists in same direction, stacking prevention)
+                            reason = result.get('reason', 'unknown')
+                            message = result.get('message', '')
+                            logger.debug(f"⏭️  Position {symbol} skipped: {reason} - {message}")
+                        else:
+                            logger.warning(f"⚠️ Unknown status for {symbol}: {status} - {result}")
                     
                     # Update portfolio state after executing orders
                     # This ensures the heartbeat shows correct position counts
                     logger.debug("Updating portfolio state after order execution...")
                     portfolio.update()
                     
-                    # Check for positions without stop-losses and place them
-                    # This handles cases where entry order was placed but position verification timed out
+                    # ENHANCED: Comprehensive stop-loss health check for ALL positions
+                    # This ensures every open position has a valid server-side stop-loss order
+                    # Handles cases where:
+                    # - Entry order was placed but position verification timed out
+                    # - SL order was manually cancelled or rejected
+                    # - Position was opened externally or by another process
                     if config.risk and config.risk.use_server_side_stops:
-                        for symbol, pos in list(portfolio.positions.items()):
-                            stop_order_id = pos.get('stop_order_id')
-                            stop_loss_price = pos.get('stop_loss_price')
-                            contracts = abs(pos.get('contracts', 0))
-                            side = pos.get('side', 'long')
-                            
-                            # If position exists but no stop-loss order ID, try to place one
-                            if stop_order_id is None and stop_loss_price is not None and contracts >= 0.001:
-                                logger.info(
-                                    f"Position {symbol} found without stop-loss order. "
-                                    f"Attempting to place stop-loss at {stop_loss_price:.2f}..."
-                                )
-                                try:
-                                    executor._place_stop_loss_order(
-                                        symbol,
-                                        side,
-                                        contracts,
-                                        stop_loss_price,
-                                        portfolio,
-                                        pos.get('entry_price'),
+                        logger.debug("Running stop-loss health check for all open positions...")
+                        sl_results = executor.ensure_protective_stops_for_all_positions(
+                            portfolio,
+                            config.strategy.trend
+                        )
+                        
+                        # Log summary
+                        created_count = sum(1 for r in sl_results.values() if r['status'] == 'created')
+                        failed_count = sum(1 for r in sl_results.values() if r['status'] == 'failed')
+                        ok_count = sum(1 for r in sl_results.values() if r['status'] == 'ok')
+                        
+                        if created_count > 0:
+                            logger.warning(
+                                f"⚠️ Stop-loss health check: Created {created_count} missing SL order(s)"
+                            )
+                            for symbol, result in sl_results.items():
+                                if result['status'] == 'created':
+                                    logger.info(
+                                        f"  ✅ {symbol}: Created SL order {result['stop_order_id']} "
+                                        f"@ {result['stop_loss_price']:.2f}"
                                     )
-                                except Exception as e:
-                                    logger.warning(f"Failed to place stop-loss for {symbol}: {e}")
+                        if failed_count > 0:
+                            logger.error(
+                                f"❌ Stop-loss health check: Failed to create {failed_count} SL order(s) - "
+                                "positions are unprotected!"
+                            )
+                            for symbol, result in sl_results.items():
+                                if result['status'] == 'failed':
+                                    logger.error(
+                                        f"  ❌ {symbol}: {result['message']}"
+                                    )
+                        if ok_count > 0:
+                            logger.debug(
+                                f"✅ Stop-loss health check: {ok_count} position(s) already have valid SL orders"
+                            )
                 else:
                     logger.info("No position changes needed (no targets and no existing positions)")
                 

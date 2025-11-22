@@ -54,9 +54,12 @@ strategy:
   # Sleeve B: Cross-sectional momentum overlay
   cross_sectional:
     # Ranking window (bars; 18 bars @4h ≈ 3 days)
+    # Exit band (hysteresis): only close positions if rank falls below top_k + exit_band
+    # This reduces churn from minor ranking changes (default: 2)
+    exit_band: 2
     ranking_window: 18
     # Number of top symbols to trade
-    top_k: 3
+    top_k: 5
     # Rebalance frequency in hours (8h aligns with funding settlements)
     rebalance_frequency_hours: 8
     # Only trade symbols that also have positive time-series trend
