@@ -567,6 +567,45 @@ Persistent=true
 WantedBy=timers.target
 EOF
     
+    # Universe build service (daily universe refresh)
+    UNIVERSE_SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}-universe.service"
+    info "Creating ${SERVICE_NAME}-universe.service..."
+    sudo tee "$UNIVERSE_SERVICE_FILE" > /dev/null <<EOF || error_exit "Failed to create universe service file"
+[Unit]
+Description=Bybit Trading Bot - Universe Builder
+After=network.target
+
+[Service]
+Type=oneshot
+User=$SERVICE_USER
+WorkingDirectory=$BOT_DIR
+EnvironmentFile=$ENV_FILE
+Environment="PATH=$VENV_DIR/bin"
+ExecStart=$VENV_DIR/bin/python -m src.main --config $CONFIG_FILE universe-build
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    
+    # Universe build timer
+    UNIVERSE_TIMER_FILE="/etc/systemd/system/${SERVICE_NAME}-universe.timer"
+    info "Creating ${SERVICE_NAME}-universe.timer..."
+    sudo tee "$UNIVERSE_TIMER_FILE" > /dev/null <<EOF || error_exit "Failed to create universe timer file"
+[Unit]
+Description=Daily universe build for Bybit Trading Bot
+Requires=${SERVICE_NAME}-universe.service
+
+[Timer]
+# Run a little after midnight UTC so data is fresh before the trading day
+OnCalendar=01:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    
     # Report service
     REPORT_SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}-report.service"
     info "Creating ${SERVICE_NAME}-report.service..."
@@ -625,7 +664,7 @@ EOF
     
     # Verify systemd units are valid
     info "Verifying systemd units..."
-    for unit in "$SERVICE_FILE" "$OPTIMIZER_SERVICE_FILE" "$OPTIMIZER_TIMER_FILE" "$REPORT_SERVICE_FILE" "$REPORT_TIMER_FILE"; do
+    for unit in "$SERVICE_FILE" "$OPTIMIZER_SERVICE_FILE" "$OPTIMIZER_TIMER_FILE" "$UNIVERSE_SERVICE_FILE" "$UNIVERSE_TIMER_FILE" "$REPORT_SERVICE_FILE" "$REPORT_TIMER_FILE"; do
         if sudo systemctl cat "$(basename "$unit")" &>/dev/null; then
             info "✓ $(basename "$unit") is valid"
         else
@@ -637,10 +676,12 @@ EOF
     info "Enabling services..."
     
     sudo systemctl enable "${SERVICE_NAME}.service" &>/dev/null || warn "Failed to enable ${SERVICE_NAME}.service"
+    sudo systemctl enable "${SERVICE_NAME}-universe.timer" &>/dev/null || warn "Failed to enable ${SERVICE_NAME}-universe.timer"
     sudo systemctl enable "${SERVICE_NAME}-optimizer.timer" &>/dev/null || warn "Failed to enable ${SERVICE_NAME}-optimizer.timer"
     sudo systemctl enable "${SERVICE_NAME}-report.timer" &>/dev/null || warn "Failed to enable ${SERVICE_NAME}-report.timer"
     
     # Start timers (they're scheduled, won't run immediately unless time matches)
+    sudo systemctl start "${SERVICE_NAME}-universe.timer" &>/dev/null || warn "Failed to start universe timer"
     sudo systemctl start "${SERVICE_NAME}-optimizer.timer" &>/dev/null || warn "Failed to start optimizer timer"
     sudo systemctl start "${SERVICE_NAME}-report.timer" &>/dev/null || warn "Failed to start report timer"
     
@@ -670,6 +711,12 @@ EOF
         echo -e "  ${RED}✗${NC} ${SERVICE_NAME}.service: not enabled"
     fi
     
+    if sudo systemctl is-enabled "${SERVICE_NAME}-universe.timer" &>/dev/null; then
+        echo -e "  ${GREEN}✓${NC} ${SERVICE_NAME}-universe.timer: enabled"
+    else
+        echo -e "  ${RED}✗${NC} ${SERVICE_NAME}-universe.timer: not enabled"
+    fi
+    
     if sudo systemctl is-enabled "${SERVICE_NAME}-optimizer.timer" &>/dev/null; then
         echo -e "  ${GREEN}✓${NC} ${SERVICE_NAME}-optimizer.timer: enabled"
     else
@@ -691,15 +738,20 @@ EOF
     echo "2. Review environment variables (API keys):"
     echo "   cat $ENV_FILE"
     echo ""
-    echo "3. Test the bot in backtest mode:"
+    echo "3. Run an initial universe build (recommended):"
+    echo "   cd $BOT_DIR"
+    echo "   source venv/bin/activate"
+    echo "   python -m src.main universe-build --config config.yaml"
+    echo ""
+    echo "4. Test the bot in backtest mode:"
     echo "   cd $BOT_DIR"
     echo "   source venv/bin/activate"
     echo "   python -m src.main backtest --config config.yaml"
     echo ""
-    echo "4. Test universe optimization (optional):"
+    echo "5. Test universe optimization (optional):"
     echo "   python -m src.main optimize-universe --config config.yaml --start 2023-01-01 --end 2024-01-01 --n-combinations 50"
     echo ""
-    echo "5. Run timeframe comparison analysis (optional, requires historical data):"
+    echo "6. Run timeframe comparison analysis (optional, requires historical data):"
     echo "   python scripts/optimize_and_compare_timeframes.py --config config.yaml --start 2022-01-01 --end 2024-12-31"
     echo ""
     echo -e "${RED}IMPORTANT: Before starting live trading:${NC}"
@@ -708,17 +760,17 @@ EOF
     echo "   - Test thoroughly in testnet/paper mode first"
     echo "   - Only set exchange.mode to 'live' when ready for real trading"
     echo ""
-    echo "6. Start the bot (when ready):"
+    echo "7. Start the bot (when ready):"
     echo "   sudo systemctl start $SERVICE_NAME"
     echo ""
-    echo "7. Monitor the bot:"
+    echo "8. Monitor the bot:"
     echo "   sudo systemctl status $SERVICE_NAME"
     echo "   sudo journalctl -u $SERVICE_NAME -f"
     echo ""
-    echo "8. Check scheduled tasks:"
+    echo "9. Check scheduled tasks:"
     echo "   sudo systemctl list-timers ${SERVICE_NAME}-*"
     echo ""
-    echo "9. Available analysis scripts:"
+    echo "10. Available analysis scripts:"
     echo "   - scripts/optimize_and_compare_timeframes.py - Compare timeframes with optimized parameters"
     echo "   - scripts/download_historical_data.py - Download historical OHLCV data"
     echo ""

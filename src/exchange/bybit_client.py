@@ -188,6 +188,28 @@ class BybitClient:
                 self.logger.error(f"Exchange error in {func.__name__}: {e}")
                 raise
     
+    def _to_ccxt_symbol(self, symbol: str) -> str:
+        """
+        Convert internal symbol format (e.g. 'BTCUSDT') to CCXT Bybit
+        perpetual futures format (e.g. 'BTC/USDT:USDT').
+        
+        This helper centralizes symbol normalization for all BybitClient
+        methods that need CCXT symbols.
+        """
+        # Already looks like a CCXT symbol
+        if "/" in symbol:
+            if ":USDT" not in symbol:
+                return f"{symbol}:USDT"
+            return symbol
+        
+        # Internal format: BASEUSDT -> BASE/USDT:USDT
+        if symbol.endswith("USDT"):
+            base = symbol[:-4]
+            return f"{base}/USDT:USDT"
+        
+        # Fallback: assume BASE -> BASE/USDT:USDT
+        return f"{symbol}/USDT:USDT"
+    
     def fetch_ohlcv(
         self,
         symbol: str,
@@ -199,7 +221,7 @@ class BybitClient:
         Fetch OHLCV (candlestick) data.
         
         Args:
-            symbol: Trading pair symbol (e.g., 'BTC/USDT')
+            symbol: Trading pair symbol (internal format, e.g., 'BTCUSDT')
             timeframe: Timeframe (e.g., '1h', '1d')
             since: Timestamp in milliseconds (optional)
             limit: Number of candles to fetch (optional)
@@ -208,25 +230,12 @@ class BybitClient:
             List of [timestamp, open, high, low, close, volume]
         """
         try:
-            # CCXT uses '/' separator and :USDT suffix for perpetual futures
-            # Handle both formats: "BTCUSDT" -> "BTC/USDT:USDT" for perpetual futures
-            if "/" not in symbol:
-                # Convert "BASEUSDT" to "BASE/USDT:USDT" for perpetual futures
-                if symbol.endswith("USDT"):
-                    base = symbol[:-4]  # Remove "USDT" suffix
-                    ccxt_symbol = f"{base}/USDT:USDT"  # Perpetual futures format
-                else:
-                    # Fallback: try adding "/USDT:USDT" if no slash
-                    ccxt_symbol = f"{symbol}/USDT:USDT"
-            elif ":USDT" not in symbol:
-                # Add :USDT suffix if missing (for perpetual futures)
-                ccxt_symbol = f"{symbol}:USDT"
-            else:
-                ccxt_symbol = symbol
-
+            # Normalize to CCXT symbol format for Bybit linear perps
+            ccxt_symbol = self._to_ccxt_symbol(symbol)
+            
             # Respect rate limit
             time.sleep(self.exchange.rateLimit / 1000)
-
+            
             ohlcv = self._call_with_retries(
                 self.exchange.fetch_ohlcv,
                 ccxt_symbol,
@@ -234,10 +243,10 @@ class BybitClient:
                 since=since,
                 limit=limit,
             )
-
+            
             self.logger.debug(f"Fetched {len(ohlcv)} candles for {symbol} {timeframe}")
             return ohlcv
-
+        
         except ccxt.BadSymbol:
             # Symbol doesn't exist - already logged at debug level in _call_with_retries
             # Re-raise so downloader can handle it gracefully
@@ -480,17 +489,7 @@ class BybitClient:
                 }
             
             # Convert symbol format for CCXT
-            ccxt_symbol = None
-            if "/" not in symbol:
-                if symbol.endswith("USDT"):
-                    base = symbol[:-4]
-                    ccxt_symbol = f"{base}/USDT:USDT"
-                else:
-                    ccxt_symbol = f"{symbol}/USDT:USDT"
-            elif ":USDT" not in symbol:
-                ccxt_symbol = f"{symbol}:USDT"
-            else:
-                ccxt_symbol = symbol
+            ccxt_symbol = self._to_ccxt_symbol(symbol)
             
             time.sleep(self.exchange.rateLimit / 1000)
             
@@ -520,6 +519,45 @@ class BybitClient:
             raise
         except Exception as e:
             self.logger.error(f"Unexpected error fetching order {order_id}: {e}")
+            raise
+    
+    def fetch_ticker(self, symbol: str) -> Dict:
+        """
+        Fetch current ticker (price) information for a symbol.
+        
+        Args:
+            symbol: Trading pair symbol (e.g., "BTCUSDT")
+        
+        Returns:
+            Dictionary with ticker information including 'last' and 'close' prices
+        """
+        try:
+            if self.paper_mode:
+                # Return mock ticker in paper mode
+                return {
+                    'symbol': symbol,
+                    'last': 0.0,
+                    'close': 0.0,
+                    'bid': 0.0,
+                    'ask': 0.0,
+                    'info': {}
+                }
+            
+            # Convert symbol format for CCXT
+            ccxt_symbol = self._to_ccxt_symbol(symbol)
+            
+            time.sleep(self.exchange.rateLimit / 1000)
+            
+            # Call CCXT's fetch_ticker
+            ticker = self._call_with_retries(
+                self.exchange.fetch_ticker,
+                ccxt_symbol
+            )
+            
+            return ticker
+            
+        except Exception as e:
+            self.logger.error(f"Error fetching ticker for {symbol}: {e}")
             raise
     
     def fetch_funding_rate(self, symbol: str) -> Dict:

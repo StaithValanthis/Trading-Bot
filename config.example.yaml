@@ -157,9 +157,12 @@ universe:
   rebalance_frequency_hours: 24
   
   # Override lists
-  # Symbols that are always included (bypass all filters)
-  include_list: [BTCUSDT, ETHUSDT, SOLUSDT, BNBUSDT, DOGEUSDT, AVAXUSDT]
-  # Symbols that are never included (always excluded)
+  # Preferred symbols: These symbols will be prioritized and always evaluated for universe membership,
+  # but they MUST still pass all filters (liquidity, data, volatility, delisted status, etc.)
+  # If a preferred symbol fails filters, it will be logged as a warning and excluded until it passes.
+  # Leave empty [] to use pure filter-based selection without preferences.
+  include_list: []
+  # Symbols that are never included (always excluded, even if they pass all filters)
   exclude_list: []
   
   # Optional: bucket limits (not implemented yet)

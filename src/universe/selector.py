@@ -109,66 +109,36 @@ class UniverseSelector:
         ):
             return self._ticker_cache[symbol]
         
-        # Build candidate CCXT symbols for Bybit linear USDT perps
-        candidates = []
-        if '/' in symbol:
-            candidates.append(symbol)
-        else:
-            # Internal format is typically 'BASEUSDT'
-            if symbol.endswith('USDT'):
-                base = symbol[:-4]
-                # Bybit unified linear perp symbols are usually 'BASE/USDT:USDT'
-                candidates.append(f"{base}/USDT:USDT")
-                # Fallback to spot-style symbol if perp symbol fails
-                candidates.append(f"{base}/USDT")
-            else:
-                # Fallback: try generic '/USDT'
-                candidates.append(f"{symbol}/USDT")
-        
-        last_error: Optional[Exception] = None
-        
-        for ccxt_symbol in candidates:
-            try:
-                ticker = self.exchange.exchange.fetch_ticker(ccxt_symbol)
-                
-                data = {
-                    'volume_24h': ticker.get('quoteVolume', 0),  # USDT volume
-                    'open_interest': None,  # OI not always available in CCXT
-                    'last_price': ticker.get('last', 0),
-                    'bid': ticker.get('bid', 0),
-                    'ask': ticker.get('ask', 0),
-                    'spread_bps': 0,
-                    'ccxt_symbol': ccxt_symbol,
-                }
-                
-                # Calculate spread if bid/ask available
-                if data['bid'] > 0 and data['ask'] > 0:
-                    spread = (data['ask'] - data['bid']) / data['bid']
-                    data['spread_bps'] = spread * 10000  # Convert to basis points
-                
-                # Update cache
-                self._ticker_cache[symbol] = data
-                self._ticker_cache_time[symbol] = now
-                
-                return data
-            
-            except Exception as e:
-                # Save last error and try next candidate
-                last_error = e
-                self.logger.debug(
-                    f"Error fetching ticker for {symbol} using {ccxt_symbol}: {e}"
-                )
-                continue
-        
-        # All candidates failed
-        if last_error is not None:
+        try:
+            # Delegate to BybitClient, which handles symbol normalization
+            ticker = self.exchange.fetch_ticker(symbol)
+        except Exception as e:
             # Log at INFO for visibility, but only once per symbol per cache window
-            self.logger.info(
-                f"Ticker data unavailable for {symbol} after trying candidates "
-                f"{candidates}. Last error: {last_error}"
-            )
+            self.logger.info(f"Ticker data unavailable for {symbol}: {e}")
+            return None
         
-        return None
+        data = {
+            'volume_24h': ticker.get('quoteVolume', 0) or 0.0,
+            'open_interest': None,  # OI not always available in CCXT
+            'last_price': ticker.get('last', 0) or ticker.get('close', 0) or 0.0,
+            'bid': ticker.get('bid', 0) or 0.0,
+            'ask': ticker.get('ask', 0) or 0.0,
+            'spread_bps': 0.0,
+            'ccxt_symbol': ticker.get('symbol'),
+        }
+        
+        # Calculate spread if bid/ask available
+        bid = data['bid']
+        ask = data['ask']
+        if bid > 0 and ask > 0:
+            spread = (ask - bid) / bid
+            data['spread_bps'] = spread * 10000  # basis points
+        
+        # Update cache
+        self._ticker_cache[symbol] = data
+        self._ticker_cache_time[symbol] = now
+        
+        return data
     
     def check_liquidity_filters(
         self,
@@ -251,7 +221,28 @@ class UniverseSelector:
             # Load data (with buffer for gap checking)
             df = self.ohlcv_store.get_ohlcv(symbol, timeframe, limit=min_bars + 100)
             
+            # If we have no data at all for this symbol/timeframe, treat it as
+            # "insufficient_history" for warmup purposes rather than a permanent
+            # "no_data" failure, as long as the symbol exists on the exchange.
             if df.empty:
+                symbol_meta = self.universe_store.get_symbol_metadata(symbol)
+                if symbol_meta:
+                    # Start warmup tracking if not already tracked
+                    warmup_status = self.universe_store.get_warmup_status(symbol)
+                    if warmup_status is None:
+                        first_seen = date.today()
+                        warmup_start = first_seen
+                        self.universe_store.track_warmup(symbol, first_seen, warmup_start)
+                    
+                    return False, "insufficient_history", {
+                        'actual_bars': 0,
+                        'required_bars': min_bars,
+                        'actual_days': 0,
+                        'threshold_days': self.config.min_history_days,
+                        'candles_per_day': candles_per_day
+                    }
+                
+                # If we don't even have symbol metadata, treat as generic no_data
                 return False, "no_data", {}
             
             # Check data age (FIX: Use UTC-aware datetime)
@@ -472,31 +463,51 @@ class UniverseSelector:
         if symbol in self.config.exclude_list:
             return False, "in_exclude_list", {}
         
-        if symbol in self.config.include_list:
-            # Always include, bypass other checks
-            return True, "in_include_list", {}
+        # Check if symbol is in include_list (for logging/prioritization, but still check filters)
+        is_preferred = symbol in self.config.include_list
         
-        # Check liquidity (with hysteresis)
-        passes_liquidity, reason, liq_meta = self.check_liquidity_filters(symbol, entry_threshold=for_entry)
-        metadata.update(liq_meta)
+        # Check if symbol is delisted (CRITICAL: Always check, even for include_list)
+        symbol_meta = self.universe_store.get_symbol_metadata(symbol)
+        if symbol_meta and symbol_meta.get('status') not in ['Trading', None]:
+            if is_preferred:
+                self.logger.warning(
+                    f"Symbol {symbol} is in include_list but is delisted (status: {symbol_meta.get('status')}). "
+                    f"Will not be included in universe."
+                )
+            return False, "delisted", {'status': symbol_meta.get('status')}
         
-        if not passes_liquidity:
-            return False, reason, metadata
-        
-        # Check historical data
+        # Check historical data (CRITICAL: Required for trading, even for include_list)
         passes_data, reason, data_meta = self.check_historical_data(symbol, timeframe)
         metadata.update(data_meta)
         
         if not passes_data:
-            # If insufficient data and it's a new symbol, start warm-up tracking
-            if reason == "insufficient_history":
-                warmup_status = self.universe_store.get_warmup_status(symbol)
-                if warmup_status is None:
-                    # New symbol, start tracking
-                    first_seen = date.today()
-                    warmup_start = first_seen
-                    self.universe_store.track_warmup(symbol, first_seen, warmup_start)
+            if is_preferred:
+                self.logger.warning(
+                    f"Symbol {symbol} is in include_list but failed data requirements: {reason}. "
+                    f"Will not be included until data is available."
+                )
+                # If insufficient data and it's a new symbol, start warm-up tracking
+                if reason == "insufficient_history":
+                    warmup_status = self.universe_store.get_warmup_status(symbol)
+                    if warmup_status is None:
+                        # New symbol, start tracking
+                        first_seen = date.today()
+                        warmup_start = first_seen
+                        self.universe_store.track_warmup(symbol, first_seen, warmup_start)
             
+            return False, reason, metadata
+        
+        # Check liquidity (with hysteresis)
+        # For include_list symbols, we still check but with relaxed thresholds if desired
+        passes_liquidity, reason, liq_meta = self.check_liquidity_filters(symbol, entry_threshold=for_entry)
+        metadata.update(liq_meta)
+        
+        if not passes_liquidity:
+            if is_preferred:
+                self.logger.warning(
+                    f"Symbol {symbol} is in include_list but failed liquidity requirements: {reason}. "
+                    f"Will not be included until liquidity improves."
+                )
             return False, reason, metadata
         
         # Check warm-up period (for entry only)
@@ -505,6 +516,11 @@ class UniverseSelector:
             metadata.update(warmup_meta)
             
             if not passes_warmup:
+                if is_preferred:
+                    self.logger.warning(
+                        f"Symbol {symbol} is in include_list but is still in warm-up period: {reason}. "
+                        f"Will not be included until warm-up completes."
+                    )
                 return False, reason, metadata
         
         # Check volatility filters
@@ -512,6 +528,11 @@ class UniverseSelector:
         metadata.update(vol_meta)
         
         if not passes_vol:
+            if is_preferred:
+                self.logger.warning(
+                    f"Symbol {symbol} is in include_list but failed volatility requirements: {reason}. "
+                    f"Will not be included due to excessive volatility."
+                )
             return False, reason, metadata
         
         # Check minimum time in universe (for exit only, with check_min_time flag)
@@ -520,12 +541,12 @@ class UniverseSelector:
             if not can_exit:
                 return True, reason, metadata  # Keep in universe
         
-        # Check if symbol is delisted
-        symbol_meta = self.universe_store.get_symbol_metadata(symbol)
-        if symbol_meta and symbol_meta.get('status') not in ['Trading', None]:
-            return False, "delisted", {'status': symbol_meta.get('status')}
-        
-        return True, None, metadata
+        # All checks passed
+        if is_preferred:
+            metadata['is_preferred'] = True
+            return True, "in_include_list_and_passed_filters", metadata
+        else:
+            return True, None, metadata
     
     def build_universe(
         self,
@@ -624,7 +645,8 @@ class UniverseSelector:
             additions = [s for s, c in changes.items() if c['action'] == 'added']
             removals = [s for s, c in changes.items() if c['action'] == 'removed']
             
-            if len(additions) + len(removals) > max_changes:
+            total_changes = len(additions) + len(removals)
+            if total_changes > max_changes:
                 # Prioritize by volume (highest for additions, lowest for removals)
                 addition_volumes = {
                     s: changes[s].get('volume_24h', 0) for s in additions
@@ -633,26 +655,52 @@ class UniverseSelector:
                     s: changes[s].get('volume_24h', float('inf')) for s in removals
                 }
                 
-                # Sort and limit
                 additions_sorted = sorted(additions, key=lambda s: addition_volumes[s], reverse=True)
                 removals_sorted = sorted(removals, key=lambda s: removal_volumes[s])
                 
-                # Keep top additions and bottom removals up to limit
-                keep_additions = additions_sorted[:max_changes // 2]
-                keep_removals = removals_sorted[:max_changes // 2]
+                # Decide how many additions/removals to keep under the turnover cap
+                # Strategy:
+                #   - If only additions or only removals, allow up to max_changes of that type
+                #   - If both exist, split budget but ensure at least 1 of each when possible
+                if additions and not removals:
+                    allowed_additions = min(len(additions_sorted), max_changes)
+                    allowed_removals = 0
+                elif removals and not additions:
+                    allowed_additions = 0
+                    allowed_removals = min(len(removals_sorted), max_changes)
+                else:
+                    # Both additions and removals present
+                    # Start with a 50/50 split, but ensure at least 1 of each when enough budget
+                    half = max_changes // 2
+                    if max_changes == 1:
+                        # With very small universes, allow at least 1 change of whichever side has more pressure
+                        if len(additions_sorted) >= len(removals_sorted):
+                            allowed_additions, allowed_removals = 1, 0
+                        else:
+                            allowed_additions, allowed_removals = 0, 1
+                    else:
+                        allowed_additions = min(len(additions_sorted), max(1, half))
+                        remaining_budget = max_changes - allowed_additions
+                        allowed_removals = min(len(removals_sorted), max(1, remaining_budget)) if remaining_budget > 0 else 0
                 
-                # Remove excess changes
+                keep_additions = set(additions_sorted[:allowed_additions])
+                keep_removals = set(removals_sorted[:allowed_removals])
+                
+                # Remove excess additions
                 for symbol in additions:
                     if symbol not in keep_additions:
                         if symbol in eligible_symbols:
                             eligible_symbols.remove(symbol)
-                        del changes[symbol]
+                        if symbol in changes:
+                            del changes[symbol]
                 
+                # Remove excess removals
                 for symbol in removals:
                     if symbol not in keep_removals:
                         if symbol not in eligible_symbols and symbol in current_universe:
                             eligible_symbols.add(symbol)  # Keep in universe
-                        del changes[symbol]
+                        if symbol in changes:
+                            del changes[symbol]
         
         # Log snapshot
         self.universe_store.log_universe_snapshot(current_date, eligible_symbols, changes)

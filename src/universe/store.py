@@ -4,7 +4,7 @@ import sqlite3
 import json
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import pandas as pd
 
 from ..logging_utils import get_logger
@@ -275,6 +275,33 @@ class UniverseStore:
             })
         
         return changes
+    
+    def build_universe_history(
+        self,
+        start_date: date,
+        end_date: date
+    ) -> Dict[date, Set[str]]:
+        """
+        Build a mapping from date -> set of symbols that were in the universe.
+
+        This is useful for backtesting and analysis so that the historical
+        universe used in simulation matches the one that would have been
+        available live.
+
+        Args:
+            start_date: inclusive start date
+            end_date: inclusive end date
+
+        Returns:
+            Dictionary mapping each date in [start_date, end_date] to the set
+            of symbols that were in the universe on that date.
+        """
+        history: Dict[date, Set[str]] = {}
+        current = start_date
+        while current <= end_date:
+            history[current] = self.get_universe(current)
+            current += timedelta(days=1)
+        return history
     
     def update_symbol_metadata(
         self,

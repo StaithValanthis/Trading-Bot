@@ -33,7 +33,17 @@ import sqlite3
 
 
 def run_universe_build(config_path: str):
-    """Build/update the universe."""
+    """
+    Build/update the tradable universe.
+
+    This orchestration does a full, production-style universe build:
+      1. Fetch all USDT-perp markets from the exchange.
+      2. Pre-filter symbols by 24h liquidity/price using tickers only.
+      3. Select top-N liquid symbols as candidates.
+      4. Automatically backfill OHLCV history for candidates.
+      5. Run UniverseSelector.build_universe() to apply historical filters.
+      6. Persist a daily universe snapshot to UniverseStore.
+    """
     # Load config FIRST
     config = BotConfig.from_yaml(config_path)
     
@@ -56,11 +66,71 @@ def run_universe_build(config_path: str):
     ohlcv_store = OHLCVStore(config.data.db_path)
     universe_store = UniverseStore(config.data.db_path)
     selector = UniverseSelector(config.universe, exchange, ohlcv_store, universe_store)
+    downloader = DataDownloader(exchange, ohlcv_store)
     
-    # Build universe
-    universe, changes = selector.build_universe(config.exchange.timeframe)
+    logger.info("Starting full universe build with auto-backfill")
     
-    # Print results
+    # STEP 1: Fetch all USDT-perp symbols from exchange
+    all_symbols = selector.fetch_all_symbols()
+    logger.info(f"Fetched {len(all_symbols)} USDT perpetual symbols from exchange for universe build")
+    
+    # STEP 2: Pre-filter by liquidity (24h volume) using tickers only
+    liquid_candidates = []
+    for symbol in all_symbols:
+        try:
+            passes_liq, reason, liq_meta = selector.check_liquidity_filters(
+                symbol,
+                entry_threshold=True,
+            )
+            if not passes_liq:
+                continue
+            volume_24h = liq_meta.get("volume_24h", 0.0) or 0.0
+            liquid_candidates.append((symbol, volume_24h))
+        except Exception as e:
+            logger.debug(f"Skipping {symbol} during liquidity pre-filter: {e}")
+            continue
+    
+    if not liquid_candidates:
+        logger.warning("No symbols passed basic liquidity filters during universe build")
+        universe, changes = selector.build_universe(config.exchange.timeframe)
+    else:
+        # STEP 3: Sort by volume and keep top-N as candidates for backfill
+        liquid_candidates.sort(key=lambda x: x[1], reverse=True)
+        max_candidates = 150  # Reasonable default to keep data footprint manageable
+        candidate_symbols = [s for s, _ in liquid_candidates[:max_candidates]]
+        logger.info(
+            f"Selected {len(candidate_symbols)} high-liquidity symbols for OHLCV backfill "
+            f"(top {max_candidates} by 24h volume)"
+        )
+        
+        # STEP 4: Backfill OHLCV for candidates to satisfy min_history_days
+        min_days = config.universe.min_history_days
+        # Add a small buffer to improve robustness of history checks
+        lookback_days = min_days + 5
+        from datetime import datetime, timezone, timedelta as _td
+        
+        force_from = datetime.now(timezone.utc) - _td(days=lookback_days)
+        logger.info(
+            f"Backfilling OHLCV for {len(candidate_symbols)} symbols from "
+            f"{force_from.date()} ({lookback_days} days)"
+        )
+        
+        for symbol in candidate_symbols:
+            try:
+                downloader.download_and_store(
+                    symbol,
+                    config.exchange.timeframe,
+                    lookback_days=lookback_days,
+                    force_from_date=force_from,
+                )
+            except Exception as e:
+                logger.warning(f"Error backfilling data for {symbol}: {e}")
+                continue
+        
+        # STEP 5: Build universe with full historical filters
+        universe, changes = selector.build_universe(config.exchange.timeframe)
+    
+    # Print results to stdout as before
     print("\n" + "="*60)
     print("UNIVERSE BUILD RESULTS")
     print("="*60)
@@ -366,9 +436,17 @@ def run_live(config_path: str):
         try:
             initial_universe = list(universe_selector.get_universe())
             if not initial_universe:
-                # Build universe if empty
-                logger.info("Universe is empty, building initial universe...")
-                initial_universe, _ = universe_selector.build_universe(config.exchange.timeframe)
+                # Preferred path: universe-build should have been run before live.
+                # As a safety fallback, build a universe on-the-fly if none exists.
+                logger.warning(
+                    "Universe is empty in database. It is recommended to run "
+                    "`python -m src.main universe-build --config config.yaml` "
+                    "before starting live trading. Falling back to on-the-fly "
+                    "universe build for this session."
+                )
+                initial_universe, _ = universe_selector.build_universe(
+                    config.exchange.timeframe
+                )
             
             if initial_universe:
                 # Download data for all symbols in initial universe
@@ -535,15 +613,19 @@ def run_live(config_path: str):
                 
                 # Determine which symbols to download data for
                 if universe_selector is not None:
-                    # Dynamic universe mode: download for current universe + potential new symbols
+                    # Dynamic universe mode: update data for the full exchange universe
+                    # plus the current tradable universe. This ensures that future
+                    # universe rebuilds have up-to-date data for all candidates.
                     current_universe = list(universe_selector.get_universe())
-                    # Also fetch all symbols from exchange to check for new listings
-                    # Limit to top 100 for performance
                     try:
                         all_exchange_symbols = universe_selector.fetch_all_symbols()
-                        # Combine current universe with exchange symbols (limit to top 100 to avoid excessive API calls)
-                        symbols_to_download = list(set(current_universe + all_exchange_symbols[:100]))
-                        logger.debug(f"Downloading data for {len(symbols_to_download)} symbols (universe: {len(current_universe)}, exchange: {len(all_exchange_symbols)})")
+                        # Combine current universe with all exchange symbols (no hard-coded limits)
+                        symbols_to_download = list(set(current_universe + all_exchange_symbols))
+                        logger.debug(
+                            f"Downloading data for {len(symbols_to_download)} symbols "
+                            f"(current universe: {len(current_universe)}, "
+                            f"exchange symbols: {len(all_exchange_symbols)})"
+                        )
                     except Exception as e:
                         logger.warning(f"Error fetching all exchange symbols, using current universe only: {e}")
                         symbols_to_download = current_universe
@@ -953,15 +1035,15 @@ def run_live(config_path: str):
                         # Log risk calculation for transparency
                         stop_distance = abs(stop_loss - entry_price) if signal == 'short' else abs(entry_price - stop_loss)
                         target_risk = portfolio.equity * config.risk.per_trade_risk_fraction
-                        calculated_risk = size * stop_distance
-                        market_info = exchange.get_market_info(symbol)
-                        contract_size = market_info.get('contractSize', 1.0)
-                        notional_at_size = size * entry_price * contract_size
-                        logger.debug(
+                        calculated_risk = size * stop_distance * market_info.get('contractSize', 1.0)
+                        notional_at_size = size * entry_price * market_info.get('contractSize', 1.0)
+                        stop_distance_pct = (stop_distance / entry_price) * 100
+                        logger.info(
                             f"Position sizing for {symbol}: "
-                            f"calculated_size={size:.6f} contracts, "
-                            f"calculated_risk=${calculated_risk:.2f} ({calculated_risk/portfolio.equity*100:.2f}% of equity, target={config.risk.per_trade_risk_fraction*100:.1f}%), "
-                            f"notional=${notional_at_size:.2f}"
+                            f"size={size:.6f} contracts, "
+                            f"risk=${calculated_risk:.2f} ({calculated_risk/portfolio.equity*100:.2f}% of ${portfolio.equity:.2f} equity, target={config.risk.per_trade_risk_fraction*100:.1f}%), "
+                            f"notional=${notional_at_size:.2f} ({(notional_at_size/portfolio.equity)*100:.1f}% of equity), "
+                            f"stop_distance={stop_distance_pct:.2f}%"
                         )
                         
                         # Apply funding bias adjustment
