@@ -670,10 +670,106 @@ def run_live(config_path: str):
                                 )
                                 continue
                             
+                            # CRITICAL: Validate data freshness before using it
+                            # Check if the last candle is recent (within 2x timeframe duration)
+                            if not df.empty:
+                                last_timestamp = df.index[-1]
+                                timeframe_to_seconds = {
+                                    '1m': 60, '5m': 300, '15m': 900, '30m': 1800,
+                                    '1h': 3600, '2h': 7200, '4h': 14400, '6h': 21600,
+                                    '12h': 43200, '1d': 86400
+                                }
+                                timeframe_seconds = timeframe_to_seconds.get(config.exchange.timeframe, 3600)
+                                max_age_seconds = timeframe_seconds * 2  # Allow 2x timeframe age
+                                
+                                now = datetime.now(timezone.utc)
+                                data_age = (now - last_timestamp.replace(tzinfo=timezone.utc)).total_seconds()
+                                
+                                if data_age > max_age_seconds:
+                                    logger.warning(
+                                        f"OHLCV data for {symbol} is stale (last candle: {last_timestamp}, "
+                                        f"age: {data_age/3600:.1f}h, max: {max_age_seconds/3600:.1f}h). "
+                                        f"Refreshing data..."
+                                    )
+                                    # Force refresh data
+                                    try:
+                                        downloader.download_and_store(
+                                            symbol,
+                                            config.exchange.timeframe,
+                                            lookback_days=30
+                                        )
+                                        # Reload data
+                                        df = store.get_ohlcv(
+                                            symbol,
+                                            config.exchange.timeframe,
+                                            limit=config.data.lookback_bars
+                                        )
+                                        if df.empty:
+                                            logger.warning(f"Still no data for {symbol} after refresh. Skipping.")
+                                            continue
+                                    except Exception as e:
+                                        logger.error(f"Error refreshing data for {symbol}: {e}")
+                                        continue
+                                
+                                # Validate price reasonableness by comparing with current ticker
+                                try:
+                                    last_close_price = df['close'].iloc[-1]
+                                    ticker = exchange.fetch_ticker(symbol)
+                                    current_price = ticker.get('last') or ticker.get('close')
+                                    
+                                    if current_price and last_close_price:
+                                        price_diff_pct = abs(current_price - last_close_price) / current_price * 100
+                                        # If price differs by more than 10%, data is likely corrupted
+                                        if price_diff_pct > 10.0:
+                                            logger.error(
+                                                f"⚠️ CRITICAL: OHLCV data for {symbol} appears corrupted! "
+                                                f"Last close: ${last_close_price:.4f}, Current price: ${current_price:.4f} "
+                                                f"({price_diff_pct:.1f}% difference). "
+                                                f"Force refreshing data..."
+                                            )
+                                            # Force full refresh
+                                            downloader.download_and_store(
+                                                symbol,
+                                                config.exchange.timeframe,
+                                                lookback_days=30,
+                                                force_from_date=datetime.now(timezone.utc) - timedelta(days=30)
+                                            )
+                                            # Reload data
+                                            df = store.get_ohlcv(
+                                                symbol,
+                                                config.exchange.timeframe,
+                                                limit=config.data.lookback_bars
+                                            )
+                                            if df.empty:
+                                                logger.warning(f"Still no data for {symbol} after refresh. Skipping.")
+                                                continue
+                                            # Use current price as entry price (more reliable than stale OHLCV)
+                                            logger.info(f"Using current ticker price ${current_price:.4f} for {symbol} instead of stale OHLCV data")
+                                            # Update the last close in the dataframe
+                                            df.iloc[-1, df.columns.get_loc('close')] = current_price
+                                            
+                                except Exception as e:
+                                    logger.warning(f"Could not validate price for {symbol}: {e}. Proceeding with caution.")
+                            
                             symbol_data[symbol] = df
                             
                             # Generate trend signal
                             trend_signal = trend_gen.generate_signal(df)
+                            
+                            # CRITICAL: Override entry_price with current market price for accuracy
+                            # The OHLCV close might be slightly stale, but current ticker is real-time
+                            try:
+                                ticker = exchange.fetch_ticker(symbol)
+                                current_market_price = ticker.get('last') or ticker.get('close')
+                                if current_market_price:
+                                    trend_signal['entry_price'] = current_market_price
+                                    logger.debug(
+                                        f"Updated entry_price for {symbol} from OHLCV ${trend_signal.get('entry_price', 0):.4f} "
+                                        f"to current market price ${current_market_price:.4f}"
+                                    )
+                            except Exception as e:
+                                logger.debug(f"Could not fetch current price for {symbol}: {e}. Using OHLCV price.")
+                            
                             symbol_signals[symbol] = trend_signal
                             
                         except Exception as e:
@@ -854,12 +950,36 @@ def run_live(config_path: str):
                             logger.warning(f"Skipping {symbol}: {error}")
                             continue
                         
+                        # Log risk calculation for transparency
+                        stop_distance = abs(stop_loss - entry_price) if signal == 'short' else abs(entry_price - stop_loss)
+                        target_risk = portfolio.equity * config.risk.per_trade_risk_fraction
+                        calculated_risk = size * stop_distance
+                        market_info = exchange.get_market_info(symbol)
+                        contract_size = market_info.get('contractSize', 1.0)
+                        notional_at_size = size * entry_price * contract_size
+                        logger.debug(
+                            f"Position sizing for {symbol}: "
+                            f"calculated_size={size:.6f} contracts, "
+                            f"calculated_risk=${calculated_risk:.2f} ({calculated_risk/portfolio.equity*100:.2f}% of equity, target={config.risk.per_trade_risk_fraction*100:.1f}%), "
+                            f"notional=${notional_at_size:.2f}"
+                        )
+                        
                         # Apply funding bias adjustment
                         adjusted_size = funding_bias.calculate_size_adjustment(
                             symbol,
                             signal,
                             size
                         )
+                        
+                        if adjusted_size != size:
+                            adjusted_risk = adjusted_size * stop_distance
+                            adjusted_notional = adjusted_size * entry_price * contract_size
+                            logger.debug(
+                                f"Funding bias adjustment for {symbol}: "
+                                f"{size:.6f} → {adjusted_size:.6f} contracts, "
+                                f"risk=${calculated_risk:.2f} → ${adjusted_risk:.2f}, "
+                                f"notional=${notional_at_size:.2f} → ${adjusted_notional:.2f}"
+                            )
                         
                         # Check leverage limits (always required, not dependent on other positions)
                         market_info = exchange.get_market_info(symbol)
@@ -875,6 +995,7 @@ def run_live(config_path: str):
                         if not within_limits:
                             logger.warning(f"Position for {symbol} exceeds leverage: {limit_error}")
                             # Scale down
+                            size_before_scale = adjusted_size
                             adjusted_size, scale_reason = portfolio_limits.scale_position_for_limits(
                                 portfolio,
                                 symbol,
@@ -885,6 +1006,18 @@ def run_live(config_path: str):
                             if adjusted_size <= 0:
                                 logger.warning(f"Cannot scale {symbol} to fit limits: {scale_reason}")
                                 continue
+                            
+                            # Log scaling impact on risk
+                            if adjusted_size != size_before_scale:
+                                stop_distance = abs(stop_loss - entry_price) if signal == 'short' else abs(entry_price - stop_loss)
+                                risk_before = size_before_scale * stop_distance
+                                risk_after = adjusted_size * stop_distance
+                                logger.info(
+                                    f"Scaled {symbol} position for leverage limits: "
+                                    f"{size_before_scale:.6f} → {adjusted_size:.6f} contracts, "
+                                    f"risk=${risk_before:.2f} → ${risk_after:.2f} ({risk_after/portfolio.equity*100:.2f}% of equity, target={config.risk.per_trade_risk_fraction*100:.1f}%), "
+                                    f"reason: {scale_reason}"
+                                )
                         
                         # Store unconstrained target (max_positions and concentration checks deferred)
                         signed_size = adjusted_size if signal == 'long' else -adjusted_size

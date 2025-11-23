@@ -1583,6 +1583,9 @@ class OrderExecutor:
                 }
                 continue  # Skip the rest of the checks for this symbol
             
+            # Determine if stop order exists on exchange
+            stop_order_exists_on_exchange = len(existing_stop_orders) > 0
+            
             # If we found existing stop orders on exchange, use the correct one and cancel duplicates
             if existing_stop_orders:
                 # CRITICAL: If we have a stored order ID, prioritize it (it's the "official" one)

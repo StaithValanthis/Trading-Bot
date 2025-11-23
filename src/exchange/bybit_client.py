@@ -847,18 +847,37 @@ class BybitClient:
             # Stop-loss for short position: triggers when price rises above trigger
             trigger_direction = 1  # Price rises to trigger price
         
-        # Optional validation: Check trigger price relative to current price
+        # Fetch current price for validation if not provided
+        if current_price is None:
+            try:
+                ticker = self.fetch_ticker(symbol)
+                current_price = ticker.get('last') or ticker.get('close')
+            except Exception as e:
+                self.logger.debug(f"Could not fetch current price for {symbol} validation: {e}")
+                current_price = None
+        
+        # Validate trigger price relative to current price
         if current_price is not None:
-            if side.lower() == 'sell' and trigger_price >= current_price:
-                self.logger.warning(
-                    f"Stop-loss trigger price ({trigger_price}) should be below current price "
-                    f"({current_price}) for SELL stop order. Proceeding anyway..."
-                )
-            elif side.lower() == 'buy' and trigger_price <= current_price:
-                self.logger.warning(
-                    f"Stop-loss trigger price ({trigger_price}) should be above current price "
-                    f"({current_price}) for BUY stop order. Proceeding anyway..."
-                )
+            if side.lower() == 'sell':
+                # SELL stop (closing long): trigger should be below current price
+                if trigger_price >= current_price:
+                    self.logger.warning(
+                        f"Stop-loss trigger price ({trigger_price}) is at or above current price "
+                        f"({current_price}) for SELL stop order (long position). "
+                        f"Adjusting trigger to {current_price * 0.99:.2f} (1% below current)..."
+                    )
+                    trigger_price = current_price * 0.99  # Adjust to 1% below current
+                    trigger_price = self.round_price(symbol, trigger_price)
+            elif side.lower() == 'buy':
+                # BUY stop (closing short): trigger should be above current price
+                if trigger_price <= current_price:
+                    self.logger.warning(
+                        f"Stop-loss trigger price ({trigger_price}) is at or below current price "
+                        f"({current_price}) for BUY stop order (short position). "
+                        f"Adjusting trigger to {current_price * 1.01:.2f} (1% above current)..."
+                    )
+                    trigger_price = current_price * 1.01  # Adjust to 1% above current
+                    trigger_price = self.round_price(symbol, trigger_price)
         
         # Build parameters matching Bybit v5 API format
         # CRITICAL: All numeric values (qty, triggerPrice, price) must be strings

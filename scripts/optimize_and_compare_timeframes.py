@@ -28,10 +28,11 @@ from src.data.ohlcv_store import OHLCVStore
 from src.exchange.bybit_client import BybitClient
 from src.data.downloader import DataDownloader
 from src.optimizer.optimizer import Optimizer
-from src.optimizer.timeframe_analyzer import TimeframeAnalyzer
+from src.optimizer.timeframe_analyzer import TimeframeAnalyzer, TimeframeResult
 from src.universe.store import UniverseStore
 from src.universe.selector import UniverseSelector
 from src.logging_utils import setup_logging, get_logger
+from dataclasses import asdict
 
 # Candidate timeframes to test
 CANDIDATE_TIMEFRAMES = ['1h', '2h', '4h', '6h', '12h', '1d']
@@ -39,12 +40,70 @@ CANDIDATE_TIMEFRAMES = ['1h', '2h', '4h', '6h', '12h', '1d']
 logger = None
 
 
+def convert_timeframe_results_to_dict(results: List[TimeframeResult]) -> Dict[str, Dict]:
+    """
+    Convert TimeframeResult objects to dictionary format for reporting.
+    
+    Args:
+        results: List of TimeframeResult objects
+    
+    Returns:
+        Dictionary mapping timeframe to result dictionary
+    """
+    return {result.timeframe: asdict(result) for result in results}
+
+
+def generate_comparison_report(results_by_timeframe: Dict[str, Dict]) -> str:
+    """
+    Generate a text report comparing timeframes.
+    
+    Args:
+        results_by_timeframe: Dictionary mapping timeframe to result dictionary
+    
+    Returns:
+        Formatted text report
+    """
+    lines = []
+    lines.append("=" * 80)
+    lines.append("TIMEFRAME COMPARISON RESULTS")
+    lines.append("=" * 80)
+    lines.append("")
+    
+    # Sort by Sharpe ratio (descending)
+    sorted_tfs = sorted(
+        results_by_timeframe.items(),
+        key=lambda x: x[1].get('sharpe_ratio', 0),
+        reverse=True
+    )
+    
+    for tf, metrics in sorted_tfs:
+        lines.append(f"Timeframe: {tf}")
+        lines.append("-" * 80)
+        lines.append(f"  Sharpe Ratio:        {metrics.get('sharpe_ratio', 0):.2f}")
+        lines.append(f"  Total Return:        {metrics.get('total_return_pct', 0):.2f}%")
+        lines.append(f"  Annualized Return:   {metrics.get('annualized_return_pct', 0):.2f}%")
+        lines.append(f"  Max Drawdown:        {metrics.get('max_drawdown_pct', 0):.2f}%")
+        lines.append(f"  Sortino Ratio:       {metrics.get('sortino_ratio', 0):.2f}")
+        lines.append(f"  Profit Factor:       {metrics.get('profit_factor', 0):.2f}")
+        lines.append(f"  Win Rate:            {metrics.get('win_rate', 0):.2f}%")
+        lines.append(f"  Total Trades:        {metrics.get('total_trades', 0)}")
+        lines.append(f"  Trades/Day:          {metrics.get('trades_per_day', 0):.2f}")
+        lines.append(f"  Avg Holding Hours:   {metrics.get('avg_holding_hours', 0):.2f}")
+        lines.append(f"  Total Fees:          {metrics.get('total_fees_pct', 0):.2f}%")
+        lines.append(f"  Net Return (After):  {metrics.get('net_return_after_costs_pct', 0):.2f}%")
+        lines.append("")
+    
+    return "\n".join(lines)
+
+
 def download_data_for_timeframes(
     config: BotConfig,
     symbols: List[str],
     timeframes: List[str],
     lookback_days: int = 730,
-    force_download: bool = False
+    force_download: bool = False,
+    start_date: Optional[datetime] = None,
+    end_date: Optional[datetime] = None
 ) -> Dict[str, List[str]]:
     """
     Download historical data for symbols and timeframes.
@@ -64,7 +123,7 @@ def download_data_for_timeframes(
     # Initialize exchange client and data store
     exchange = BybitClient(config.exchange)
     store = OHLCVStore(config.data.db_path)
-    downloader = DataDownloader(exchange, store, logger=logger)
+    downloader = DataDownloader(exchange, store)
     
     results = {tf: [] for tf in timeframes}
     
@@ -77,21 +136,108 @@ def download_data_for_timeframes(
             try:
                 logger.info(f"  Downloading {symbol} {timeframe}...")
                 
-                # Check if data already exists
+                # Check if data already exists and covers required date range
+                needs_historical_download = False
                 if not force_download:
                     existing_data = store.get_ohlcv(symbol, timeframe)
                     if not existing_data.empty:
+                        # Check if data covers the required date range
+                        has_sufficient_range = True
+                        earliest_timestamp = existing_data.index[0] if len(existing_data) > 0 else None
+                        
+                        if start_date is not None and earliest_timestamp is not None:
+                            latest_timestamp = existing_data.index[-1] if len(existing_data) > 0 else None
+                            
+                            # Calculate expected bars for the required date range
+                            total_days_needed = (end_date - start_date).days if end_date else (datetime.now() - start_date).days
+                            
+                            if 'd' in timeframe:
+                                hours_per_bar = 24 * int(timeframe.replace('d', ''))
+                                expected_bars = int(total_days_needed / (hours_per_bar / 24))
+                            elif 'h' in timeframe:
+                                hours_per_bar = int(timeframe.replace('h', ''))
+                                expected_bars = int((total_days_needed * 24) / hours_per_bar)
+                            else:
+                                expected_bars = total_days_needed * 24  # Default to 1h
+                            
+                            # Calculate actual date range covered by existing data
+                            total_days_in_data = (latest_timestamp - earliest_timestamp).days if latest_timestamp else 0
+                            
+                            logger.debug(
+                                f"    {symbol} {timeframe}: Data check - "
+                                f"earliest={earliest_timestamp.date()}, latest={latest_timestamp.date() if latest_timestamp else 'N/A'}, "
+                                f"bars={len(existing_data)}, total_days={total_days_in_data}, "
+                                f"need from {start_date.date()}, expected_bars~{expected_bars}"
+                            )
+                            
+                            # Check if data starts early enough
+                            if earliest_timestamp > start_date:
+                                # Data doesn't go back far enough - need historical download
+                                has_sufficient_range = False
+                                needs_historical_download = True
+                                days_covered = (datetime.now() - earliest_timestamp).days
+                                days_needed = (datetime.now() - start_date).days
+                                logger.info(
+                                    f"    {symbol} {timeframe}: Existing data starts at {earliest_timestamp.date()} "
+                                    f"({days_covered} days, {len(existing_data)} bars), "
+                                    f"need {start_date.date()} ({days_needed} days, ~{expected_bars} bars) - will download historical data"
+                                )
+                            # Check if we have enough bars to cover the range (at least 80% of expected)
+                            elif len(existing_data) < expected_bars * 0.8:
+                                # Data might have gaps or be incomplete - need to download more
+                                has_sufficient_range = False
+                                needs_historical_download = True
+                                logger.info(
+                                    f"    {symbol} {timeframe}: Existing data ({len(existing_data)} bars) insufficient "
+                                    f"(expected ~{expected_bars} bars for full range {start_date.date()} to {end_date.date() if end_date else 'now'}). "
+                                    f"Will download historical data to fill gaps."
+                                )
+                        
                         # Check if we have enough recent data
-                        latest_timestamp = existing_data.index[-1] if len(existing_data) > 0 else None
-                        if latest_timestamp:
-                            days_old = (datetime.now() - latest_timestamp).days
-                            if days_old < 1:  # Data is less than 1 day old
-                                logger.info(f"    ✓ {symbol} {timeframe}: Data already exists ({len(existing_data)} bars)")
-                                results[timeframe].append(symbol)
-                                continue
+                        if has_sufficient_range:
+                            latest_timestamp = existing_data.index[-1] if len(existing_data) > 0 else None
+                            if latest_timestamp:
+                                days_old = (datetime.now() - latest_timestamp).days
+                                if days_old < 1:  # Data is less than 1 day old and covers required range
+                                    logger.info(f"    ✓ {symbol} {timeframe}: Data already exists ({len(existing_data)} bars) and covers required range")
+                                    results[timeframe].append(symbol)
+                                    continue
+                            # Data exists and covers range, but might be slightly old - still use it
+                            logger.info(f"    ✓ {symbol} {timeframe}: Data already exists ({len(existing_data)} bars) and covers required range")
+                            results[timeframe].append(symbol)
+                            continue
                 
-                # Download data
-                downloader.download_and_store(symbol, timeframe, lookback_days=lookback_days)
+                # Download data - use force_from_date if we need historical data
+                if needs_historical_download and start_date is not None:
+                    # Need to download historical data from start_date
+                    logger.info(f"    Downloading historical data from {start_date.date()} to fill gap")
+                    downloader.download_and_store(
+                        symbol, 
+                        timeframe, 
+                        lookback_days=lookback_days,
+                        force_from_date=start_date
+                    )
+                    # Wait a bit to avoid rate limits
+                    import time
+                    time.sleep(0.5)
+                elif start_date is not None:
+                    # No existing data or existing data covers range, download from start_date if no data
+                    existing_data_check = store.get_ohlcv(symbol, timeframe)
+                    if existing_data_check.empty:
+                        # No existing data, download from start_date
+                        logger.info(f"    Downloading from {start_date.date()} (no existing data)")
+                        downloader.download_and_store(
+                            symbol, 
+                            timeframe, 
+                            lookback_days=lookback_days,
+                            force_from_date=start_date
+                        )
+                    else:
+                        # Existing data covers range or we're just updating, normal incremental download
+                        downloader.download_and_store(symbol, timeframe, lookback_days=lookback_days)
+                else:
+                    # No start_date specified, normal incremental download
+                    downloader.download_and_store(symbol, timeframe, lookback_days=lookback_days)
                 
                 # Verify data was stored
                 data = store.get_ohlcv(symbol, timeframe)
@@ -112,7 +258,9 @@ def optimize_timeframe_parameters(
     config: BotConfig,
     symbols: List[str],
     timeframe: str,
-    store: OHLCVStore
+    store: OHLCVStore,
+    start_date: Optional[datetime] = None,
+    end_date: Optional[datetime] = None
 ) -> Optional[Dict]:
     """
     Optimize parameters for a specific timeframe.
@@ -122,6 +270,8 @@ def optimize_timeframe_parameters(
         symbols: List of symbols to optimize on
         timeframe: Timeframe to optimize (e.g., '4h')
         store: OHLCV data store
+        start_date: Optional start date for optimization data
+        end_date: Optional end date for optimization data
     
     Returns:
         Dictionary with best parameters and metrics, or None if optimization failed
@@ -136,7 +286,7 @@ def optimize_timeframe_parameters(
     
     # Add ranking_window to param_ranges if not present
     if 'ranking_window' not in opt_config.optimizer.param_ranges:
-        logger.info("Adding ranking_window to optimizer parameter ranges")
+        logger.info("  Adding ranking_window to optimizer parameter ranges")
         # Reasonable range: 12-48 bars (timeframe-dependent)
         # These will scale appropriately for different timeframes
         opt_config.optimizer.param_ranges['ranking_window'] = [12, 18, 24, 36, 48]
@@ -144,9 +294,14 @@ def optimize_timeframe_parameters(
     # Create optimizer instance with updated config
     optimizer = Optimizer(opt_config, store)
     
-    # Run optimization
+    # Run optimization with date range if provided
     try:
-        result = optimizer.optimize(symbols=symbols, timeframe=timeframe)
+        result = optimizer.optimize(
+            symbols=symbols,
+            timeframe=timeframe,
+            start_date=start_date,
+            end_date=end_date
+        )
         
         if 'error' in result:
             logger.error(f"  ✗ Optimization failed: {result['error']}")
@@ -521,12 +676,18 @@ def main():
         logger.info("STEP 1: DOWNLOADING HISTORICAL DATA")
         logger.info("="*80)
         
+        # Calculate required lookback days based on start_date
+        days_until_start = (start_datetime - datetime.now()).days
+        required_lookback_days = abs(days_until_start) + 100  # Add buffer
+        
         download_results = download_data_for_timeframes(
             config=config,
             symbols=symbols,
             timeframes=args.timeframes,
-            lookback_days=args.lookback_days,
-            force_download=args.force_download
+            lookback_days=max(args.lookback_days, required_lookback_days),
+            force_download=args.force_download,
+            start_date=start_datetime,
+            end_date=end_datetime
         )
         
         # Filter timeframes to only those with sufficient data
@@ -557,7 +718,9 @@ def main():
                 config=config,
                 symbols=symbols,
                 timeframe=tf,
-                store=store
+                store=store,
+                start_date=start_datetime,
+                end_date=end_datetime
             )
             
             if opt_result:
@@ -591,11 +754,9 @@ def main():
         sys.exit(1)
     
     # Convert results to dictionary format for reporting
-    from scripts.timeframe_comparison import convert_timeframe_results_to_dict
     results_by_timeframe = convert_timeframe_results_to_dict(timeframe_results)
     
     # Generate comparison report
-    from scripts.timeframe_comparison import generate_comparison_report
     report = generate_comparison_report(results_by_timeframe)
     
     # Add optimization info to report

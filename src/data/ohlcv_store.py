@@ -114,29 +114,52 @@ class OHLCVStore:
             symbol: Trading pair symbol
             timeframe: Timeframe (e.g., '1h')
             since: Minimum timestamp in milliseconds
-            limit: Maximum number of rows to return
+            limit: Maximum number of rows to return (returns most recent candles)
         
         Returns:
             DataFrame with columns: timestamp, open, high, low, close, volume
+            Data is sorted by timestamp ASC (oldest first) for proper time series processing
         """
         conn = sqlite3.connect(self.db_path)
         
-        query = """
-            SELECT timestamp, open, high, low, close, volume
-            FROM ohlcv
-            WHERE symbol = ? AND timeframe = ?
-        """
-        params = [symbol, timeframe]
-        
-        if since:
-            query += " AND timestamp >= ?"
-            params.append(since)
-        
-        query += " ORDER BY timestamp ASC"
-        
+        # CRITICAL: When using LIMIT, we need to get the MOST RECENT candles
+        # So we order DESC first, apply LIMIT, then sort ASC for proper time series order
         if limit:
-            query += " LIMIT ?"
+            # Get the most recent N candles
+            query = """
+                SELECT timestamp, open, high, low, close, volume
+                FROM (
+                    SELECT timestamp, open, high, low, close, volume
+                    FROM ohlcv
+                    WHERE symbol = ? AND timeframe = ?
+            """
+            params = [symbol, timeframe]
+            
+            if since:
+                query += " AND timestamp >= ?"
+                params.append(since)
+            
+            query += """
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                )
+                ORDER BY timestamp ASC
+            """
             params.append(limit)
+        else:
+            # No limit - get all data sorted ASC
+            query = """
+                SELECT timestamp, open, high, low, close, volume
+                FROM ohlcv
+                WHERE symbol = ? AND timeframe = ?
+            """
+            params = [symbol, timeframe]
+            
+            if since:
+                query += " AND timestamp >= ?"
+                params.append(since)
+            
+            query += " ORDER BY timestamp ASC"
         
         try:
             df = pd.read_sql_query(query, conn, params=params)
@@ -145,6 +168,8 @@ class OHLCVStore:
             if not df.empty:
                 df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
                 df.set_index('datetime', inplace=True)
+                # Ensure sorted by datetime ASC (oldest to newest)
+                df = df.sort_index()
             
             return df
             
@@ -185,6 +210,41 @@ class OHLCVStore:
             
         except Exception as e:
             self.logger.error(f"Error getting latest timestamp: {e}")
+            conn.close()
+            return None
+    
+    def get_earliest_timestamp(
+        self,
+        symbol: str,
+        timeframe: str
+    ) -> Optional[int]:
+        """
+        Get the earliest timestamp for a symbol/timeframe.
+        
+        Args:
+            symbol: Trading pair symbol
+            timeframe: Timeframe
+        
+        Returns:
+            Earliest timestamp in milliseconds, or None if no data
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute("""
+                SELECT MIN(timestamp)
+                FROM ohlcv
+                WHERE symbol = ? AND timeframe = ?
+            """, (symbol, timeframe))
+            
+            result = cursor.fetchone()
+            conn.close()
+            
+            return result[0] if result[0] else None
+            
+        except Exception as e:
+            self.logger.error(f"Error getting earliest timestamp: {e}")
             conn.close()
             return None
     
