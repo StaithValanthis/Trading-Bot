@@ -295,6 +295,8 @@ class Optimizer:
         # Update cross-sectional parameters
         if 'top_k' in params:
             test_config.strategy.cross_sectional.top_k = params['top_k']
+        if 'ranking_window' in params:
+            test_config.strategy.cross_sectional.ranking_window = params['ranking_window']
         
         return test_config
     
@@ -369,7 +371,8 @@ class Optimizer:
             'ma_long': self.config.strategy.trend.ma_long,
             'momentum_lookback': self.config.strategy.trend.momentum_lookback,
             'atr_stop_multiplier': self.config.strategy.trend.atr_stop_multiplier,
-            'top_k': self.config.strategy.cross_sectional.top_k
+            'top_k': self.config.strategy.cross_sectional.top_k,
+            'ranking_window': self.config.strategy.cross_sectional.ranking_window
         }
         
         # Check if best params differ from current

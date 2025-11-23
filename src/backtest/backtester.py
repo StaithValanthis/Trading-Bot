@@ -65,6 +65,33 @@ class _SimulatedExchange:
     def round_amount(self, symbol: str, amount: float) -> float:
         # For backtests we don't need exchange-specific rounding
         return float(amount)
+    
+    def validate_order_size(self, symbol: str, amount: float, price: float) -> Tuple[bool, Optional[str]]:
+        """
+        Validate order size meets exchange requirements.
+        
+        For backtests, we're lenient - only reject truly invalid orders.
+        Returns:
+            (is_valid, error_message)
+        """
+        market_info = self.get_market_info(symbol)
+        limits = market_info['limits']
+        contract_size = market_info['contractSize']
+        
+        # Check minimum amount
+        min_amount = limits['amount']['min']
+        if min_amount is not None and min_amount > 0:
+            if amount < min_amount:
+                return False, f"Amount {amount} below minimum {min_amount}"
+        
+        # Check minimum cost (notional)
+        min_cost = limits['cost']['min']
+        if min_cost is not None and min_cost > 0:
+            cost = amount * price * contract_size
+            if cost < min_cost:
+                return False, f"Order cost {cost} below minimum {min_cost}"
+        
+        return True, None
 
 
 class _BacktestPortfolioState:
@@ -130,6 +157,7 @@ class Backtester:
         """
         capital = initial_capital
         equity_history = [capital]
+        timestamps_list = []  # Track timestamps for metrics calculation
         trades = []
         funding_pnl_total = 0.0
         # symbol -> {size, contracts, entry_price, stop_loss, signal, entry_time, notional}
@@ -510,34 +538,83 @@ class Backtester:
         
         # Calculate metrics
         final_equity = equity_history[-1] if equity_history else initial_capital
-        total_return = (final_equity - initial_capital) / initial_capital * 100
+        total_return_pct = (final_equity - initial_capital) / initial_capital * 100
+        total_return = total_return_pct / 100.0  # As decimal for consistency
+        
+        # Calculate time period for annualization
+        if timestamps:
+            start_time = timestamps[0]
+            end_time = timestamps[-1]
+            time_diff = (end_time - start_time).total_seconds() / (365.25 * 24 * 3600)  # Years
+            days_diff = (end_time - start_time).total_seconds() / (24 * 3600)  # Days
+        else:
+            time_diff = 0
+            days_diff = 0
         
         # Calculate returns
         equity_series = pd.Series(equity_history)
         returns = equity_series.pct_change().dropna()
         
         if len(returns) > 0:
-            sharpe_ratio = (returns.mean() / returns.std() * np.sqrt(252 * 24)) if returns.std() > 0 else 0  # Annualized for hourly data
+            # Sharpe ratio (annualized)
+            sharpe_ratio = (returns.mean() / returns.std() * np.sqrt(252 * 24)) if returns.std() > 0 else 0
+            
+            # Sortino ratio (downside deviation only)
+            downside_returns = returns[returns < 0]
+            if len(downside_returns) > 0 and downside_returns.std() > 0:
+                sortino_ratio = (returns.mean() / downside_returns.std() * np.sqrt(252 * 24))
+            else:
+                sortino_ratio = float('inf') if returns.mean() > 0 else 0
+            
             max_drawdown = self._calculate_max_drawdown(equity_series)
             win_rate = len([t for t in trades if t['pnl'] > 0]) / len(trades) if trades else 0
             avg_win = np.mean([t['pnl'] for t in trades if t['pnl'] > 0]) if any(t['pnl'] > 0 for t in trades) else 0
             avg_loss = np.mean([t['pnl'] for t in trades if t['pnl'] < 0]) if any(t['pnl'] < 0 for t in trades) else 0
             profit_factor = abs(avg_win / avg_loss) if avg_loss != 0 else float('inf') if avg_win > 0 else 0
+            
+            # Annualized return
+            if time_diff > 0:
+                annualized_return = ((final_equity / initial_capital) ** (1.0 / time_diff) - 1.0) if time_diff > 0 else total_return
+            else:
+                annualized_return = 0.0
+            
+            # Trades per day
+            trades_per_day = len(trades) / days_diff if days_diff > 0 else 0
         else:
             sharpe_ratio = 0
+            sortino_ratio = 0
             max_drawdown = 0
             win_rate = 0
             profit_factor = 0
+            annualized_return = 0.0
+            trades_per_day = 0
+        
+        # Calculate total fees (sum of all fees from trades)
+        total_fees = sum([abs(t['size']) * t['exit_price'] * taker_fee for t in trades if 'exit_price' in t])
+        total_fees += sum([abs(t['size']) * t['entry_price'] * taker_fee for t in trades if 'entry_price' in t])
+        
+        # Calculate average leverage (average position size / capital)
+        if trades:
+            avg_position_size = np.mean([abs(t['size']) * t['entry_price'] for t in trades if 'entry_price' in t])
+            avg_leverage = (avg_position_size / initial_capital) if initial_capital > 0 else 0
+        else:
+            avg_leverage = 0
         
         return {
             'initial_capital': initial_capital,
             'final_equity': final_equity,
-            'total_return_pct': total_return,
+            'total_return': total_return,  # As decimal
+            'total_return_pct': total_return_pct,  # As percentage for backwards compatibility
+            'annualized_return': annualized_return,
             'sharpe_ratio': sharpe_ratio,
+            'sortino_ratio': sortino_ratio,
             'max_drawdown_pct': max_drawdown,
             'total_trades': len(trades),
             'win_rate': win_rate,
             'profit_factor': profit_factor,
+            'trades_per_day': trades_per_day,
+            'total_fees': total_fees,
+            'avg_leverage': avg_leverage,
             'trades': trades,
             'equity_history': equity_history,
             'funding_pnl_total': funding_pnl_total,

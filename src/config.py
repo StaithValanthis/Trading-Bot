@@ -191,7 +191,8 @@ class OptimizerConfig:
         "ma_long": [80, 100, 120, 150],
         "momentum_lookback": [12, 24, 36, 48],
         "atr_stop_multiplier": [2.0, 2.5, 3.0],
-        "top_k": [2, 3, 4, 5]
+        "top_k": [2, 3, 4, 5],
+        "ranking_window": [12, 18, 24, 36, 48]  # Bars for ranking lookback (timeframe-dependent)
     })
 
 

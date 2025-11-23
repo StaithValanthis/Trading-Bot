@@ -318,13 +318,15 @@ class TimeframeAnalyzer:
                     continue
                 
                 # Calculate additional metrics
+                equity_history = backtest_result.get('equity_history', [])
                 tf_result = self._calculate_metrics(
                     backtest_result,
                     tf,
                     symbol_data,
                     common_timestamps,
                     is_oos_split,
-                    classify_regimes
+                    classify_regimes,
+                    equity_history
                 )
                 
                 results.append(tf_result)
