@@ -164,6 +164,11 @@ main() {
         error_exit "src/main.py not found. Are you in the project root?"
     fi
     
+    # Check if src/cli/main.py exists (actual CLI entrypoint)
+    if [ ! -f "$BOT_DIR/src/cli/main.py" ]; then
+        error_exit "src/cli/main.py not found. Project structure may be incomplete."
+    fi
+    
     # Check if requirements.txt exists
     if [ ! -f "$BOT_DIR/requirements.txt" ]; then
         error_exit "requirements.txt not found in $BOT_DIR"
@@ -172,6 +177,62 @@ main() {
     # Check if config.example.yaml exists
     if [ ! -f "$BOT_DIR/config.example.yaml" ]; then
         warn "config.example.yaml not found. You'll need to create config.yaml manually."
+    fi
+    
+    # Verify critical modules exist
+    CRITICAL_MODULES=(
+        "src/config.py"
+        "src/exchange/bybit_client.py"
+        "src/data/ohlcv_store.py"
+        "src/data/downloader.py"
+        "src/execution/executor.py"
+        "src/state/portfolio.py"
+        "src/backtest/backtester.py"
+        "src/optimizer/optimizer.py"
+        "src/optimizer/timeframe_analyzer.py"
+        "src/signals/trend.py"
+        "src/signals/cross_sectional.py"
+        "src/risk/position_sizing.py"
+        "src/risk/portfolio_limits.py"
+        "src/universe/selector.py"
+        "src/universe/store.py"
+    )
+    
+    MISSING_MODULES=()
+    for module in "${CRITICAL_MODULES[@]}"; do
+        if [ ! -f "$BOT_DIR/$module" ]; then
+            MISSING_MODULES+=("$module")
+        fi
+    done
+    
+    if [ ${#MISSING_MODULES[@]} -gt 0 ]; then
+        warn "Some critical modules are missing:"
+        for module in "${MISSING_MODULES[@]}"; do
+            warn "  - $module"
+        done
+        if [ "$NON_INTERACTIVE" != "true" ]; then
+            read -p "Continue anyway? (y/N) " -n 1 -r
+            echo
+            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                exit 1
+            fi
+        fi
+    else
+        info "All critical modules found"
+    fi
+    
+    # Verify scripts directory exists (optional, scripts are standalone)
+    if [ ! -d "$BOT_DIR/scripts" ]; then
+        warn "scripts/ directory not found (optional, for standalone analysis scripts)"
+    else
+        info "scripts/ directory found"
+        # Check for important scripts
+        if [ -f "$BOT_DIR/scripts/optimize_and_compare_timeframes.py" ]; then
+            info "  ✓ optimize_and_compare_timeframes.py found"
+        fi
+        if [ -f "$BOT_DIR/scripts/download_historical_data.py" ]; then
+            info "  ✓ download_historical_data.py found"
+        fi
     fi
     
     info "Project files verified"
@@ -218,18 +279,22 @@ main() {
     # ============================================================
     step "6/11" "Creating directories..."
     
+    # Create core directories
     mkdir -p "$BOT_DIR/data" || error_exit "Failed to create data directory"
     mkdir -p "$BOT_DIR/logs" || error_exit "Failed to create logs directory"
     
+    # Create results directory for optimizer/analysis outputs
+    mkdir -p "$BOT_DIR/results" || warn "Failed to create results directory (non-critical)"
+    
     # Set permissions
-    chmod 755 "$BOT_DIR/data" "$BOT_DIR/logs" || warn "Failed to set directory permissions"
+    chmod 755 "$BOT_DIR/data" "$BOT_DIR/logs" "$BOT_DIR/results" 2>/dev/null || warn "Failed to set directory permissions"
     
     # Set ownership if running as root
     if [ "$EUID" -eq 0 ] && [ "$SERVICE_USER" != "root" ]; then
-        chown -R "$SERVICE_USER:$SERVICE_USER" "$BOT_DIR/data" "$BOT_DIR/logs" || warn "Failed to set directory ownership"
+        chown -R "$SERVICE_USER:$SERVICE_USER" "$BOT_DIR/data" "$BOT_DIR/logs" "$BOT_DIR/results" 2>/dev/null || warn "Failed to set directory ownership"
     fi
     
-    info "Directories created"
+    info "Directories created: data/, logs/, results/"
     echo ""
     
     # ============================================================
@@ -634,21 +699,28 @@ EOF
     echo "4. Test universe optimization (optional):"
     echo "   python -m src.main optimize-universe --config config.yaml --start 2023-01-01 --end 2024-01-01 --n-combinations 50"
     echo ""
+    echo "5. Run timeframe comparison analysis (optional, requires historical data):"
+    echo "   python scripts/optimize_and_compare_timeframes.py --config config.yaml --start 2022-01-01 --end 2024-12-31"
+    echo ""
     echo -e "${RED}IMPORTANT: Before starting live trading:${NC}"
     echo ""
     echo "   - Set exchange.mode to 'testnet' or 'paper' in config.yaml"
     echo "   - Test thoroughly in testnet/paper mode first"
     echo "   - Only set exchange.mode to 'live' when ready for real trading"
     echo ""
-    echo "5. Start the bot (when ready):"
+    echo "6. Start the bot (when ready):"
     echo "   sudo systemctl start $SERVICE_NAME"
     echo ""
-    echo "6. Monitor the bot:"
+    echo "7. Monitor the bot:"
     echo "   sudo systemctl status $SERVICE_NAME"
     echo "   sudo journalctl -u $SERVICE_NAME -f"
     echo ""
-    echo "7. Check scheduled tasks:"
+    echo "8. Check scheduled tasks:"
     echo "   sudo systemctl list-timers ${SERVICE_NAME}-*"
+    echo ""
+    echo "9. Available analysis scripts:"
+    echo "   - scripts/optimize_and_compare_timeframes.py - Compare timeframes with optimized parameters"
+    echo "   - scripts/download_historical_data.py - Download historical OHLCV data"
     echo ""
     echo -e "${GREEN}For more information, see README.md${NC}"
     echo ""
