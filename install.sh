@@ -542,7 +542,7 @@ User=$SERVICE_USER
 WorkingDirectory=$BOT_DIR
 EnvironmentFile=$ENV_FILE
 Environment="PATH=$VENV_DIR/bin"
-ExecStart=$VENV_DIR/bin/python -m src.main --config $CONFIG_FILE optimize
+ExecStart=$VENV_DIR/bin/python -m src.main --config $CONFIG_FILE optimize --use-universe-history
 StandardOutput=journal
 StandardError=journal
 
