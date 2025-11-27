@@ -523,6 +523,7 @@ class Optimizer:
                             f"Current config baseline performance: Sharpe={avg_sharpe:.2f} "
                             f"(IS={avg_sharpe_is:.2f}, OOS={avg_sharpe_oos:.2f}), "
                             f"Return={avg_return:+.2f}%, DD={avg_dd:.2f}%"
+                        )
             except Exception as e:
                 self.logger.warning(f"Error testing parameter set {i}: {e}")
                 continue
