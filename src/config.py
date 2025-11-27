@@ -34,6 +34,9 @@ class ExchangeConfig:
     api_secret: Optional[str] = None
     symbols: List[str] = field(default_factory=lambda: ["BTCUSDT", "ETHUSDT"])
     timeframe: str = "4h"
+    taker_fee: float = 0.00055  # Default Bybit taker fee
+    funding_rate_per_8h: float = 0.0  # Optional constant funding assumption for backtests
+    symbol_funding_rates: Dict[str, float] = field(default_factory=dict)
     
     def __post_init__(self):
         """Load API keys from environment if not provided."""
@@ -186,6 +189,14 @@ class OptimizerConfig:
     max_drawdown_pct: float = -15.0
     search_method: str = "random"  # grid, random, bayesian
     n_trials: int = 50
+    random_seed: Optional[int] = None
+    min_positive_windows: float = 0.5
+    max_oos_sharpe_std: Optional[float] = None
+    max_worst_oos_dd: Optional[float] = None
+    walk_forward_folds: int = 1
+    sample_method: str = "uniform"
+    coverage_warning_threshold: float = 1e-4
+    use_universe_history: bool = False
     param_ranges: Dict[str, List[Any]] = field(default_factory=lambda: {
         "ma_short": [15, 25, 30],
         "ma_long": [80, 100, 120, 150],

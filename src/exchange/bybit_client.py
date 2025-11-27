@@ -894,28 +894,60 @@ class BybitClient:
                 self.logger.debug(f"Could not fetch current price for {symbol} validation: {e}")
                 current_price = None
         
-        # Validate trigger price relative to current price
+        # Validate and adjust trigger price relative to current price, using tick size.
+        # This is critical for very low-priced symbols where naive rounding can push
+        # the trigger back to/beyond the current price and cause Bybit error 110093.
         if current_price is not None:
+            try:
+                market_info = self.get_market_info(symbol)
+                precision = market_info['precision']['price']
+                # Derive tick size from precision if it's a float, otherwise fall back
+                # to a reasonable default using decimals.
+                if isinstance(precision, float) and precision > 0:
+                    tick_size = precision
+                else:
+                    decimals = self._precision_to_decimals(precision)
+                    tick_size = 10 ** (-decimals) if decimals > 0 else 0.0001
+            except Exception as e:
+                self.logger.warning(f"Could not determine tick size for {symbol}: {e}")
+                tick_size = 0.0001
+            
             if side.lower() == 'sell':
-                # SELL stop (closing long): trigger should be below current price
-                if trigger_price >= current_price:
+                # SELL stop (closing long): trigger must be strictly below current price.
+                # Start with either the requested trigger or 2% below current, then
+                # round DOWN to the nearest tick to guarantee < current.
+                desired = min(trigger_price, current_price * 0.98)
+                # Floor to tick grid
+                adjusted = math.floor(desired / tick_size) * tick_size
+                # Ensure strictly below current price
+                if adjusted >= current_price:
+                    adjusted = math.floor((current_price - tick_size) / tick_size) * tick_size
+                if adjusted <= 0:
+                    adjusted = tick_size
+                
+                if adjusted != trigger_price:
                     self.logger.warning(
-                        f"Stop-loss trigger price ({trigger_price}) is at or above current price "
+                        f"Stop-loss trigger price ({trigger_price}) is at or above/too close to current price "
                         f"({current_price}) for SELL stop order (long position). "
-                        f"Adjusting trigger to {current_price * 0.99:.2f} (1% below current)..."
+                        f"Adjusting trigger to {adjusted:.8f} (<= current, using tick_size={tick_size})..."
                     )
-                    trigger_price = current_price * 0.99  # Adjust to 1% below current
-                    trigger_price = self.round_price(symbol, trigger_price)
+                trigger_price = adjusted
+            
             elif side.lower() == 'buy':
-                # BUY stop (closing short): trigger should be above current price
-                if trigger_price <= current_price:
+                # BUY stop (closing short): trigger must be strictly above current price.
+                desired = max(trigger_price, current_price * 1.02)
+                # Ceil to tick grid
+                adjusted = math.ceil(desired / tick_size) * tick_size
+                if adjusted <= current_price:
+                    adjusted = math.ceil((current_price + tick_size) / tick_size) * tick_size
+                
+                if adjusted != trigger_price:
                     self.logger.warning(
-                        f"Stop-loss trigger price ({trigger_price}) is at or below current price "
+                        f"Stop-loss trigger price ({trigger_price}) is at or below/too close to current price "
                         f"({current_price}) for BUY stop order (short position). "
-                        f"Adjusting trigger to {current_price * 1.01:.2f} (1% above current)..."
+                        f"Adjusting trigger to {adjusted:.8f} (>= current, using tick_size={tick_size})..."
                     )
-                    trigger_price = current_price * 1.01  # Adjust to 1% above current
-                    trigger_price = self.round_price(symbol, trigger_price)
+                trigger_price = adjusted
         
         # Build parameters matching Bybit v5 API format
         # CRITICAL: All numeric values (qty, triggerPrice, price) must be strings

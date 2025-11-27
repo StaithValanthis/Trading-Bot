@@ -1032,11 +1032,15 @@ def run_live(config_path: str):
                             logger.warning(f"Skipping {symbol}: {error}")
                             continue
                         
+                        # Fetch market info once for sizing/risk logging
+                        market_info = exchange.get_market_info(symbol)
+                        contract_size = market_info.get('contractSize', 1.0)
+                        
                         # Log risk calculation for transparency
                         stop_distance = abs(stop_loss - entry_price) if signal == 'short' else abs(entry_price - stop_loss)
                         target_risk = portfolio.equity * config.risk.per_trade_risk_fraction
-                        calculated_risk = size * stop_distance * market_info.get('contractSize', 1.0)
-                        notional_at_size = size * entry_price * market_info.get('contractSize', 1.0)
+                        calculated_risk = size * stop_distance * contract_size
+                        notional_at_size = size * entry_price * contract_size
                         stop_distance_pct = (stop_distance / entry_price) * 100
                         logger.info(
                             f"Position sizing for {symbol}: "
@@ -1054,7 +1058,7 @@ def run_live(config_path: str):
                         )
                         
                         if adjusted_size != size:
-                            adjusted_risk = adjusted_size * stop_distance
+                            adjusted_risk = adjusted_size * stop_distance * contract_size
                             adjusted_notional = adjusted_size * entry_price * contract_size
                             logger.debug(
                                 f"Funding bias adjustment for {symbol}: "
@@ -1064,8 +1068,6 @@ def run_live(config_path: str):
                             )
                         
                         # Check leverage limits (always required, not dependent on other positions)
-                        market_info = exchange.get_market_info(symbol)
-                        contract_size = market_info.get('contractSize', 1.0)
                         notional = adjusted_size * entry_price * contract_size
                         
                         within_limits, limit_error = portfolio_limits.check_leverage_limit(
@@ -1092,8 +1094,8 @@ def run_live(config_path: str):
                             # Log scaling impact on risk
                             if adjusted_size != size_before_scale:
                                 stop_distance = abs(stop_loss - entry_price) if signal == 'short' else abs(entry_price - stop_loss)
-                                risk_before = size_before_scale * stop_distance
-                                risk_after = adjusted_size * stop_distance
+                                risk_before = size_before_scale * stop_distance * contract_size
+                                risk_after = adjusted_size * stop_distance * contract_size
                                 logger.info(
                                     f"Scaled {symbol} position for leverage limits: "
                                     f"{size_before_scale:.6f} → {adjusted_size:.6f} contracts, "
@@ -1521,7 +1523,7 @@ def run_health(config_path: str):
         sys.exit(1)
 
 
-def run_optimize(config_path: str):
+def run_optimize(config_path: str, use_universe_history: bool = False):
     """Run parameter optimization."""
     # Load config FIRST
     config = BotConfig.from_yaml(config_path)
@@ -1550,12 +1552,15 @@ def run_optimize(config_path: str):
     target_symbols = config.exchange.symbols if config.exchange.symbols else []
     
     # Ensure data exists for target symbols (download if missing)
+    since_timestamp: Optional[int] = None
+
     if target_symbols:
         logger.info(f"Ensuring data exists for {len(target_symbols)} target symbols: {', '.join(target_symbols)}")
         
         # Check what data exists and download missing data
         lookback_days = max(config.optimizer.lookback_months * 30, 60)  # At least 60 days
         since = int((datetime.now() - timedelta(days=lookback_days)).timestamp() * 1000)
+        since_timestamp = since
         
         for symbol in target_symbols:
             try:
@@ -1605,6 +1610,7 @@ def run_optimize(config_path: str):
         
         results = cursor.fetchall()
         conn.close()
+        since_timestamp = min_timestamp
         
         if results:
             target_symbols = [row[0] for row in results]
@@ -1617,10 +1623,25 @@ def run_optimize(config_path: str):
             logger.error("3. Manually download data for your desired symbols")
             sys.exit(1)
     
+    universe_history = None
+    if use_universe_history and since_timestamp is not None:
+        try:
+            universe_store = UniverseStore(config.data.db_path)
+            start_dt = datetime.fromtimestamp(since_timestamp / 1000).date()
+            end_dt = datetime.now(timezone.utc).date()
+            universe_history = universe_store.build_universe_history(start_dt, end_dt)
+            logger.info(f"Loaded universe history for optimizer ({len(universe_history)} days)")
+        except Exception as e:
+            logger.warning(f"Failed to load universe history: {e}")
+
     optimizer = Optimizer(config, store)
     
     # Run optimization
-    result = optimizer.optimize(target_symbols, config.exchange.timeframe)
+    result = optimizer.optimize(
+        target_symbols,
+        config.exchange.timeframe,
+        universe_history=universe_history,
+    )
     
     if 'error' in result:
         error_msg = result['error']
@@ -1640,8 +1661,12 @@ def run_optimize(config_path: str):
         
         sys.exit(1)
     
-    # Compare with current
-    comparison = optimizer.compare_with_current(result['best_params'])
+    # Compare with current (including performance metrics if available)
+    comparison = optimizer.compare_with_current(
+        result['best_params'],
+        best_metrics=result.get('best_metrics'),
+        current_metrics=result.get('current_config_metrics')
+    )
     result['comparison'] = comparison
     
     # Print results
@@ -1649,13 +1674,30 @@ def run_optimize(config_path: str):
     print("OPTIMIZATION RESULTS")
     print("="*60)
     print(f"Best Parameters: {result['best_params']}")
-    print(f"Metrics:")
+    print(f"\nBest Parameters Metrics:")
     metrics = result['best_metrics']
     print(f"  Avg Return: {metrics['avg_return_pct']:+.2f}%")
     print(f"  Avg Sharpe: {metrics['avg_sharpe']:.2f}")
+    if 'avg_sharpe_oos' in metrics:
+        print(f"    (IS: {metrics.get('avg_sharpe_is', metrics['avg_sharpe']):.2f}, OOS: {metrics.get('avg_sharpe_oos', metrics['avg_sharpe']):.2f})")
     print(f"  Avg Drawdown: {metrics['avg_drawdown_pct']:.2f}%")
     print(f"  Avg Trades: {metrics['avg_trades']:.0f}")
-    print(f"\nComparison: {comparison['recommendation'] if comparison.get('should_update') else 'No update needed'}")
+    
+    # Show current config comparison if available
+    if comparison.get('performance_comparison'):
+        perf = comparison['performance_comparison']
+        print(f"\nCurrent Config Metrics (baseline):")
+        print(f"  Avg Return: {perf['current']['return_pct']:+.2f}%")
+        print(f"  Avg Sharpe: {perf['current']['sharpe']:.2f}")
+        print(f"  Avg Drawdown: {perf['current']['drawdown_pct']:.2f}%")
+        print(f"  Avg Trades: {perf['current']['trades']:.0f}")
+        print(f"\nPerformance Improvements:")
+        impr = perf['improvements']
+        print(f"  Sharpe: {impr['sharpe']:+.2f}")
+        print(f"  Return: {impr['return_pct']:+.2f}%")
+        print(f"  Drawdown: {impr['drawdown_pct']:+.2f}%")
+    
+    print(f"\nRecommendation: {comparison['recommendation'] if comparison.get('should_update') else 'No update needed'}")
     print("="*60)
     
     # Save result
@@ -1994,6 +2036,11 @@ def main():
     
     # Optimize command
     optimize_parser = subparsers.add_parser('optimize', help='Run strategy parameter optimization')
+    optimize_parser.add_argument(
+        '--use-universe-history',
+        action='store_true',
+        help='Use stored universe history to avoid look-ahead during optimization'
+    )
     
     # Optimize universe command
     optimize_universe_parser = subparsers.add_parser('optimize-universe', help='Run universe parameter optimization')
@@ -2047,7 +2094,7 @@ def main():
     elif args.command == 'backtest':
         run_backtest(config_path, getattr(args, 'symbols', None), getattr(args, 'output', None))
     elif args.command == 'optimize':
-        run_optimize(config_path)
+        run_optimize(config_path, getattr(args, 'use_universe_history', False))
     elif args.command == 'optimize-universe':
         run_optimize_universe(
             config_path,

@@ -269,25 +269,46 @@ class DiscordReporter:
             conn = sqlite3.connect(db_path)
             cursor = conn.cursor()
             
-            # Get latest optimization result
-            cursor.execute("""
-                SELECT timestamp, params_changed
-                FROM optimization_results
-                WHERE should_update = 1
-                ORDER BY timestamp DESC
-                LIMIT 1
-            """)
+            # Get latest optimization result (try to get performance_comparison if column exists)
+            try:
+                cursor.execute("""
+                    SELECT timestamp, params_changed, performance_comparison
+                    FROM optimization_results
+                    WHERE should_update = 1
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                """)
+                result = cursor.fetchone()
+                if result:
+                    timestamp, params_changed_json, perf_comp_json = result
+                    params_changed = json.loads(params_changed_json) if params_changed_json else {}
+                    performance_comparison = json.loads(perf_comp_json) if perf_comp_json else None
+                else:
+                    result = None
+            except sqlite3.OperationalError:
+                # Column doesn't exist yet (old DB schema)
+                cursor.execute("""
+                    SELECT timestamp, params_changed
+                    FROM optimization_results
+                    WHERE should_update = 1
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                """)
+                result = cursor.fetchone()
+                if result:
+                    timestamp, params_changed_json = result
+                    params_changed = json.loads(params_changed_json) if params_changed_json else {}
+                    performance_comparison = None
+                else:
+                    result = None
             
-            result = cursor.fetchone()
             conn.close()
             
             if result:
-                timestamp, params_changed_json = result
-                params_changed = json.loads(params_changed_json) if params_changed_json else {}
-                
                 return {
-                    'timestamp': timestamp,
-                    'params_changed': params_changed
+                    'timestamp': timestamp if 'timestamp' in locals() else result[0],
+                    'params_changed': params_changed if 'params_changed' in locals() else {},
+                    'performance_comparison': performance_comparison if 'performance_comparison' in locals() else None
                 }
             
             return None
@@ -419,6 +440,22 @@ class DiscordReporter:
                 f"• **{param}**: {change['old']} → {change['new']}"
                 for param, change in optimizer_changes['params_changed'].items()
             ])
+            
+            # Add performance comparison if available
+            perf_comp = optimizer_changes.get('performance_comparison')
+            if perf_comp:
+                impr = perf_comp['improvements']
+                perf_text = "\n**Performance vs Current:**\n"
+                if impr['sharpe'] > 0.01:
+                    perf_text += f"• Sharpe: +{impr['sharpe']:.2f}\n"
+                if impr['return_pct'] > 0:
+                    perf_text += f"• Return: +{impr['return_pct']:.2f}%\n"
+                if impr['drawdown_pct'] > 0:
+                    perf_text += f"• Drawdown: {impr['drawdown_pct']:+.2f}%\n"
+                
+                if perf_text != "\n**Performance vs Current:**\n":
+                    params_text += "\n" + perf_text
+            
             fields.append({
                 'name': '🔧 Parameter Updates',
                 'value': params_text,

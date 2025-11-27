@@ -1,15 +1,19 @@
 """Parameter optimization with walk-forward analysis."""
 
 import json
-import sqlite3
+import math
 import random
-from typing import Dict, List, Optional, Tuple, Any
-from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple, Any, Set
+from datetime import datetime, timedelta, date
 from pathlib import Path
+import uuid
+import sqlite3
+import numpy as np
 
 from ..config import BotConfig, TrendStrategyConfig, CrossSectionalStrategyConfig
 from ..backtest.backtester import Backtester
 from ..data.ohlcv_store import OHLCVStore
+from .store import OptimizerStore
 from ..logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -30,13 +34,16 @@ class Optimizer:
         self.store = ohlcv_store
         self.logger = get_logger(__name__)
         self.backtester = Backtester(config)
+        # OptimizerStore shares the same SQLite DB as OHLCV/universe
+        self.optimizer_store = OptimizerStore(ohlcv_store.db_path)
     
     def optimize(
         self,
         symbols: List[str],
         timeframe: str,
         start_date: Optional[datetime] = None,
-        end_date: Optional[datetime] = None
+        end_date: Optional[datetime] = None,
+        universe_history: Optional[Dict[date, Set[str]]] = None,
     ) -> Dict:
         """
         Run parameter optimization.
@@ -50,7 +57,28 @@ class Optimizer:
         Returns:
             Dictionary with optimization results
         """
-        self.logger.info(f"Starting optimization for {len(symbols)} symbols")
+        self.logger.info(f"Starting optimization for {len(symbols)} symbols at timeframe {timeframe}")
+        
+        # Store the optimization timeframe to ensure all test configs use it
+        self.optimization_timeframe = timeframe
+
+        # Create a persistent run record for this optimization
+        run_id = uuid.uuid4().hex
+        start_date_str = start_date.isoformat() if start_date else None
+        end_date_str = end_date.isoformat() if end_date else None
+        try:
+            self.optimizer_store.create_run(
+                run_id=run_id,
+                timeframe=timeframe,
+                symbols=symbols,
+                start_date=start_date_str,
+                end_date=end_date_str,
+                config_version=getattr(self.config, "config_version", None),
+            )
+        except Exception as e:
+            # Non-fatal: optimization can still proceed without DB tracking
+            self.logger.warning(f"Could not create optimizer run record: {e}")
+            run_id = None
         
         # Load historical data
         if start_date is not None:
@@ -158,23 +186,88 @@ class Optimizer:
             return {'error': error_msg}
         
         # Generate parameter sets
+        rng = random
+        seed = getattr(self.config.optimizer, "random_seed", None)
+        if seed is not None:
+            rng = random.Random(seed)
+
+        param_ranges = self.config.optimizer.param_ranges
+        sample_method = getattr(self.config.optimizer, "sample_method", "uniform")
+        total_combinations = 1
+        for values in param_ranges.values():
+            total_combinations *= max(1, len(values))
+
+        if (
+            self.config.optimizer.search_method == 'random'
+            and total_combinations > 0
+            and getattr(self.config.optimizer, "coverage_warning_threshold", 1e-4) > 0
+        ):
+            coverage = self.config.optimizer.n_trials / total_combinations
+            if coverage < self.config.optimizer.coverage_warning_threshold:
+                self.logger.warning(
+                    "Optimizer sampling coverage is very low (%.6f%% of parameter space). "
+                    "Consider increasing n_trials or narrowing param_ranges.",
+                    coverage * 100,
+                )
+
         if self.config.optimizer.search_method == 'random':
             param_sets = self._generate_random_params(
                 self.config.optimizer.n_trials,
-                self.config.optimizer.param_ranges
+                param_ranges,
+                rng=rng,
+                method=sample_method,
             )
         elif self.config.optimizer.search_method == 'grid':
             param_sets = self._generate_grid_params(
-                self.config.optimizer.param_ranges
+                param_ranges
             )
         else:
             # Default to random
             param_sets = self._generate_random_params(
                 self.config.optimizer.n_trials,
-                self.config.optimizer.param_ranges
+                param_ranges,
+                rng=rng,
+                method=sample_method,
             )
         
-        self.logger.info(f"Testing {len(param_sets)} parameter sets")
+        # Always include current config parameters as the first test (baseline)
+        current_params = self._get_current_params()
+        
+        # Only add if not already in the list (avoids duplicate testing)
+        if current_params not in param_sets:
+            param_sets.insert(0, current_params)
+            self.logger.info(f"Added current config parameters as baseline (test #0)")
+        
+        # Include top historical performers as seeds (hall of fame)
+        # This ensures proven parameter sets continue to be tested over time
+        try:
+            top_historical = self.optimizer_store.get_top_historical_parameters(
+                timeframe=timeframe,
+                min_oos_sharpe=0.5,  # Only include decent performers
+                min_trades_oos=10,  # Need sufficient trades for reliability
+                top_n=5,  # Include top 5 historical performers
+                days_lookback=180,  # Last 6 months
+            )
+            
+            seeds_added = 0
+            for hist_param in top_historical:
+                hist_params = hist_param["params"]
+                # Only add if not already in the list and not the current config
+                if hist_params not in param_sets and hist_params != current_params:
+                    param_sets.append(hist_params)
+                    seeds_added += 1
+                    self.logger.info(
+                        f"Added top historical performer (Sharpe OOS: {hist_param['avg_sharpe_oos']:.2f}, "
+                        f"seen in {hist_param['run_count']} runs): {hist_params}"
+                    )
+            
+            if seeds_added > 0:
+                self.logger.info(f"Added {seeds_added} top historical parameter sets as seeds")
+        except Exception as e:
+            # Non-fatal: optimization can proceed without historical seeds
+            self.logger.warning(f"Could not load historical top performers: {e}")
+        
+        self.logger.info(f"Testing {len(param_sets)} parameter sets (current config baseline + historical seeds + new candidates)")
         
         # Calculate total data available and adjust criteria if limited
         total_bars = sum(len(df) for df in symbol_data.values())
@@ -223,12 +316,18 @@ class Optimizer:
             f"estimated time: ~{estimated_windows * len(param_sets) * 2 / 60:.1f} minutes (assuming ~2s per window)"
         )
         
+        best_oos_sharpe = None
+        best_oos_params = None
+        current_config_metrics = None  # Track performance of current config
+
+        collected_all_results = []
+
         for i, params in enumerate(param_sets):
             try:
                 param_start_time = time_module.time()
                 
                 # Create config with these parameters
-                test_config = self._create_test_config(params)
+                test_config = self._create_test_config(params, timeframe)
 
                 # Run walk-forward backtests
                 self.logger.debug(f"Parameter set {i+1}/{len(param_sets)}: Starting walk-forward backtest...")
@@ -236,6 +335,7 @@ class Optimizer:
                     symbol_data,
                     test_config,
                     walk_forward_window_days,
+                    universe_history=universe_history,
                 )
                 param_elapsed = time_module.time() - param_start_time
                 
@@ -253,6 +353,11 @@ class Optimizer:
                     split_idx = max(1, int(n_windows * 0.7))
                     is_results = walk_forward_results[:split_idx]
                     oos_results = walk_forward_results[split_idx:] or walk_forward_results
+                    oos_eval = oos_results
+                    if len(oos_results) > 1:
+                        oos_eval = oos_results[1:]
+                    if not oos_eval:
+                        oos_eval = oos_results
 
                     def _agg(results_list):
                         return (
@@ -267,7 +372,7 @@ class Optimizer:
                         is_results
                     )
                     avg_return_oos, avg_sharpe_oos, avg_dd_oos, avg_trades_oos, min_trades_oos = _agg(
-                        oos_results
+                        oos_eval
                     )
 
                     # Combined stats (for backwards compatibility)
@@ -315,6 +420,9 @@ class Optimizer:
 
                     # Store all results with sufficient trades for ranking
                     # We'll rank them and pick the best even if none meet strict criteria
+                    positive_windows = sum(1 for r in walk_forward_results if r.get("total_return_pct", 0) > 0)
+                    window_success_ratio = positive_windows / len(walk_forward_results) if walk_forward_results else 0.0
+
                     all_results = {
                         "params": params,
                         "avg_return_pct": avg_return,
@@ -330,7 +438,8 @@ class Optimizer:
                         "avg_dd_oos": avg_dd_oos,
                         "passes_is": passes_is,
                         "passes_oos": passes_oos,
-                        "passes_all": passes_is and passes_oos
+                        "passes_all": passes_is and passes_oos,
+                        "positive_window_ratio": window_success_ratio,
                     }
                     
                     # Store results based on priority:
@@ -357,6 +466,9 @@ class Optimizer:
                                 f"even though IS failed (IS: sharpe={avg_sharpe_is:.2f}, limited data: ~{total_days:.0f} days)"
                             )
                     
+                    # Always collect for fallback ranking and diagnostics
+                    collected_all_results.append(all_results)
+
                     # For limited data, also store ALL results with sufficient trades for fallback ranking
                     # This ensures we always have something to return, even if nothing meets strict criteria
                     if not already_added and total_days < 180 and min_trades_oos >= 5:
@@ -368,23 +480,81 @@ class Optimizer:
                                 f"limited data: {total_days:.0f} days)"
                             )
 
-                    if (i + 1) % 10 == 0:
-                        self.logger.info(
-                            f"Tested {i + 1}/{len(param_sets)} parameter sets"
-                        )
+                    # Persist per-parameter-set metrics to DB (best-effort)
+                    try:
+                        if run_id is not None:
+                            # Calculate return percentages for IS and OOS
+                            return_pct_is = np.mean([r["total_return_pct"] for r in is_results]) if is_results else None
+                            return_pct_oos = np.mean([r["total_return_pct"] for r in oos_eval]) if oos_eval else None
+                            
+                            self.optimizer_store.add_param_result(
+                                run_id=run_id,
+                                param_index=i + 1,
+                                params=params,
+                                sharpe_is=avg_sharpe_is,
+                                sharpe_oos=avg_sharpe_oos,
+                                dd_is=avg_dd_is,
+                                dd_oos=avg_dd_oos,
+                                trades_is=int(min_trades_is),
+                                trades_oos=int(min_trades_oos),
+                                accepted=passes_is and passes_oos,
+                                return_pct_is=return_pct_is,
+                                return_pct_oos=return_pct_oos,
+                            )
+                    except Exception as e:
+                        self.logger.warning(f"Failed to persist param result for set {i+1}: {e}")
 
+                    # Track best OOS Sharpe for best-parameters registry
+                    if passes_oos and (best_oos_sharpe is None or avg_sharpe_oos > best_oos_sharpe):
+                        best_oos_sharpe = avg_sharpe_oos
+                        best_oos_params = params
+                    
+                    # If this is the current config (test #0), store its metrics for comparison
+                    if i == 0 and params == self._get_current_params():
+                        current_config_metrics = {
+                            'avg_return_pct': avg_return,
+                            'avg_sharpe': avg_sharpe,
+                            'avg_drawdown_pct': avg_dd,
+                            'avg_trades': avg_trades,
+                            'avg_sharpe_oos': avg_sharpe_oos,
+                            'avg_sharpe_is': avg_sharpe_is
+                        }
+                        self.logger.info(
+                            f"Current config baseline performance: Sharpe={avg_sharpe:.2f} "
+                            f"(IS={avg_sharpe_is:.2f}, OOS={avg_sharpe_oos:.2f}), "
+                            f"Return={avg_return:+.2f}%, DD={avg_dd:.2f}%"
             except Exception as e:
                 self.logger.warning(f"Error testing parameter set {i}: {e}")
                 continue
+
+        # Mark run status and update best-parameter registry
+        if run_id is not None:
+            try:
+                self.optimizer_store.update_run_status(run_id, "completed")
+            except Exception as e:
+                self.logger.warning(f"Failed to update optimizer run status: {e}")
+
+            if best_oos_sharpe is not None and best_oos_params is not None:
+                try:
+                    self.optimizer_store.upsert_best_parameters(
+                        timeframe=timeframe,
+                        symbols=list(symbol_data.keys()),
+                        config_version=getattr(self.config, "config_version", None),
+                        params=best_oos_params,
+                        sharpe_oos=best_oos_sharpe,
+                    )
+                except Exception as e:
+                    self.logger.warning(f"Failed to upsert best parameters: {e}")
         
         # Sort results - prioritize those that passed all criteria, then by OOS Sharpe
         if results:
             results.sort(
                 key=lambda x: (
-                    0 if x.get('passes_all', False) else 1,  # Passed all criteria first
-                    x.get('avg_sharpe_oos', x.get('avg_sharpe', -999))  # Then by OOS Sharpe
+                    0 if x.get('passes_all', False) else 1,
+                    x.get('avg_sharpe_oos', x.get('avg_sharpe', -999)),
+                    x.get('avg_dd_oos', x.get('avg_drawdown_pct', -999)),
                 ),
-                reverse=True
+                reverse=True,
             )
             
             best_result = results[0]
@@ -413,77 +583,38 @@ class Optimizer:
                     'avg_return_pct': best_result['avg_return_pct'],
                     'avg_sharpe': best_result['avg_sharpe'],
                     'avg_drawdown_pct': best_result['avg_drawdown_pct'],
-                    'avg_trades': best_result['avg_trades']
+                    'avg_trades': best_result['avg_trades'],
+                    'avg_sharpe_oos': best_result.get('avg_sharpe_oos', best_result['avg_sharpe']),
+                    'avg_sharpe_is': best_result.get('avg_sharpe_is', best_result['avg_sharpe'])
                 },
+                'current_config_metrics': current_config_metrics,  # Include for comparison
                 'all_results': results[:10],  # Top 10
                 'warning': None if best_result.get('passes_all', False) else 'Used best available parameters - strict criteria not met'
             }
         
-        # If still no results (shouldn't happen with fallback, but just in case)
-        # Even if none passed strict criteria, try to find the best based on OOS performance
-        # Collect all tested results that had some valid backtests
-        all_tested_results = []
-        for i, params in enumerate(param_sets):
-            try:
-                test_config = self._create_test_config(params)
-                walk_forward_results = self._walk_forward_backtest(
-                    symbol_data,
-                    test_config,
-                    walk_forward_window_days,
-                )
-                if walk_forward_results:
-                    n_windows = len(walk_forward_results)
-                    split_idx = int(n_windows * 0.7)
-                    is_results = walk_forward_results[:split_idx] if split_idx > 0 else walk_forward_results
-                    oos_results = walk_forward_results[split_idx:] or walk_forward_results
-                    
-                    def _agg(results_list):
-                        return (
-                            np.mean([r["total_return_pct"] for r in results_list]),
-                            np.mean([r["sharpe_ratio"] for r in results_list]),
-                            np.mean([r["max_drawdown_pct"] for r in results_list]),
-                            np.mean([r["total_trades"] for r in results_list]),
-                            min([r["total_trades"] for r in results_list]),
-                        )
-                    
-                    avg_return_oos, avg_sharpe_oos, avg_dd_oos, avg_trades_oos, min_trades_oos = _agg(oos_results)
-                    avg_return = np.mean([r["total_return_pct"] for r in walk_forward_results])
-                    avg_sharpe = np.mean([r["sharpe_ratio"] for r in walk_forward_results])
-                    avg_dd = np.mean([r["max_drawdown_pct"] for r in walk_forward_results])
-                    avg_trades = np.mean([r["total_trades"] for r in walk_forward_results])
-                    min_trades = min([r["total_trades"] for r in walk_forward_results])
-                    
-                    # Only include if it has reasonable number of trades
-                    if min_trades_oos >= 5 and avg_sharpe_oos > -2.0:
-                        all_tested_results.append({
-                            "params": params,
-                            "avg_return_pct": avg_return,
-                            "avg_sharpe": avg_sharpe,
-                            "avg_sharpe_oos": avg_sharpe_oos,
-                            "avg_drawdown_pct": avg_dd,
-                            "avg_trades": avg_trades,
-                            "min_trades": min_trades,
-                        })
-            except:
-                continue
-        
-        if all_tested_results:
-            # Sort by OOS Sharpe (most important for generalization)
-            all_tested_results.sort(key=lambda x: x.get('avg_sharpe_oos', x['avg_sharpe']), reverse=True)
-            best = all_tested_results[0]
+        # If no parameter set passed strict criteria, fall back to best available
+        if not results and collected_all_results:
+            collected_all_results.sort(
+                key=lambda x: (
+                    x.get('avg_sharpe_oos', x.get('avg_sharpe', -999)),
+                    x.get('avg_dd_oos', x.get('avg_drawdown_pct', -999)),
+                ),
+                reverse=True,
+            )
+            fallback = collected_all_results[0]
             self.logger.warning(
-                f"No parameter sets met strict criteria, but using best available: "
-                f"OOS Sharpe={best.get('avg_sharpe_oos', best['avg_sharpe']):.2f}, "
-                f"OOS trades={best['min_trades']:.0f}. "
-                f"This may not be optimal - consider using more historical data."
+                "No parameter sets met strict criteria; using best available: "
+                "OOS Sharpe=%.2f, trades=%d. Consider expanding data or relaxing thresholds.",
+                fallback.get('avg_sharpe_oos', fallback.get('avg_sharpe', 0)),
+                fallback.get('min_trades', 0)
             )
             return {
-                'best_params': best['params'],
+                'best_params': fallback['params'],
                 'best_metrics': {
-                    'avg_return_pct': best['avg_return_pct'],
-                    'avg_sharpe': best['avg_sharpe'],
-                    'avg_drawdown_pct': best['avg_drawdown_pct'],
-                    'avg_trades': best['avg_trades']
+                    'avg_return_pct': fallback['avg_return_pct'],
+                    'avg_sharpe': fallback['avg_sharpe'],
+                    'avg_drawdown_pct': fallback['avg_drawdown_pct'],
+                    'avg_trades': fallback['avg_trades']
                 },
                 'warning': 'Used best available parameters - strict criteria not met'
             }
@@ -519,15 +650,38 @@ class Optimizer:
             'all_results': results[:10]  # Top 10
         }
     
-    def _generate_random_params(self, n_trials: int, param_ranges: Dict) -> List[Dict]:
+    def _generate_random_params(
+        self,
+        n_trials: int,
+        param_ranges: Dict,
+        rng=random,
+        method: str = "uniform",
+    ) -> List[Dict]:
         """Generate random parameter sets."""
         param_sets = []
         
-        for _ in range(n_trials):
-            params = {}
-            for param_name, values in param_ranges.items():
-                params[param_name] = random.choice(values)
-            param_sets.append(params)
+        if method == "latin" and param_ranges:
+            param_names = list(param_ranges.keys())
+            buckets: Dict[str, List[Any]] = {}
+            for name, values in param_ranges.items():
+                if not values:
+                    buckets[name] = [None] * n_trials
+                    continue
+                repeated = []
+                while len(repeated) < n_trials:
+                    repeated.extend(values)
+                repeated = repeated[:n_trials]
+                rng.shuffle(repeated)
+                buckets[name] = repeated
+            for i in range(n_trials):
+                params = {name: buckets[name][i] for name in param_names}
+                param_sets.append(params)
+        else:
+            for _ in range(n_trials):
+                params = {}
+                for param_name, values in param_ranges.items():
+                    params[param_name] = rng.choice(values)
+                param_sets.append(params)
         
         return param_sets
     
@@ -545,11 +699,23 @@ class Optimizer:
         
         return param_sets
     
-    def _create_test_config(self, params: Dict) -> BotConfig:
-        """Create a test config with given parameters."""
+    def _create_test_config(self, params: Dict, timeframe: str) -> BotConfig:
+        """
+        Create a test config with given parameters.
+        
+        Args:
+            params: Parameter dictionary to test
+            timeframe: Timeframe to use for optimization (from config.yaml)
+        
+        Returns:
+            BotConfig with updated parameters and timeframe
+        """
         import copy
         
         test_config = copy.deepcopy(self.config)
+        
+        # Explicitly set the timeframe from config.yaml
+        test_config.exchange.timeframe = timeframe
         
         # Update trend parameters
         if 'ma_short' in params:
@@ -560,12 +726,18 @@ class Optimizer:
             test_config.strategy.trend.momentum_lookback = params['momentum_lookback']
         if 'atr_stop_multiplier' in params:
             test_config.strategy.trend.atr_stop_multiplier = params['atr_stop_multiplier']
+        if 'atr_period' in params:
+            test_config.strategy.trend.atr_period = params['atr_period']
         
         # Update cross-sectional parameters
         if 'top_k' in params:
             test_config.strategy.cross_sectional.top_k = params['top_k']
         if 'ranking_window' in params:
             test_config.strategy.cross_sectional.ranking_window = params['ranking_window']
+        if 'exit_band' in params:
+            test_config.strategy.cross_sectional.exit_band = params['exit_band']
+        if 'rebalance_frequency_hours' in params:
+            test_config.strategy.cross_sectional.rebalance_frequency_hours = params['rebalance_frequency_hours']
         
         return test_config
     
@@ -573,7 +745,8 @@ class Optimizer:
         self,
         symbol_data: Dict,
         test_config: BotConfig,
-        window_days: int
+        window_days: int,
+        universe_history: Optional[Dict[date, Set[str]]] = None,
     ) -> List[Dict]:
         """Run walk-forward backtests."""
         from ..backtest.backtester import Backtester
@@ -618,8 +791,23 @@ class Optimizer:
             if not window_data:
                 continue
             
+            window_universe = None
+            if universe_history:
+                window_universe = {
+                    day: members
+                    for day, members in universe_history.items()
+                    if window_start.date() <= day <= window_end.date()
+                }
+            
             try:
-                result = backtester.backtest(window_data)
+                result = backtester.backtest(
+                    window_data,
+                    taker_fee=test_config.exchange.taker_fee,
+                    funding_rate_per_8h=getattr(test_config.exchange, "funding_rate_per_8h", 0.0),
+                    universe_history=window_universe,
+                    stop_slippage_bps=test_config.risk.stop_slippage_bps,
+                    tp_slippage_bps=test_config.risk.tp_slippage_bps,
+                )
                 if 'error' not in result:
                     results.append(result)
             except Exception as e:
@@ -628,14 +816,9 @@ class Optimizer:
         
         return results
     
-    def compare_with_current(self, best_params: Dict) -> Dict:
-        """
-        Compare best parameters with current config.
-        
-        Returns:
-            Dictionary with comparison and recommendation
-        """
-        current_params = {
+    def _get_current_params(self) -> Dict:
+        """Extract current config parameters."""
+        params = {
             'ma_short': self.config.strategy.trend.ma_short,
             'ma_long': self.config.strategy.trend.ma_long,
             'momentum_lookback': self.config.strategy.trend.momentum_lookback,
@@ -643,6 +826,33 @@ class Optimizer:
             'top_k': self.config.strategy.cross_sectional.top_k,
             'ranking_window': self.config.strategy.cross_sectional.ranking_window
         }
+        # Add optional parameters if they exist in config
+        if hasattr(self.config.strategy.trend, 'atr_period'):
+            params['atr_period'] = self.config.strategy.trend.atr_period
+        if hasattr(self.config.strategy.cross_sectional, 'exit_band'):
+            params['exit_band'] = self.config.strategy.cross_sectional.exit_band
+        if hasattr(self.config.strategy.cross_sectional, 'rebalance_frequency_hours'):
+            params['rebalance_frequency_hours'] = self.config.strategy.cross_sectional.rebalance_frequency_hours
+        return params
+    
+    def compare_with_current(
+        self, 
+        best_params: Dict, 
+        best_metrics: Dict = None,
+        current_metrics: Dict = None
+    ) -> Dict:
+        """
+        Compare best parameters with current config, including performance metrics.
+        
+        Args:
+            best_params: Best parameters found by optimizer
+            best_metrics: Performance metrics for best parameters (optional)
+            current_metrics: Performance metrics for current config (optional)
+        
+        Returns:
+            Dictionary with comparison and recommendation
+        """
+        current_params = self._get_current_params()
         
         # Check if best params differ from current
         params_changed = {}
@@ -656,13 +866,62 @@ class Optimizer:
         if not params_changed:
             return {
                 'should_update': False,
-                'reason': 'Best parameters match current config'
+                'reason': 'Best parameters match current config',
+                'params_changed': {},
+                'performance_comparison': None
             }
+        
+        # Build recommendation with performance comparison if available
+        recommendation = 'Update config with new parameters'
+        performance_comparison = None
+        
+        if current_metrics and best_metrics:
+            # Calculate performance improvements
+            sharpe_improvement = best_metrics.get('avg_sharpe', 0) - current_metrics.get('avg_sharpe', 0)
+            return_improvement = best_metrics.get('avg_return_pct', 0) - current_metrics.get('avg_return_pct', 0)
+            dd_improvement = best_metrics.get('avg_drawdown_pct', 0) - current_metrics.get('avg_drawdown_pct', 0)
+            
+            performance_comparison = {
+                'current': {
+                    'sharpe': current_metrics.get('avg_sharpe', 0),
+                    'return_pct': current_metrics.get('avg_return_pct', 0),
+                    'drawdown_pct': current_metrics.get('avg_drawdown_pct', 0),
+                    'trades': current_metrics.get('avg_trades', 0)
+                },
+                'best': {
+                    'sharpe': best_metrics.get('avg_sharpe', 0),
+                    'return_pct': best_metrics.get('avg_return_pct', 0),
+                    'drawdown_pct': best_metrics.get('avg_drawdown_pct', 0),
+                    'trades': best_metrics.get('avg_trades', 0)
+                },
+                'improvements': {
+                    'sharpe': sharpe_improvement,
+                    'return_pct': return_improvement,
+                    'drawdown_pct': dd_improvement
+                }
+            }
+            
+            # Build recommendation based on performance
+            improvements = []
+            if sharpe_improvement > 0.1:
+                improvements.append(f"Sharpe +{sharpe_improvement:.2f}")
+            if return_improvement > 0:
+                improvements.append(f"Return +{return_improvement:.2f}%")
+            if dd_improvement > 0:  # Less negative is better
+                improvements.append(f"Drawdown {dd_improvement:+.2f}%")
+            
+            if improvements:
+                recommendation = f"Update recommended: {', '.join(improvements)}"
+            elif sharpe_improvement < -0.1:
+                recommendation = "CAUTION: New params have lower Sharpe. Current config may be better."
+            else:
+                recommendation = "Update suggested, but performance difference is minimal"
         
         return {
             'should_update': True,
             'params_changed': params_changed,
-            'recommendation': 'Update config with new parameters'
+            'recommendation': recommendation,
+            'performance_comparison': performance_comparison
         }
     
     def save_optimization_result(self, result: Dict, db_path: str):
@@ -679,26 +938,36 @@ class Optimizer:
                     best_params TEXT NOT NULL,
                     best_metrics TEXT NOT NULL,
                     should_update BOOLEAN,
-                    params_changed TEXT
+                    params_changed TEXT,
+                    performance_comparison TEXT
                 )
             """)
+            
+            # Add performance_comparison column if it doesn't exist (for existing DBs)
+            try:
+                cursor.execute("ALTER TABLE optimization_results ADD COLUMN performance_comparison TEXT")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
             
             # Insert result
             timestamp = int(datetime.now().timestamp())
             best_params_json = json.dumps(result.get('best_params', {}))
             best_metrics_json = json.dumps(result.get('best_metrics', {}))
-            params_changed_json = json.dumps(result.get('comparison', {}).get('params_changed', {}))
+            comparison = result.get('comparison', {})
+            params_changed_json = json.dumps(comparison.get('params_changed', {}))
+            performance_comparison_json = json.dumps(comparison.get('performance_comparison'))
             
             cursor.execute("""
                 INSERT INTO optimization_results
-                (timestamp, best_params, best_metrics, should_update, params_changed)
-                VALUES (?, ?, ?, ?, ?)
+                (timestamp, best_params, best_metrics, should_update, params_changed, performance_comparison)
+                VALUES (?, ?, ?, ?, ?, ?)
             """, (
                 timestamp,
                 best_params_json,
                 best_metrics_json,
-                result.get('comparison', {}).get('should_update', False),
-                params_changed_json
+                comparison.get('should_update', False),
+                params_changed_json,
+                performance_comparison_json
             ))
             
             conn.commit()
