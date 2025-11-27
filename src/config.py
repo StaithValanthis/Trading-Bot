@@ -249,6 +249,7 @@ class UniverseConfig:
     
     # Historical data
     min_history_days: int = 30
+    history_buffer_days: int = 5                   # Extra days to download beyond minimum requirement
     warmup_days: int = 7                         # Warm-up period for new listings
     max_data_gap_pct: float = 10.0               # Max % missing candles
     max_days_since_last_update: int = 3          # Max days since last data update
@@ -409,6 +410,8 @@ class BotConfig:
             errors.append("min_24h_volume_exit must be less than min_24h_volume_entry (hysteresis)")
         if self.universe.min_history_days <= 0:
             errors.append("min_history_days must be positive")
+        if getattr(self.universe, "history_buffer_days", 0) < 0:
+            errors.append("history_buffer_days must be zero or positive")
         
         return errors
 

@@ -137,7 +137,9 @@ universe:
   
   # Historical data requirements
   # Minimum days of continuous OHLCV history required
-  min_history_days: 30
+  min_history_days: 90
+  # Extra days of history to download beyond the minimum (buffer for gaps/off-by-one)
+  history_buffer_days: 5
   # Warm-up period: new listings must pass filters for this many days before entry
   warmup_days: 7
   # Maximum percentage of missing candles allowed (timeframe-aware)

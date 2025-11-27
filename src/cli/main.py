@@ -32,6 +32,13 @@ from ..universe.store import UniverseStore
 import sqlite3
 
 
+def _get_history_lookback_days(universe_config) -> int:
+    """Return days of OHLCV history to download (min + buffer)."""
+    min_days = max(getattr(universe_config, "min_history_days", 1), 1)
+    buffer_days = max(getattr(universe_config, "history_buffer_days", 5), 0)
+    return min_days + buffer_days
+
+
 def run_universe_build(config_path: str):
     """
     Build/update the tradable universe.
@@ -104,9 +111,7 @@ def run_universe_build(config_path: str):
         )
         
         # STEP 4: Backfill OHLCV for candidates to satisfy min_history_days
-        min_days = config.universe.min_history_days
-        # Add a small buffer to improve robustness of history checks
-        lookback_days = min_days + 5
+        lookback_days = _get_history_lookback_days(config.universe)
         from datetime import datetime, timezone, timedelta as _td
         
         force_from = datetime.now(timezone.utc) - _td(days=lookback_days)
@@ -262,6 +267,7 @@ def run_live(config_path: str):
     # Now get logger (will inherit from root logger)
     logger = get_logger(__name__)
     logger.info("Starting live trading bot")
+    history_lookback_days = _get_history_lookback_days(config.universe)
     
     # Validate API credentials early
     if config.exchange.mode != "paper":
@@ -453,7 +459,7 @@ def run_live(config_path: str):
                 downloader.update_all_symbols(
                     initial_universe,
                     config.exchange.timeframe,
-                    lookback_days=30
+                    lookback_days=history_lookback_days
                 )
                 logger.info(f"Pre-downloaded data for {len(initial_universe)} symbols in initial universe")
             else:
@@ -636,7 +642,7 @@ def run_live(config_path: str):
                 downloader.update_all_symbols(
                     symbols_to_download,
                     config.exchange.timeframe,
-                    lookback_days=30
+                    lookback_days=history_lookback_days
                 )
                 logger.info(f"Market data updated successfully for {len(symbols_to_download)} symbols")
                 
@@ -778,7 +784,7 @@ def run_live(config_path: str):
                                         downloader.download_and_store(
                                             symbol,
                                             config.exchange.timeframe,
-                                            lookback_days=30
+                                            lookback_days=history_lookback_days
                                         )
                                         # Reload data
                                         df = store.get_ohlcv(
@@ -813,8 +819,8 @@ def run_live(config_path: str):
                                             downloader.download_and_store(
                                                 symbol,
                                                 config.exchange.timeframe,
-                                                lookback_days=30,
-                                                force_from_date=datetime.now(timezone.utc) - timedelta(days=30)
+                                                lookback_days=history_lookback_days,
+                                                force_from_date=datetime.now(timezone.utc) - timedelta(days=history_lookback_days)
                                             )
                                             # Reload data
                                             df = store.get_ohlcv(

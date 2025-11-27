@@ -3,6 +3,7 @@
 import time
 from typing import Dict, List, Optional, Set, Tuple
 from datetime import datetime, date, timedelta, timezone
+import math
 import pandas as pd
 import numpy as np
 
@@ -11,7 +12,6 @@ from ..exchange.bybit_client import BybitClient
 from ..data.ohlcv_store import OHLCVStore
 from ..universe.store import UniverseStore
 from ..logging_utils import get_logger
-from ..utils import parse_timeframe_to_hours
 from ..utils import parse_timeframe_to_hours
 
 logger = get_logger(__name__)
@@ -194,6 +194,20 @@ class UniverseSelector:
             'spread_bps': ticker.get('spread_bps')
         }
     
+    def _get_history_requirements(self, timeframe: str) -> Tuple[int, float]:
+        """Return required bar count and candles per day for timeframe."""
+        hours_per_bar = parse_timeframe_to_hours(timeframe)
+        if hours_per_bar <= 0:
+            return 0, 0.0
+        candles_per_day = max(24 / hours_per_bar, 1.0)
+        required_bars = int(math.ceil(self.config.min_history_days * candles_per_day))
+        return required_bars, candles_per_day
+
+    def _get_history_buffer_bars(self, candles_per_day: float) -> int:
+        """Convert configured buffer days into bars for the timeframe."""
+        buffer_days = getattr(self.config, "history_buffer_days", 5)
+        return int(math.ceil(max(buffer_days, 0) * candles_per_day))
+
     def check_historical_data(
         self,
         symbol: str,
@@ -210,16 +224,13 @@ class UniverseSelector:
             Tuple of (passes, reason, metadata)
         """
         try:
-            # Calculate how many bars we need to check (more efficient than loading all data)
-            hours_per_bar = parse_timeframe_to_hours(timeframe)
-            if hours_per_bar == 0:
+            required_bars, candles_per_day = self._get_history_requirements(timeframe)
+            if required_bars == 0:
                 return False, "invalid_timeframe", {'timeframe': timeframe}
-            
-            candles_per_day = 24 / hours_per_bar  # 6 for 4h, 24 for 1h, 1 for 1d
-            min_bars = int((self.config.min_history_days * 24) / hours_per_bar)
+            buffer_bars = self._get_history_buffer_bars(candles_per_day)
             
             # Load data (with buffer for gap checking)
-            df = self.ohlcv_store.get_ohlcv(symbol, timeframe, limit=min_bars + 100)
+            df = self.ohlcv_store.get_ohlcv(symbol, timeframe, limit=required_bars + buffer_bars)
             
             # If we have no data at all for this symbol/timeframe, treat it as
             # "insufficient_history" for warmup purposes rather than a permanent
@@ -236,7 +247,7 @@ class UniverseSelector:
                     
                     return False, "insufficient_history", {
                         'actual_bars': 0,
-                        'required_bars': min_bars,
+                        'required_bars': required_bars,
                         'actual_days': 0,
                         'threshold_days': self.config.min_history_days,
                         'candles_per_day': candles_per_day
@@ -270,10 +281,10 @@ class UniverseSelector:
             
             # Check total history (use bars-based check for accuracy)
             actual_bars = len(df)
-            if actual_bars < min_bars:
+            if actual_bars < required_bars:
                 return False, "insufficient_history", {
                     'actual_bars': actual_bars,
-                    'required_bars': min_bars,
+                    'required_bars': required_bars,
                     'actual_days': actual_bars / candles_per_day,
                     'threshold_days': self.config.min_history_days,
                     'candles_per_day': candles_per_day
@@ -293,7 +304,7 @@ class UniverseSelector:
             history_days = (latest_dt - oldest_dt).days
             
             # Check data gaps (FIX: Use timeframe-aware calculation)
-            expected_candles = history_days * candles_per_day
+            expected_candles = max(history_days * candles_per_day, 1)
             gap_pct = (1 - actual_bars / expected_candles) * 100 if expected_candles > 0 else 0
             
             if gap_pct > self.config.max_data_gap_pct:
@@ -311,7 +322,7 @@ class UniverseSelector:
                 'data_points': actual_bars,
                 'gap_pct': gap_pct,
                 'candles_per_day': candles_per_day,
-                'required_bars': min_bars
+                'required_bars': required_bars
             }
             
         except Exception as e:
@@ -331,7 +342,12 @@ class UniverseSelector:
         """
         try:
             # Get recent OHLCV
-            df = self.ohlcv_store.get_ohlcv(symbol, timeframe, limit=720)  # ~30 days of 1h data
+            required_bars, candles_per_day = self._get_history_requirements(timeframe)
+            if required_bars == 0:
+                return False, "invalid_timeframe", {'timeframe': timeframe}
+            buffer_bars = self._get_history_buffer_bars(candles_per_day)
+            limit = max(required_bars + buffer_bars, 24)
+            df = self.ohlcv_store.get_ohlcv(symbol, timeframe, limit=limit)
             
             if df.empty or len(df) < 24:
                 return False, "insufficient_data_for_volatility", {}
