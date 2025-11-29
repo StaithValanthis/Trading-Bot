@@ -9,7 +9,7 @@ from typing import Dict, List, Optional, Tuple, Set, Any
 from datetime import datetime, date, timedelta
 from pathlib import Path
 import pandas as pd
-import np as np
+import numpy as np
 from copy import deepcopy
 
 from ..config import BotConfig, UniverseConfig
