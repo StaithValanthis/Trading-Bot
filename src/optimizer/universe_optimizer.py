@@ -3,12 +3,13 @@
 import json
 import random
 import sqlite3
+import math
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple, Set, Any
 from datetime import datetime, date, timedelta
 from pathlib import Path
 import pandas as pd
-import numpy as np
+import np as np
 from copy import deepcopy
 
 from ..config import BotConfig, UniverseConfig
@@ -16,6 +17,7 @@ from ..universe.selector import UniverseSelector
 from ..universe.store import UniverseStore
 from ..data.ohlcv_store import OHLCVStore
 from ..backtest.backtester import Backtester
+from ..utils import parse_timeframe_to_hours
 from ..logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -286,9 +288,14 @@ class UniverseOptimizer:
                 # Symbol delisted, skip
                 continue
             
-            # Check history requirement
-            if len(df_up_to_date) < universe_config.min_history_days * 24:  # Assuming 1h bars
-                # Insufficient history
+            # Check history requirement (timeframe-aware)
+            hours_per_bar = parse_timeframe_to_hours(timeframe)
+            if hours_per_bar <= 0:
+                continue
+            candles_per_day = max(24.0 / hours_per_bar, 1.0)
+            required_bars = int(math.ceil(universe_config.min_history_days * candles_per_day))
+            if len(df_up_to_date) < required_bars:
+                # Insufficient history for this timeframe
                 continue
             
             # Calculate listing date (first data timestamp)

@@ -131,6 +131,20 @@ def run_universe_build(config_path: str):
             except Exception as e:
                 logger.warning(f"Error backfilling data for {symbol}: {e}")
                 continue
+
+        # Immediately top up data to present time so freshness checks pass
+        logger.info(
+            f"Refreshing latest candles for {len(candidate_symbols)} candidates "
+            f"to satisfy max_days_since_last_update"
+        )
+        try:
+            downloader.update_all_symbols(
+                candidate_symbols,
+                config.exchange.timeframe,
+                lookback_days=max(3, getattr(config.universe, "history_buffer_days", 5))
+            )
+        except Exception as e:
+            logger.warning(f"Error refreshing latest candles for candidates: {e}")
         
         # STEP 5: Build universe with full historical filters
         universe, changes = selector.build_universe(config.exchange.timeframe)
@@ -470,7 +484,10 @@ def run_live(config_path: str):
     
     logger.info(f"Bot initialized. Mode: {config.exchange.mode}, Equity: ${portfolio.equity:,.2f}")
     logger.info("Starting main trading loop...")
-    logger.info(f"Rebalance frequency: every {rebalance_frequency_hours} hours")
+    check_interval_minutes = getattr(config.exchange, 'loop_check_interval_minutes', 60)
+    logger.info(f"Loop check interval: every {check_interval_minutes} minutes")
+    logger.info(f"Portfolio rebalance frequency: every {rebalance_frequency_hours} hours")
+    logger.info(f"Universe rebalance frequency: every {config.universe.rebalance_frequency_hours} hours")
     logger.info("Entering main loop - bot will run until interrupted or error occurs")
     
     loop_iteration = 0
@@ -1383,9 +1400,10 @@ def run_live(config_path: str):
                     ", ".join(portfolio.positions.keys()) if portfolio.positions else "none"
                 )
 
-                # Sleep until next iteration (check every hour for rebalancing)
-                sleep_seconds = 3600  # 1 hour
-                logger.info(f"Loop iteration #{loop_iteration} complete. Sleeping for {sleep_seconds}s ({sleep_seconds/60:.0f} minutes) until next check...")
+                # Sleep until next iteration (check interval from config)
+                check_interval_minutes = getattr(config.exchange, 'loop_check_interval_minutes', 60)
+                sleep_seconds = check_interval_minutes * 60
+                logger.info(f"Loop iteration #{loop_iteration} complete. Sleeping for {sleep_seconds}s ({check_interval_minutes} minutes) until next check...")
                 logger.info("="*60)
                 time.sleep(sleep_seconds)
             

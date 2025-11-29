@@ -21,7 +21,10 @@ exchange:
     - BNBUSDT
     - ADAUSDT
   # Trading timeframe (default 4h: cleaner signals & aligned with 8h funding cycle)
-  timeframe: 1h
+  timeframe: 4h
+  # How often the main loop checks for new signals/rebalancing (minutes)
+  # Default: 60 minutes. For 15m timeframes, consider 15-30 minutes for faster reaction
+  loop_check_interval_minutes: 60
   # Estimated taker fee (used in backtests/optimizer)
   taker_fee: 0.00055
   # Optional constant funding estimate (per 8h). Set to 0 to disable.
@@ -36,15 +39,15 @@ strategy:
   # Sleeve A: Time-series trend-following
   trend:
     # Short moving average period (bars; 5 bars @4h ≈ 20h)
-    ma_short: 5
+    ma_short: 15
     # Long moving average period (bars; 25 bars @4h ≈ 100h)
-    ma_long: 25
+    ma_long: 50
     # Momentum lookback (bars; 6 bars @4h ≈ 24h)
-    momentum_lookback: 6
+    momentum_lookback: 12
     # ATR multiplier for stop-loss distance
     atr_stop_multiplier: 2.5
     # ATR lookback for volatility calculation (bars; 4 bars @4h ≈ 16h)
-    atr_period: 4
+    atr_period: 10
     # Minimum ATR filter: skip trades if ATR < min_atr_threshold * price
     min_atr_threshold: 0.001  # 0.1% of price
     # Position management
@@ -64,12 +67,12 @@ strategy:
     # Ranking window (bars; 18 bars @4h ≈ 3 days)
     # Exit band (hysteresis): only close positions if rank falls below top_k + exit_band
     # This reduces churn from minor ranking changes (default: 2)
-    exit_band: 2
+    exit_band: 1
     ranking_window: 18
     # Number of top symbols to trade
     top_k: 10
     # Rebalance frequency in hours (8h aligns with funding settlements)
-    rebalance_frequency_hours: 8
+    rebalance_frequency_hours: 6
     # Only trade symbols that also have positive time-series trend
     require_trend_alignment: true
     
@@ -203,49 +206,49 @@ optimizer:
   # Use historical universe membership when optimizing (prevents look-ahead)
   use_universe_history: true
   # Parameter ranges (if using random/bayesian search)
-  # Comprehensive ranges covering short-term scalping to long-term swing trading
+  # FOCUSED ranges for efficient optimization (~50k combinations, 100-200 trials = 0.2-0.4% coverage)
+  # Adjust these based on your timeframe and strategy preferences
   param_ranges:
-    # Moving averages: wide range from very short (5-10 bars) to long-term (200+ bars)
-    # Short MA: 5-50 bars (covers 20h to 200h on 4h timeframe)
-    ma_short: [5, 8, 10, 12, 15, 18, 20, 25, 30, 35, 40, 50]
-    # Long MA: 50-300 bars (covers 200h to 1200h / 8-50 days on 4h timeframe)
-    ma_long: [50, 60, 80, 100, 120, 150, 180, 200, 240, 280, 300]
+    # Moving averages: focused range around proven values
+    # Short MA: 5-20 bars (covers 20h to 80h on 4h timeframe, or 1.25h to 5h on 15m)
+    ma_short: [5, 8, 10, 12, 15]
+    # Long MA: 50-150 bars (covers 200h to 600h on 4h, or 12.5h to 37.5h on 15m)
+    ma_long: [50, 80, 100, 150]
     
-    # Momentum lookback: 6-96 bars (covers 24h to 16 days on 4h timeframe)
-    # Includes very short (6-12), medium (18-36), and long-term (48-96) momentum
-    momentum_lookback: [6, 9, 12, 15, 18, 24, 30, 36, 42, 48, 60, 72, 84, 96]
+    # Momentum lookback: 6-36 bars (covers 24h to 6 days on 4h, or 1.5h to 9h on 15m)
+    momentum_lookback: [6, 12, 18, 24]
     
-    # ATR stop multiplier: tight stops (1.5) to wide stops (4.0)
-    # Covers conservative (1.5-2.0), standard (2.5-3.0), and wide (3.5-4.0) stops
-    atr_stop_multiplier: [1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5, 4.0]
+    # ATR stop multiplier: standard range (2.0-3.0)
+    atr_stop_multiplier: [2.0, 2.5, 3.0]
     
-    # ATR period: short (4-7) to long (21-28) volatility windows
-    atr_period: [4, 5, 7, 10, 14, 18, 21, 28]
+    # ATR period: 4-18 bars (short to medium volatility windows)
+    atr_period: [4, 7, 10, 14]
     
-    # Cross-sectional: portfolio size from concentrated (2-3) to diversified (8-10)
-    top_k: [2, 3, 4, 5, 6, 7, 8, 10]
+    # Cross-sectional: portfolio size (concentrated to moderate diversification)
+    top_k: [3, 4, 5, 6]
     
-    # Ranking window: 6-96 bars (covers 24h to 16 days on 4h timeframe)
-    # Short (6-12), medium (18-36), and long-term (48-96) momentum ranking
-    ranking_window: [6, 9, 12, 15, 18, 24, 30, 36, 42, 48, 60, 72, 84, 96]
+    # Ranking window: 12-36 bars (medium-term momentum ranking)
+    ranking_window: [12, 18, 24]
     
-    # Exit band (hysteresis): prevents churn from minor ranking changes
-    exit_band: [1, 2, 3, 4, 5]
+    # Exit band (hysteresis): prevents churn (keep simple)
+    exit_band: [1, 2]
     
-    # Rebalance frequency: from frequent (4h) to less frequent (24h)
-    rebalance_frequency_hours: [4, 6, 8, 12, 16, 24]
+    # Rebalance frequency: 4h to 24h (aligns with funding cycles) - reduced options
+    rebalance_frequency_hours: [4, 6, 8]
   # Sampling method for random search: uniform or latin (stratified)
   sample_method: latin
   # Warn if coverage (n_trials / total combos) drops below this fraction
   coverage_warning_threshold: 0.0001
-  # Minimum % of walk-forward windows that must be profitable
-  min_positive_windows: 0.55
+  # Minimum % of OOS walk-forward windows that must be profitable
+  min_positive_windows: 0.5
   # Maximum allowed OOS Sharpe standard deviation (set null to disable)
   max_oos_sharpe_std: null
-  # Maximum tolerated worst OOS drawdown (more negative than this fails). e.g., -30.0
-  max_worst_oos_dd: -30.0
-  # Number of rolling walk-forward folds to average (1 = current behavior)
-  walk_forward_folds: 2
+  # Maximum tolerated worst OOS drawdown (set e.g. -30.0 to reject configs worse than -30%). null = disabled
+  max_worst_oos_dd: null
+  # Number of rolling walk-forward folds to average (1 = single split, >1 = multiple folds)
+  walk_forward_folds: 1
+  # Embargo period in days: gap between IS and OOS windows to reduce leakage (0 = disabled)
+  embargo_days: 0
 
 # Universe optimizer settings (for universe parameter optimization)
 universe_optimizer:

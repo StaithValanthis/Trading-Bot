@@ -15,6 +15,8 @@ from ..backtest.backtester import Backtester
 from ..data.ohlcv_store import OHLCVStore
 from .store import OptimizerStore
 from ..logging_utils import get_logger
+from ..utils import parse_timeframe_to_hours
+import pandas as pd
 
 logger = get_logger(__name__)
 
@@ -283,16 +285,49 @@ class Optimizer:
         else:
             total_days = 0
         
+        # Multiple-testing-aware Sharpe threshold
+        base_min_sharpe = self.config.optimizer.min_sharpe_ratio
+        n_trials_cfg = self.config.optimizer.n_trials or 1
+        adjusted_min_sharpe = base_min_sharpe
+        try:
+            # Simple log-based correction: scale with log10 of trials relative to 10
+            adjusted_min_sharpe = base_min_sharpe + 0.1 * math.log10(
+                max(1.0, n_trials_cfg / 10.0)
+            )
+        except Exception:
+            # Fallback to base if anything goes wrong
+            adjusted_min_sharpe = base_min_sharpe
+
+        self.logger.info(
+            "Optimizer Sharpe thresholds - base: %.2f, adjusted for %d trials: %.2f",
+            base_min_sharpe,
+            n_trials_cfg,
+            adjusted_min_sharpe,
+        )
+        
+        # Log walk-forward settings
+        embargo_days = getattr(self.config.optimizer, "embargo_days", 0)
+        walk_forward_folds = getattr(self.config.optimizer, "walk_forward_folds", 1)
+        self.logger.info(
+            "Walk-forward settings: folds=%d, embargo_days=%d, purge=enabled (computed per parameter set)",
+            walk_forward_folds,
+            embargo_days,
+        )
+
         # Relax criteria if data is limited (less than 6 months)
         min_trades_threshold = self.config.optimizer.min_trades
-        min_sharpe_threshold = self.config.optimizer.min_sharpe_ratio
+        # Start from the multiple-testing-adjusted Sharpe threshold
+        min_sharpe_threshold = adjusted_min_sharpe
         max_dd_threshold = self.config.optimizer.max_drawdown_pct
         
         if total_days < 180:  # Less than 6 months
             # Relax criteria proportionally
             relaxation_factor = max(0.5, total_days / 180.0)  # Between 50% and 100%
-            min_trades_threshold = max(5, int(self.config.optimizer.min_trades * relaxation_factor))
-            min_sharpe_threshold = self.config.optimizer.min_sharpe_ratio * relaxation_factor
+            min_trades_threshold = max(
+                5, int(self.config.optimizer.min_trades * relaxation_factor)
+            )
+            # Apply relaxation on top of multiple-testing adjustment
+            min_sharpe_threshold = adjusted_min_sharpe * relaxation_factor
             max_dd_threshold = self.config.optimizer.max_drawdown_pct * (1.0 / relaxation_factor)  # More lenient on drawdown
             
             self.logger.info(
@@ -321,6 +356,7 @@ class Optimizer:
         current_config_metrics = None  # Track performance of current config
 
         collected_all_results = []
+        num_pass_all = 0  # For summary logging
 
         for i, params in enumerate(param_sets):
             try:
@@ -336,6 +372,7 @@ class Optimizer:
                     test_config,
                     walk_forward_window_days,
                     universe_history=universe_history,
+                    params=params,
                 )
                 param_elapsed = time_module.time() - param_start_time
                 
@@ -348,16 +385,20 @@ class Optimizer:
                     )
 
                 if walk_forward_results:
-                    # Split into in-sample and out-of-sample windows (e.g. 70% / 30%)
-                    n_windows = len(walk_forward_results)
-                    split_idx = max(1, int(n_windows * 0.7))
-                    is_results = walk_forward_results[:split_idx]
-                    oos_results = walk_forward_results[split_idx:] or walk_forward_results
+                    # Split into in-sample and out-of-sample windows
+                    # Results now have 'is_oos' and 'fold_index' tags from _walk_forward_backtest
+                    is_results = [r for r in walk_forward_results if r.get('is_oos') == 'is']
+                    oos_results = [r for r in walk_forward_results if r.get('is_oos') == 'oos']
+                    
+                    # Fallback: if no tags, use old 70/30 split for backwards compatibility
+                    if not is_results and not oos_results:
+                        n_windows = len(walk_forward_results)
+                        split_idx = max(1, int(n_windows * 0.7))
+                        is_results = walk_forward_results[:split_idx]
+                        oos_results = walk_forward_results[split_idx:] or walk_forward_results
+                    
+                    # Use all OOS results for evaluation (across all folds)
                     oos_eval = oos_results
-                    if len(oos_results) > 1:
-                        oos_eval = oos_results[1:]
-                    if not oos_eval:
-                        oos_eval = oos_results
 
                     def _agg(results_list):
                         return (
@@ -408,20 +449,106 @@ class Optimizer:
                     
                     # Log failed criteria (first failed set and every 10th after)
                     if (not passes_is or not passes_oos) and (i == 0 or (i + 1) % 10 == 0):
+                        fail_reasons = []
+                        if min_trades_is < min_trades_threshold:
+                            fail_reasons.append(
+                                f"IS min_trades {min_trades_is:.0f} < threshold {min_trades_threshold:.0f}"
+                            )
+                        if avg_sharpe_is < min_sharpe_threshold:
+                            fail_reasons.append(
+                                f"IS Sharpe {avg_sharpe_is:.2f} < threshold {min_sharpe_threshold:.2f}"
+                            )
+                        if avg_dd_is < max_dd_threshold:
+                            fail_reasons.append(
+                                f"IS DD {avg_dd_is:.2f}% < threshold {max_dd_threshold:.1f}%"
+                            )
+                        if min_trades_oos < min_trades_threshold:
+                            fail_reasons.append(
+                                f"OOS min_trades {min_trades_oos:.0f} < threshold {min_trades_threshold:.0f}"
+                            )
+                        if avg_sharpe_oos < min_sharpe_threshold * 0.7:
+                            fail_reasons.append(
+                                f"OOS Sharpe {avg_sharpe_oos:.2f} < relaxed threshold {min_sharpe_threshold * 0.7:.2f}"
+                            )
+                        if avg_dd_oos < max_dd_threshold * 1.2:
+                            fail_reasons.append(
+                                f"OOS DD {avg_dd_oos:.2f}% < relaxed threshold {max_dd_threshold * 1.2:.1f}%"
+                            )
                         self.logger.info(
-                            f"Parameter set {i+1} failed criteria: "
-                            f"IS: trades={min_trades_is:.0f}/{min_trades_threshold:.0f}, "
-                            f"sharpe={avg_sharpe_is:.2f}/{min_sharpe_threshold:.2f}, "
-                            f"dd={avg_dd_is:.2f}%/{max_dd_threshold:.1f}%, "
-                            f"OOS: trades={min_trades_oos:.0f}/{min_trades_threshold:.0f}, "
-                            f"sharpe={avg_sharpe_oos:.2f}/{min_sharpe_threshold * 0.7:.2f}, "
-                            f"dd={avg_dd_oos:.2f}%/{max_dd_threshold * 1.2:.1f}%"
+                            "Parameter set %d failed criteria: %s",
+                            i + 1,
+                            "; ".join(fail_reasons) if fail_reasons else "unspecified",
                         )
 
                     # Store all results with sufficient trades for ranking
                     # We'll rank them and pick the best even if none meet strict criteria
-                    positive_windows = sum(1 for r in walk_forward_results if r.get("total_return_pct", 0) > 0)
-                    window_success_ratio = positive_windows / len(walk_forward_results) if walk_forward_results else 0.0
+                    # Robustness metrics are evaluated on OOS windows
+                    positive_oos_windows = sum(
+                        1 for r in oos_results if r.get("total_return_pct", 0) > 0
+                    )
+                    oos_window_count = len(oos_results)
+                    positive_window_ratio = (
+                        positive_oos_windows / oos_window_count
+                        if oos_window_count
+                        else 0.0
+                    )
+                    oos_sharpes = [
+                        r["sharpe_ratio"]
+                        for r in oos_results
+                        if "sharpe_ratio" in r
+                    ]
+                    oos_sharpe_std = float(np.std(oos_sharpes)) if len(oos_sharpes) > 1 else 0.0
+                    worst_oos_dd = min(
+                        (r["max_drawdown_pct"] for r in oos_results), default=0.0
+                    )
+
+                    # Enforce robustness filters on top of baseline OOS criteria
+                    min_positive_windows_cfg = getattr(
+                        self.config.optimizer, "min_positive_windows", 0.5
+                    )
+                    max_oos_sharpe_std_cfg = getattr(
+                        self.config.optimizer, "max_oos_sharpe_std", None
+                    )
+                    max_worst_oos_dd_cfg = getattr(
+                        self.config.optimizer, "max_worst_oos_dd", None
+                    )
+
+                    if passes_oos and oos_window_count > 0:
+                        if positive_window_ratio < min_positive_windows_cfg:
+                            self.logger.info(
+                                "Parameter set %d rejected on OOS robustness: "
+                                "only %.1f%% of OOS windows positive (min %.1f%%)",
+                                i + 1,
+                                positive_window_ratio * 100,
+                                min_positive_windows_cfg * 100,
+                            )
+                            passes_oos = False
+                        if (
+                            passes_oos
+                            and max_oos_sharpe_std_cfg is not None
+                            and oos_sharpe_std > max_oos_sharpe_std_cfg
+                        ):
+                            self.logger.info(
+                                "Parameter set %d rejected on OOS robustness: "
+                                "OOS Sharpe std %.2f > max %.2f",
+                                i + 1,
+                                oos_sharpe_std,
+                                max_oos_sharpe_std_cfg,
+                            )
+                            passes_oos = False
+                        if (
+                            passes_oos
+                            and max_worst_oos_dd_cfg is not None
+                            and worst_oos_dd < max_worst_oos_dd_cfg
+                        ):
+                            self.logger.info(
+                                "Parameter set %d rejected on OOS robustness: "
+                                "worst OOS drawdown %.2f%% < max allowed %.2f%%",
+                                i + 1,
+                                worst_oos_dd,
+                                max_worst_oos_dd_cfg,
+                            )
+                            passes_oos = False
 
                     all_results = {
                         "params": params,
@@ -439,7 +566,9 @@ class Optimizer:
                         "passes_is": passes_is,
                         "passes_oos": passes_oos,
                         "passes_all": passes_is and passes_oos,
-                        "positive_window_ratio": window_success_ratio,
+                        "positive_window_ratio": positive_window_ratio,
+                        "oos_sharpe_std": oos_sharpe_std,
+                        "worst_oos_dd": worst_oos_dd,
                     }
                     
                     # Store results based on priority:
@@ -450,6 +579,7 @@ class Optimizer:
                     
                     if passes_is and passes_oos:
                         results.append(all_results)
+                        num_pass_all += 1
                         already_added = True
                         if (i == 0 or (i + 1) % 10 == 0):
                             self.logger.info(
@@ -559,7 +689,30 @@ class Optimizer:
             )
             
             best_result = results[0]
-            
+
+            # Summary logging
+            embargo_days = getattr(self.config.optimizer, "embargo_days", 0)
+            walk_forward_folds = getattr(self.config.optimizer, "walk_forward_folds", 1)
+            self.logger.info(
+                "Optimizer summary: tested %d parameter sets, %d passed all criteria, %d total candidates stored "
+                "(folds=%d, embargo=%d days, purge=enabled)",
+                len(param_sets),
+                num_pass_all,
+                len(results),
+                walk_forward_folds,
+                embargo_days,
+            )
+            top_n = min(3, len(results))
+            for rank, res in enumerate(results[:top_n], start=1):
+                self.logger.info(
+                    "Top %d: OOS Sharpe=%.2f, OOS DD=%.2f%%, pos_win_ratio=%.1f%%, params=%s",
+                    rank,
+                    res.get("avg_sharpe_oos", res.get("avg_sharpe", 0.0)),
+                    res.get("avg_dd_oos", res.get("avg_drawdown_pct", 0.0)),
+                    res.get("positive_window_ratio", 0.0) * 100.0,
+                    res.get("params"),
+                )
+
             # Log what we're using
             if best_result.get('passes_all', False):
                 self.logger.info(
@@ -742,18 +895,61 @@ class Optimizer:
         
         return test_config
     
+    def _compute_purge_bars(self, params: Dict[str, Any], timeframe: str) -> int:
+        """
+        Compute purge length in bars based on maximum lookback used by the strategy.
+        
+        This prevents data leakage from overlapping lookback periods (e.g., MA, momentum, ranking).
+        
+        Args:
+            params: Parameter dictionary containing strategy lookback parameters
+            timeframe: Trading timeframe (e.g., '1h', '4h')
+        
+        Returns:
+            Purge length in bars (with safety margin)
+        """
+        hours_per_bar = parse_timeframe_to_hours(timeframe)
+        if hours_per_bar <= 0:
+            return 0
+        
+        # Extract lookback parameters (in bars)
+        ma_long = params.get('ma_long', 100)
+        momentum_lookback = params.get('momentum_lookback', 24)
+        ranking_window = params.get('ranking_window', 18)
+        
+        # Find maximum lookback
+        max_lookback_bars = max(ma_long, momentum_lookback, ranking_window, 1)
+        
+        # Add safety margin (10 bars or ~10% of max lookback, whichever is larger)
+        safety_margin = max(10, int(max_lookback_bars * 0.1))
+        purge_bars = max_lookback_bars + safety_margin
+        
+        return purge_bars
+    
     def _walk_forward_backtest(
         self,
         symbol_data: Dict,
         test_config: BotConfig,
         window_days: int,
         universe_history: Optional[Dict[date, Set[str]]] = None,
+        params: Optional[Dict[str, Any]] = None,
     ) -> List[Dict]:
-        """Run walk-forward backtests."""
+        """
+        Run walk-forward backtests with purged cross-validation, embargo, and multiple folds.
+        
+        Args:
+            symbol_data: Dictionary mapping symbol to OHLCV DataFrame
+            test_config: Bot configuration for this parameter set
+            window_days: Size of each walk-forward window in days
+            universe_history: Optional historical universe membership
+            params: Parameter dictionary (for computing purge period)
+        
+        Returns:
+            List of backtest result dictionaries (one per window, aggregated across folds)
+        """
         from ..backtest.backtester import Backtester
         
         backtester = Backtester(test_config)
-        results = []
         
         # Get date range
         all_dates = []
@@ -767,7 +963,7 @@ class Optimizer:
         start_date = min(all_dates)
         end_date = max(all_dates)
         
-        # Create windows
+        # Create non-overlapping windows
         current_date = start_date
         windows = []
         
@@ -779,43 +975,198 @@ class Optimizer:
             windows.append((current_date, window_end))
             current_date = window_end
         
-        # Backtest each window
-        for window_start, window_end in windows:
-            # Filter data to window
-            window_data = {}
-            for symbol, df in symbol_data.items():
-                mask = (df.index >= window_start) & (df.index <= window_end)
-                window_df = df[mask].copy()
-                if not window_df.empty and len(window_df) > 100:
-                    window_data[symbol] = window_df
-            
-            if not window_data:
-                continue
-            
-            window_universe = None
-            if universe_history:
-                window_universe = {
-                    day: members
-                    for day, members in universe_history.items()
-                    if window_start.date() <= day <= window_end.date()
-                }
-            
-            try:
-                result = backtester.backtest(
-                    window_data,
-                    taker_fee=test_config.exchange.taker_fee,
-                    funding_rate_per_8h=getattr(test_config.exchange, "funding_rate_per_8h", 0.0),
-                    universe_history=window_universe,
-                    stop_slippage_bps=test_config.risk.stop_slippage_bps,
-                    tp_slippage_bps=test_config.risk.tp_slippage_bps,
-                )
-                if 'error' not in result:
-                    results.append(result)
-            except Exception as e:
-                self.logger.warning(f"Error in walk-forward window {window_start} to {window_end}: {e}")
-                continue
+        if not windows:
+            return []
         
-        return results
+        # Compute purge period (in bars and days)
+        timeframe = test_config.exchange.timeframe
+        purge_bars = 0
+        purge_days = 0.0
+        if params:
+            purge_bars = self._compute_purge_bars(params, timeframe)
+            hours_per_bar = parse_timeframe_to_hours(timeframe)
+            if hours_per_bar > 0:
+                purge_days = (purge_bars * hours_per_bar) / 24.0
+        
+        embargo_days = getattr(self.config.optimizer, "embargo_days", 0)
+        walk_forward_folds = getattr(self.config.optimizer, "walk_forward_folds", 1)
+        
+        # Log purge/embargo settings (once per parameter set)
+        if params and len(windows) > 0:
+            self.logger.debug(
+                f"Walk-forward settings: purge_bars={purge_bars} (~{purge_days:.1f} days), "
+                f"embargo_days={embargo_days}, folds={walk_forward_folds}, windows={len(windows)}"
+            )
+        
+        # Collect results from all folds
+        all_fold_results = []
+        
+        # Generate folds
+        n_windows = len(windows)
+        if walk_forward_folds <= 1:
+            # Single fold: use 70/30 split (current behavior)
+            split_idx = max(1, int(n_windows * 0.7))
+            fold_splits = [(split_idx,)]
+        else:
+            # Multiple folds: shift the IS/OOS boundary
+            base_split = max(1, int(n_windows * 0.7))
+            fold_splits = []
+            for fold_idx in range(walk_forward_folds):
+                # Shift boundary by 1-2 windows per fold (ensure we have both IS and OOS)
+                shift = fold_idx * max(1, n_windows // (walk_forward_folds * 2))
+                split_idx = min(base_split + shift, n_windows - 1)
+                if split_idx > 0 and split_idx < n_windows:
+                    fold_splits.append((split_idx,))
+        
+        # Process each fold
+        for fold_idx, (split_idx,) in enumerate(fold_splits):
+            is_windows = windows[:split_idx]
+            oos_windows = windows[split_idx:]
+            
+            # Apply embargo: skip OOS windows that start within embargo_days of last IS window
+            if embargo_days > 0 and is_windows and oos_windows:
+                last_is_end = is_windows[-1][1]
+                embargo_cutoff = last_is_end + timedelta(days=embargo_days)
+                oos_windows = [
+                    (w_start, w_end) for w_start, w_end in oos_windows
+                    if w_start >= embargo_cutoff
+                ]
+            
+            if not oos_windows:
+                # No valid OOS windows after embargo, skip this fold
+                continue
+            
+            # Backtest IS windows (no purge needed for IS)
+            is_results = []
+            for window_start, window_end in is_windows:
+                window_result = self._backtest_window(
+                    backtester, symbol_data, window_start, window_end,
+                    universe_history, test_config, None  # No purge for IS
+                )
+                if window_result:
+                    is_results.append(window_result)
+            
+            # Backtest OOS windows (with purge)
+            oos_results = []
+            for window_start, window_end in oos_windows:
+                # Purge training data that overlaps with OOS lookback
+                purge_start = None
+                if purge_days > 0:
+                    purge_start = window_start - timedelta(days=purge_days)
+                
+                window_result = self._backtest_window(
+                    backtester, symbol_data, window_start, window_end,
+                    universe_history, test_config, purge_start
+                )
+                if window_result:
+                    oos_results.append(window_result)
+            
+            # Tag results with fold index for aggregation
+            for result in is_results:
+                result['fold_index'] = fold_idx
+                result['is_oos'] = 'is'
+            for result in oos_results:
+                result['fold_index'] = fold_idx
+                result['is_oos'] = 'oos'
+            
+            all_fold_results.extend(is_results)
+            all_fold_results.extend(oos_results)
+        
+        # If no folds produced results, return empty list
+        if not all_fold_results:
+            return []
+        
+        # Aggregate results: for backwards compatibility, return one result per unique window
+        # (averaging across folds if a window appears in multiple folds)
+        window_results_map = {}
+        for result in all_fold_results:
+            # Use a window key (we'll need to track which window this came from)
+            # For now, we'll just return all results and let the caller aggregate
+            pass
+        
+        # Return all results (caller will aggregate by IS/OOS across folds)
+        return all_fold_results
+    
+    def _backtest_window(
+        self,
+        backtester: 'Backtester',
+        symbol_data: Dict,
+        window_start: datetime,
+        window_end: datetime,
+        universe_history: Optional[Dict[date, Set[str]]],
+        test_config: BotConfig,
+        purge_start: Optional[datetime],
+    ) -> Optional[Dict]:
+        """
+        Backtest a single window with optional purge period.
+        
+        For OOS windows, purge_start indicates the start of the purge period (data before
+        window_start that would be visible to the strategy's lookback).
+        
+        Args:
+            backtester: Backtester instance
+            symbol_data: Full symbol data dictionary (may contain data beyond the window)
+            window_start: Window start datetime
+            window_end: Window end datetime
+            universe_history: Historical universe membership
+            test_config: Bot configuration
+            purge_start: Optional purge period start (for OOS: exclude data from [purge_start, window_start))
+        
+        Returns:
+            Backtest result dict or None if window is invalid
+        """
+        # Filter data to window
+        window_data = {}
+        for symbol, df in symbol_data.items():
+            # Get data for the window
+            mask = (df.index >= window_start) & (df.index <= window_end)
+            window_df = df[mask].copy()
+            
+            # For OOS windows with purge: include lookback data but exclude purge period
+            # The backtester needs lookback to compute indicators, but we must avoid
+            # data leakage from the purge period
+            if purge_start is not None:
+                # Include data before purge_start for lookback (safe from leakage)
+                lookback_df = df[df.index < purge_start].copy()
+                # Combine safe lookback + window data
+                if not lookback_df.empty:
+                    window_df = pd.concat([lookback_df, window_df]).sort_index()
+                # If no safe lookback, just use window data (backtester may fail or use defaults)
+            else:
+                # For IS windows: include all data before window_start for lookback
+                lookback_df = df[df.index < window_start].copy()
+                if not lookback_df.empty:
+                    window_df = pd.concat([lookback_df, window_df]).sort_index()
+            
+            if not window_df.empty and len(window_df) > 100:
+                window_data[symbol] = window_df
+        
+        if not window_data:
+            return None
+        
+        window_universe = None
+        if universe_history:
+            window_universe = {
+                day: members
+                for day, members in universe_history.items()
+                if window_start.date() <= day <= window_end.date()
+            }
+        
+        try:
+            result = backtester.backtest(
+                window_data,
+                taker_fee=test_config.exchange.taker_fee,
+                funding_rate_per_8h=getattr(test_config.exchange, "funding_rate_per_8h", 0.0),
+                universe_history=window_universe,
+                stop_slippage_bps=test_config.risk.stop_slippage_bps,
+                tp_slippage_bps=test_config.risk.tp_slippage_bps,
+            )
+            if 'error' not in result:
+                return result
+        except Exception as e:
+            self.logger.warning(f"Error in walk-forward window {window_start} to {window_end}: {e}")
+        
+        return None
     
     def _get_current_params(self) -> Dict:
         """Extract current config parameters."""

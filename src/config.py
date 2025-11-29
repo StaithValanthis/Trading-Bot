@@ -34,6 +34,9 @@ class ExchangeConfig:
     api_secret: Optional[str] = None
     symbols: List[str] = field(default_factory=lambda: ["BTCUSDT", "ETHUSDT"])
     timeframe: str = "4h"
+    # How often the main loop checks for new signals/rebalancing (minutes)
+    # Default: 60 minutes (1 hour). For shorter timeframes (e.g., 15m), consider 15-30 minutes
+    loop_check_interval_minutes: int = 60
     taker_fee: float = 0.00055  # Default Bybit taker fee
     funding_rate_per_8h: float = 0.0  # Optional constant funding assumption for backtests
     symbol_funding_rates: Dict[str, float] = field(default_factory=dict)
@@ -190,12 +193,22 @@ class OptimizerConfig:
     search_method: str = "random"  # grid, random, bayesian
     n_trials: int = 50
     random_seed: Optional[int] = None
+    # Robustness controls
+    # Minimum fraction of OOS walk-forward windows that must be profitable
     min_positive_windows: float = 0.5
+    # Maximum allowed standard deviation of OOS Sharpe across windows (None = disabled)
     max_oos_sharpe_std: Optional[float] = None
+    # Maximum tolerated worst OOS drawdown (more negative than this fails). None = disabled.
     max_worst_oos_dd: Optional[float] = None
+    # Number of rolling walk-forward folds to average (1 = single split, >1 = multiple folds)
     walk_forward_folds: int = 1
+    # Embargo period in days: gap between IS and OOS windows to reduce leakage (0 = disabled)
+    embargo_days: int = 0
+    # Sampling method for random search: "uniform" or "latin"
     sample_method: str = "uniform"
+    # Warn if coverage (n_trials / total_combinations) drops below this fraction
     coverage_warning_threshold: float = 1e-4
+    # Whether to use historical universe membership during optimization
     use_universe_history: bool = False
     param_ranges: Dict[str, List[Any]] = field(default_factory=lambda: {
         "ma_short": [15, 25, 30],

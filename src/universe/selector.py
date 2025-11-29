@@ -278,19 +278,9 @@ class UniverseSelector:
                     'threshold': self.config.max_days_since_last_update,
                     'latest_timestamp': latest_timestamp.isoformat() if hasattr(latest_timestamp, 'isoformat') else str(latest_timestamp)
                 }
-            
-            # Check total history (use bars-based check for accuracy)
+
+            # Check total history based on days (primary) and bars (for diagnostics)
             actual_bars = len(df)
-            if actual_bars < required_bars:
-                return False, "insufficient_history", {
-                    'actual_bars': actual_bars,
-                    'required_bars': required_bars,
-                    'actual_days': actual_bars / candles_per_day,
-                    'threshold_days': self.config.min_history_days,
-                    'candles_per_day': candles_per_day
-                }
-            
-            # Also check days for reporting
             oldest_timestamp = df.index[0]
             if isinstance(oldest_timestamp, pd.Timestamp):
                 oldest_dt = oldest_timestamp.to_pydatetime()
@@ -302,6 +292,17 @@ class UniverseSelector:
             if isinstance(latest_dt, pd.Timestamp):
                 latest_dt = latest_dt.to_pydatetime()
             history_days = (latest_dt - oldest_dt).days
+
+            # Require at least min_history_days worth of data in calendar terms
+            if history_days < self.config.min_history_days:
+                return False, "insufficient_history", {
+                    'actual_bars': actual_bars,
+                    'required_bars': required_bars,
+                    'history_days': history_days,
+                    'threshold_days': self.config.min_history_days,
+                    'candles_per_day': candles_per_day,
+                    'reason': 'history_days_below_threshold',
+                }
             
             # Check data gaps (FIX: Use timeframe-aware calculation)
             expected_candles = max(history_days * candles_per_day, 1)
