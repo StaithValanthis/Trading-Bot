@@ -67,6 +67,9 @@ class DiscordReporter:
             # Get strategy performance (from trades in DB)
             strategy_performance = self._get_strategy_performance(db_path)
             
+            # Calculate funding-specific metrics from positions
+            funding_metrics = self._calculate_funding_metrics(portfolio_state.positions)
+            
             # Get optimizer changes
             optimizer_changes = self._get_optimizer_changes(db_path)
             
@@ -103,7 +106,8 @@ class DiscordReporter:
                 optimizer_changes,
                 recent_errors,
                 universe_stats,
-                universe_changes
+                universe_changes,
+                funding_metrics
             )
             
             response = requests.post(
@@ -166,7 +170,7 @@ class DiscordReporter:
         }
     
     def _format_positions(self, positions: Dict) -> List[Dict]:
-        """Format positions for display."""
+        """Format positions for display, including source information."""
         formatted = []
         
         for symbol, pos in positions.items():
@@ -180,10 +184,40 @@ class DiscordReporter:
                 'unrealized_pnl_pct': (
                     (pos.get('unrealized_pnl', 0) / (pos.get('entry_price', 1) * pos.get('contracts', 1))) * 100
                     if pos.get('contracts', 0) != 0 else 0
-                )
+                ),
+                'source': pos.get('source', 'main_strategy'),  # Include source for grouping
+                'metadata': pos.get('metadata', {})  # Include metadata (e.g., funding rate)
             })
         
         return formatted
+    
+    def _calculate_funding_metrics(self, positions: Dict) -> Dict:
+        """Calculate funding-specific metrics from positions."""
+        funding_positions = [
+            pos for pos in positions.values()
+            if pos.get('source') in ['funding_opportunity', 'confluence', 'confluence_prefer_funding', 'confluence_prefer_main']
+        ]
+        
+        total_funding_notional = sum(abs(pos.get('notional', 0)) for pos in funding_positions)
+        total_funding_pnl = sum(pos.get('unrealized_pnl', 0) for pos in funding_positions)
+        
+        # Calculate average funding rate from positions
+        funding_rates = []
+        for pos in funding_positions:
+            metadata = pos.get('metadata', {})
+            funding_rate = metadata.get('funding_rate')
+            if funding_rate is not None:
+                funding_rates.append(funding_rate)
+        
+        avg_funding_rate = sum(funding_rates) / len(funding_rates) if funding_rates else 0.0
+        
+        return {
+            'num_funding_positions': len(funding_positions),
+            'total_funding_notional': total_funding_notional,
+            'total_funding_pnl': total_funding_pnl,
+            'avg_funding_rate': avg_funding_rate,
+            'has_funding_positions': len(funding_positions) > 0
+        }
     
     def _calculate_risk_metrics(self, portfolio_state: PortfolioState) -> Dict:
         """Calculate risk metrics."""
@@ -222,7 +256,7 @@ class DiscordReporter:
         }
     
     def _get_strategy_performance(self, db_path: str) -> Dict:
-        """Get strategy performance breakdown from trades table."""
+        """Get strategy performance breakdown from trades table, grouped by source if available."""
         trades_store = TradesStore(db_path)
         # For now, consider all trades in DB
         start = datetime.fromtimestamp(0)
@@ -236,6 +270,7 @@ class DiscordReporter:
                 "win_rate": 0.0,
                 "profit_factor": 0.0,
                 "by_symbol": {},
+                "by_source": {},  # Group by source (main_strategy, funding_opportunity, confluence)
             }
 
         wins = [t for t in trades if t["pnl"] > 0]
@@ -256,11 +291,17 @@ class DiscordReporter:
 
         by_symbol = dict(sorted(by_symbol.items(), key=lambda kv: kv[1]["pnl"], reverse=True))
 
+        # Group by source (if available in trades - note: trades table may not have source yet)
+        # For now, we'll group positions by source in the report instead
+        # This is a placeholder for future enhancement when trades table includes source
+        by_source: Dict[str, Dict[str, float]] = {}
+
         return {
             "total_trades": total_trades,
             "win_rate": win_rate,
             "profit_factor": profit_factor,
             "by_symbol": by_symbol,
+            "by_source": by_source,  # Empty for now, will be populated from positions
         }
     
     def _get_optimizer_changes(self, db_path: str) -> Optional[Dict]:
@@ -332,7 +373,8 @@ class DiscordReporter:
         optimizer_changes: Optional[Dict],
         recent_errors: List[str],
         universe_stats: Optional[Dict] = None,
-        universe_changes: Optional[Dict] = None
+        universe_changes: Optional[Dict] = None,
+        funding_metrics: Optional[Dict] = None
     ) -> Dict:
         """Create Discord embed message."""
         now = datetime.now()
@@ -353,19 +395,53 @@ class DiscordReporter:
         # Fields
         fields = []
         
-        # Open Positions
-        if positions:
+        # Group positions by source for better visibility
+        main_positions = [p for p in positions if p.get('source', 'main_strategy') == 'main_strategy']
+        funding_positions = [p for p in positions if p.get('source', '') in ['funding_opportunity', 'confluence', 'confluence_prefer_funding', 'confluence_prefer_main']]
+        other_positions = [p for p in positions if p.get('source', 'main_strategy') not in ['main_strategy', 'funding_opportunity', 'confluence', 'confluence_prefer_funding', 'confluence_prefer_main']]
+        
+        # Main Strategy Positions
+        if main_positions:
             pos_text = "\n".join([
                 f"**{p['symbol']}** {p['side'].upper()}: {abs(p['size']):.4f} @ ${p['entry_price']:,.2f} "
                 f"(PnL: ${p['unrealized_pnl']:,.2f} / {p['unrealized_pnl_pct']:+.2f}%)"
-                for p in positions[:10]  # Limit to 10 positions
+                for p in main_positions[:10]  # Limit to 10 positions
+            ])
+            fields.append({
+                'name': '📈 Main Strategy Positions',
+                'value': pos_text if pos_text else 'None',
+                'inline': False
+            })
+        
+        # Funding Strategy Positions
+        if funding_positions:
+            pos_text = "\n".join([
+                f"**{p['symbol']}** {p['side'].upper()}: {abs(p['size']):.4f} @ ${p['entry_price']:,.2f} "
+                f"(PnL: ${p['unrealized_pnl']:,.2f} / {p['unrealized_pnl_pct']:+.2f}%)"
+                + (f" [Funding: {p.get('metadata', {}).get('funding_rate', 0)*100:.4f}%]" if p.get('metadata', {}).get('funding_rate') is not None else "")
+                for p in funding_positions[:10]  # Limit to 10 positions
+            ])
+            fields.append({
+                'name': '💰 Funding Strategy Positions',
+                'value': pos_text if pos_text else 'None',
+                'inline': False
+            })
+        
+        # Other positions (fallback)
+        if other_positions and not main_positions and not funding_positions:
+            pos_text = "\n".join([
+                f"**{p['symbol']}** {p['side'].upper()}: {abs(p['size']):.4f} @ ${p['entry_price']:,.2f} "
+                f"(PnL: ${p['unrealized_pnl']:,.2f} / {p['unrealized_pnl_pct']:+.2f}%)"
+                for p in other_positions[:10]
             ])
             fields.append({
                 'name': '📈 Open Positions',
                 'value': pos_text if pos_text else 'None',
                 'inline': False
             })
-        else:
+        
+        # If no positions at all
+        if not positions:
             fields.append({
                 'name': '📈 Open Positions',
                 'value': 'None',
@@ -386,7 +462,7 @@ class DiscordReporter:
             'inline': False
         })
         
-        # Strategy Performance
+        # Strategy Performance (Overall)
         if strategy_performance.get('total_trades', 0) > 0:
             perf_text = f"""
 • Total Trades: {strategy_performance['total_trades']}
@@ -394,8 +470,46 @@ class DiscordReporter:
 • Profit Factor: {strategy_performance['profit_factor']:.2f}
 """
             fields.append({
-                'name': '📊 Strategy Performance',
+                'name': '📊 Overall Strategy Performance',
                 'value': perf_text,
+                'inline': False
+            })
+        
+        # Strategy Performance by Source (from positions)
+        if positions:
+            # Calculate PnL by source from current positions
+            main_pnl = sum(p['unrealized_pnl'] for p in main_positions)
+            funding_pnl = sum(p['unrealized_pnl'] for p in funding_positions)
+            main_count = len(main_positions)
+            funding_count = len(funding_positions)
+            
+            if main_count > 0 or funding_count > 0:
+                perf_by_source = []
+                if main_count > 0:
+                    perf_by_source.append(f"**Main Strategy**: {main_count} pos, ${main_pnl:,.2f} unrealized")
+                if funding_count > 0:
+                    perf_by_source.append(f"**Funding Strategy**: {funding_count} pos, ${funding_pnl:,.2f} unrealized")
+                
+                if perf_by_source:
+                    fields.append({
+                        'name': '📊 Performance by Strategy',
+                        'value': "\n".join(perf_by_source),
+                        'inline': False
+                    })
+        
+        # Funding Strategy Metrics (if enabled and has positions)
+        if funding_metrics and funding_metrics.get('has_funding_positions'):
+            funding_text = f"""
+• Funding Positions: {funding_metrics['num_funding_positions']}
+• Funding Notional: ${funding_metrics['total_funding_notional']:,.2f}
+• Funding Unrealized PnL: ${funding_metrics['total_funding_pnl']:,.2f}
+"""
+            if funding_metrics.get('avg_funding_rate') != 0:
+                funding_text += f"• Avg Funding Rate: {funding_metrics['avg_funding_rate']*100:.4f}% per 8h"
+            
+            fields.append({
+                'name': '💰 Funding Strategy Metrics',
+                'value': funding_text,
                 'inline': False
             })
         

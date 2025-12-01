@@ -192,6 +192,7 @@ main() {
         "src/optimizer/timeframe_analyzer.py"
         "src/signals/trend.py"
         "src/signals/cross_sectional.py"
+        "src/signals/funding_opportunity.py"
         "src/risk/position_sizing.py"
         "src/risk/portfolio_limits.py"
         "src/universe/selector.py"
@@ -219,6 +220,13 @@ main() {
         fi
     else
         info "All critical modules found"
+    fi
+    
+    # Verify funding opportunity module (new feature)
+    if [ -f "$BOT_DIR/src/signals/funding_opportunity.py" ]; then
+        info "✓ Funding opportunity strategy module found"
+    else
+        warn "src/signals/funding_opportunity.py not found (funding strategy may not be available)"
     fi
     
     # Verify scripts directory exists (optional, scripts are standalone)
