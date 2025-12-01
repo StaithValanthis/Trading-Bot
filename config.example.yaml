@@ -39,15 +39,15 @@ strategy:
   # Sleeve A: Time-series trend-following
   trend:
     # Short moving average period (bars; 5 bars @4h ≈ 20h)
-    ma_short: 15
+    ma_short: 10
     # Long moving average period (bars; 25 bars @4h ≈ 100h)
     ma_long: 50
     # Momentum lookback (bars; 6 bars @4h ≈ 24h)
-    momentum_lookback: 12
+    momentum_lookback: 18
     # ATR multiplier for stop-loss distance
-    atr_stop_multiplier: 2.5
+    atr_stop_multiplier: 2
     # ATR lookback for volatility calculation (bars; 4 bars @4h ≈ 16h)
-    atr_period: 10
+    atr_period: 4
     # Minimum ATR filter: skip trades if ATR < min_atr_threshold * price
     min_atr_threshold: 0.001  # 0.1% of price
     # Position management
@@ -67,8 +67,8 @@ strategy:
     # Ranking window (bars; 18 bars @4h ≈ 3 days)
     # Exit band (hysteresis): only close positions if rank falls below top_k + exit_band
     # This reduces churn from minor ranking changes (default: 2)
-    exit_band: 1
-    ranking_window: 18
+    exit_band: 
+    ranking_window: 12
     # Number of top symbols to trade
     top_k: 10
     # Rebalance frequency in hours (8h aligns with funding settlements)
@@ -86,6 +86,57 @@ strategy:
     negative_funding_size_boost: 1.2
     # Max boost factor (safety cap)
     max_boost_factor: 1.5
+  
+  # Sleeve D: Funding Rate Opportunity Finder (INDEPENDENT STRATEGY)
+  funding_opportunity:
+    enabled: true  # Set to true to enable
+    
+    # Independent universe configuration
+    universe:
+      use_main_universe: false  # If true, reuse main strategy universe
+      min_24h_volume_entry: 5_000_000  # Lower threshold for funding (more lenient)
+      min_24h_volume_exit: 3_000_000
+      min_history_days: 7  # Less history needed
+      warmup_days: 3  # 3-day warmup for new listings
+      max_days_since_last_update: 7
+      include_list: []  # Optional: specific symbols to include
+      exclude_list: []  # Optional: symbols to exclude
+    
+    # Funding opportunity detection
+    min_funding_rate: 0.0003  # 0.03% per 8h minimum
+    max_positions: 5  # Maximum funding positions
+    
+    # Position sizing
+    sizing:
+      base_size_fraction: 0.08  # 8% of equity per position
+      size_multiplier: 75.0  # Scale by funding rate
+      max_position_size: 0.15  # 15% max per position
+    
+    # Entry filters
+    entry:
+      require_trend_alignment: true  # Require trend supports direction
+      min_momentum_pct: null  # Optional momentum filter
+      max_momentum_pct: null
+    
+    # Exit conditions
+    exit:
+      exit_on_funding_flip: true  # Exit when funding flips
+      exit_funding_threshold: 0.00015  # Exit below this (0.015% per 8h)
+      max_holding_hours: 120  # 5 days maximum
+      stop_loss_atr_multiplier: 2.5  # Wider stops for carry
+      take_profit_rr: 2.5  # Optional: TP at 2.5x risk
+    
+    # Risk management
+    risk:
+      max_total_funding_exposure: 0.40  # 40% of equity max
+      max_funding_rate: 0.005  # Reject rates > 0.5% per 8h
+    
+    # Confluence coordination
+    confluence:
+      enabled: true  # Detect when both strategies agree
+      mode: "share"  # "share", "independent", "prefer_funding", "prefer_main"
+      shared_stop_tightening: 0.8  # 20% tighter stop for shared positions
+      max_shared_position_size: 0.30  # 30% max for shared
 
 # Risk management
 risk:
@@ -140,11 +191,11 @@ universe:
   
   # Historical data requirements
   # Minimum days of continuous OHLCV history required
-  min_history_days: 365
+  min_history_days: 90
   # Extra days of history to download beyond the minimum (buffer for gaps/off-by-one)
-  history_buffer_days: 30
+  history_buffer_days: 5
   # Warm-up period: new listings must pass filters for this many days before entry
-  warmup_days: 0
+  warmup_days: 7
   # Maximum percentage of missing candles allowed (timeframe-aware)
   max_data_gap_pct: 10.0
   # Maximum days since last data update (data must be fairly recent)
@@ -193,7 +244,9 @@ optimizer:
   # Recommended: 30-50 trades for statistical significance
   min_trades: 30
   # Minimum Sharpe ratio to consider updating
-  min_sharpe_ratio: 1.0
+  # For crypto strategies: 0.7-0.8 is "good", 1.0+ is "excellent" but rare
+  # Lowered from 1.0 to 0.75 to account for crypto market characteristics
+  min_sharpe_ratio: 0.75
   # Maximum drawdown allowed (%)
   max_drawdown_pct: -15.0
   # Parameter search method: grid, random, or bayesian

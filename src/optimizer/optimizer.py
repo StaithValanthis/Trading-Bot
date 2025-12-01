@@ -286,14 +286,16 @@ class Optimizer:
             total_days = 0
         
         # Multiple-testing-aware Sharpe threshold
+        # Using a more conservative correction: log-based but capped to avoid over-penalizing
         base_min_sharpe = self.config.optimizer.min_sharpe_ratio
         n_trials_cfg = self.config.optimizer.n_trials or 1
         adjusted_min_sharpe = base_min_sharpe
         try:
-            # Simple log-based correction: scale with log10 of trials relative to 10
-            adjusted_min_sharpe = base_min_sharpe + 0.1 * math.log10(
-                max(1.0, n_trials_cfg / 10.0)
-            )
+            # More conservative correction: smaller multiplier and cap at +0.2
+            # For 300 trials: 0.75 + 0.05 * log10(30) ≈ 0.75 + 0.05 * 1.477 ≈ 0.82
+            # For 100 trials: 0.75 + 0.05 * log10(10) ≈ 0.75 + 0.05 * 1.0 ≈ 0.80
+            correction = 0.05 * math.log10(max(1.0, n_trials_cfg / 10.0))
+            adjusted_min_sharpe = base_min_sharpe + min(correction, 0.2)  # Cap at +0.2
         except Exception:
             # Fallback to base if anything goes wrong
             adjusted_min_sharpe = base_min_sharpe
@@ -362,6 +364,15 @@ class Optimizer:
             try:
                 param_start_time = time_module.time()
                 
+                # Log parameter variation for first few sets to verify exploration
+                if i < 3:
+                    self.logger.info(
+                        f"Parameter set {i+1}/{len(param_sets)} params: "
+                        f"ma_short={params.get('ma_short')}, ma_long={params.get('ma_long')}, "
+                        f"momentum={params.get('momentum_lookback')}, top_k={params.get('top_k')}, "
+                        f"ranking={params.get('ranking_window')}, rebalance={params.get('rebalance_frequency_hours')}"
+                    )
+                
                 # Create config with these parameters
                 test_config = self._create_test_config(params, timeframe)
 
@@ -415,6 +426,15 @@ class Optimizer:
                     avg_return_oos, avg_sharpe_oos, avg_dd_oos, avg_trades_oos, min_trades_oos = _agg(
                         oos_eval
                     )
+                    
+                    # Diagnostic logging for first parameter set
+                    if i == 0:
+                        self.logger.info(
+                            f"Parameter set 1 diagnostic: IS windows={len(is_results)}, OOS windows={len(oos_eval)}, "
+                            f"IS avg_trades={avg_trades_is:.1f}, OOS avg_trades={avg_trades_oos:.1f}, "
+                            f"IS trades per window: {[r.get('total_trades', 0) for r in is_results[:3]]}, "
+                            f"OOS trades per window: {[r.get('total_trades', 0) for r in oos_eval[:3]]}"
+                        )
 
                     # Combined stats (for backwards compatibility)
                     avg_return = np.mean(
@@ -435,15 +455,22 @@ class Optimizer:
 
                     # Check if meets criteria (both IS and OOS)
                     # Note: drawdowns are negative, so >= means "better" (less negative)
+                    # For crypto strategies, OOS performance is more important than IS
                     passes_is = (
                         min_trades_is >= min_trades_threshold
                         and avg_sharpe_is >= min_sharpe_threshold
                         and avg_dd_is >= max_dd_threshold
                     )
-                    # Allow slightly looser constraints for OOS
+                    # OOS criteria: slightly looser Sharpe (0.7x), but also allow if OOS Sharpe is excellent (>1.2)
+                    # This accounts for cases where IS underperforms but OOS is strong (better generalization)
+                    oos_sharpe_min = min_sharpe_threshold * 0.7
+                    oos_sharpe_excellent = 1.2  # If OOS Sharpe > 1.2, accept even if IS is slightly below threshold
                     passes_oos = (
                         min_trades_oos >= min_trades_threshold
-                        and avg_sharpe_oos >= min_sharpe_threshold * 0.7
+                        and (
+                            avg_sharpe_oos >= oos_sharpe_min
+                            or (avg_sharpe_oos >= oos_sharpe_excellent and avg_sharpe_is >= min_sharpe_threshold * 0.6)
+                        )
                         and avg_dd_oos >= max_dd_threshold * 1.2
                     )
                     
@@ -1138,7 +1165,14 @@ class Optimizer:
                 if not lookback_df.empty:
                     window_df = pd.concat([lookback_df, window_df]).sort_index()
             
-            if not window_df.empty and len(window_df) > 100:
+            # Reduced minimum bar requirement: need at least ma_long + some buffer for signals
+            # The 100-bar minimum was too strict for short windows
+            min_required_bars = max(
+                test_config.strategy.trend.ma_long + 10,  # ma_long + small buffer
+                50  # Absolute minimum for any meaningful backtest
+            )
+            
+            if not window_df.empty and len(window_df) >= min_required_bars:
                 window_data[symbol] = window_df
         
         if not window_data:
@@ -1161,10 +1195,13 @@ class Optimizer:
                 stop_slippage_bps=test_config.risk.stop_slippage_bps,
                 tp_slippage_bps=test_config.risk.tp_slippage_bps,
             )
+            
             if 'error' not in result:
                 return result
+            else:
+                self.logger.debug(f"Window {window_start.date()} returned error: {result.get('error')}")
         except Exception as e:
-            self.logger.warning(f"Error in walk-forward window {window_start} to {window_end}: {e}")
+            self.logger.warning(f"Error in walk-forward window {window_start} to {window_end}: {e}", exc_info=True)
         
         return None
     

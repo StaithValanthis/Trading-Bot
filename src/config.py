@@ -147,11 +147,84 @@ class FundingBiasConfig:
 
 
 @dataclass
+class FundingOpportunityUniverseConfig:
+    """Independent universe configuration for funding opportunity strategy."""
+    use_main_universe: bool = False  # If True, reuse main strategy universe; if False, build own
+    # Funding-specific universe filters (only used if use_main_universe: False)
+    min_24h_volume_entry: float = 5_000_000.0
+    min_24h_volume_exit: float = 3_000_000.0
+    volume_check_days: int = 3
+    min_history_days: int = 7
+    warmup_days: int = 3  # 3-day warmup for new listings (safer than 0)
+    max_days_since_last_update: int = 7
+    max_data_gap_pct: float = 10.0
+    include_list: List[str] = field(default_factory=list)
+    exclude_list: List[str] = field(default_factory=list)
+
+
+@dataclass
+class FundingOpportunitySizingConfig:
+    """Position sizing for funding opportunities."""
+    base_size_fraction: float = 0.08  # Base position size as fraction of equity (conservative)
+    size_multiplier: float = 75.0  # Scale by funding rate magnitude (less aggressive)
+    max_position_size: float = 0.15  # Maximum position size (fraction of equity)
+
+
+@dataclass
+class FundingOpportunityEntryConfig:
+    """Entry filters for funding opportunities."""
+    require_trend_alignment: bool = True  # Default to true to reduce directional risk
+    min_momentum_pct: Optional[float] = None
+    max_momentum_pct: Optional[float] = None
+
+
+@dataclass
+class FundingOpportunityExitConfig:
+    """Exit conditions for funding opportunities."""
+    exit_on_funding_flip: bool = True
+    exit_funding_threshold: float = 0.00015  # 0.015% per 8h (lower with hysteresis)
+    max_holding_hours: Optional[int] = 120  # 5 days (more conservative)
+    stop_loss_atr_multiplier: float = 2.5  # Wider stops for carry strategies
+    take_profit_rr: Optional[float] = 2.5  # Optional take profit at 2.5x risk
+
+
+@dataclass
+class FundingOpportunityRiskConfig:
+    """Risk management for funding opportunities."""
+    max_total_funding_exposure: float = 0.40  # Max total funding positions (fraction of equity, more conservative)
+    max_funding_rate: float = 0.005  # Maximum funding rate to accept (0.5% per 8h, avoid extreme spikes)
+
+
+@dataclass
+class FundingOpportunityConfluenceConfig:
+    """Confluence detection and coordination settings."""
+    enabled: bool = True
+    mode: str = "share"  # "share", "independent", "prefer_funding", "prefer_main"
+    shared_stop_tightening: float = 0.8  # Multiply stop distance by this (0.8 = 20% tighter)
+    max_shared_position_size: float = 0.30  # Max position size for shared positions (fraction of equity)
+
+
+@dataclass
+class FundingOpportunityConfig:
+    """Configuration for funding rate opportunity finder."""
+    enabled: bool = False
+    min_funding_rate: float = 0.0003  # Minimum funding rate to consider (per 8h, lowered for more opportunities)
+    max_positions: int = 5  # Maximum number of funding positions
+    universe: FundingOpportunityUniverseConfig = field(default_factory=FundingOpportunityUniverseConfig)
+    sizing: FundingOpportunitySizingConfig = field(default_factory=FundingOpportunitySizingConfig)
+    entry: FundingOpportunityEntryConfig = field(default_factory=FundingOpportunityEntryConfig)
+    exit: FundingOpportunityExitConfig = field(default_factory=FundingOpportunityExitConfig)
+    risk: FundingOpportunityRiskConfig = field(default_factory=FundingOpportunityRiskConfig)
+    confluence: FundingOpportunityConfluenceConfig = field(default_factory=FundingOpportunityConfluenceConfig)
+
+
+@dataclass
 class StrategyConfig:
     """Overall strategy configuration."""
     trend: TrendStrategyConfig = field(default_factory=TrendStrategyConfig)
     cross_sectional: CrossSectionalStrategyConfig = field(default_factory=CrossSectionalStrategyConfig)
     funding_bias: FundingBiasConfig = field(default_factory=FundingBiasConfig)
+    funding_opportunity: FundingOpportunityConfig = field(default_factory=FundingOpportunityConfig)
 
 
 @dataclass
@@ -385,7 +458,8 @@ class BotConfig:
             strategy=StrategyConfig(
                 trend=TrendStrategyConfig(**strategy_dict.get("trend", {})),
                 cross_sectional=CrossSectionalStrategyConfig(**strategy_dict.get("cross_sectional", {})),
-                funding_bias=FundingBiasConfig(**strategy_dict.get("funding_bias", {}))
+                funding_bias=FundingBiasConfig(**strategy_dict.get("funding_bias", {})),
+                funding_opportunity=_parse_funding_opportunity_config(strategy_dict.get("funding_opportunity", {}))
             ),
             risk=RiskConfig(**risk_dict),
             data=DataConfig(**data_dict),
@@ -427,4 +501,29 @@ class BotConfig:
             errors.append("history_buffer_days must be zero or positive")
         
         return errors
+
+
+def _parse_funding_opportunity_config(fo_dict: dict) -> FundingOpportunityConfig:
+    """Parse funding opportunity config from dictionary."""
+    if not fo_dict:
+        return FundingOpportunityConfig()
+    
+    universe_dict = fo_dict.get("universe", {})
+    sizing_dict = fo_dict.get("sizing", {})
+    entry_dict = fo_dict.get("entry", {})
+    exit_dict = fo_dict.get("exit", {})
+    risk_dict = fo_dict.get("risk", {})
+    confluence_dict = fo_dict.get("confluence", {})
+    
+    return FundingOpportunityConfig(
+        enabled=fo_dict.get("enabled", False),
+        min_funding_rate=fo_dict.get("min_funding_rate", 0.0005),
+        max_positions=fo_dict.get("max_positions", 5),
+        universe=FundingOpportunityUniverseConfig(**universe_dict),
+        sizing=FundingOpportunitySizingConfig(**sizing_dict),
+        entry=FundingOpportunityEntryConfig(**entry_dict),
+        exit=FundingOpportunityExitConfig(**exit_dict),
+        risk=FundingOpportunityRiskConfig(**risk_dict),
+        confluence=FundingOpportunityConfluenceConfig(**confluence_dict)
+    )
 

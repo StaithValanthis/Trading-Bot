@@ -154,6 +154,8 @@ class PortfolioState:
         entry_time: Optional[datetime] = None,
         stop_loss_price: Optional[float] = None,
         take_profit_price: Optional[float] = None,
+        source: Optional[str] = None,
+        metadata: Optional[Dict] = None,
     ):
         """
         Set metadata for a position (SL/TP order IDs, entry time, etc.).
@@ -165,6 +167,8 @@ class PortfolioState:
             entry_time: Entry timestamp
             stop_loss_price: Stop-loss price
             take_profit_price: Take-profit price
+            source: Position source ('main_strategy', 'funding_opportunity', 'confluence')
+            metadata: Additional metadata (e.g., funding rate)
         """
         if symbol in self.positions:
             if stop_order_id is not None:
@@ -177,6 +181,10 @@ class PortfolioState:
                 self.positions[symbol]['stop_loss_price'] = stop_loss_price
             if take_profit_price is not None:
                 self.positions[symbol]['take_profit_price'] = take_profit_price
+            if source is not None:
+                self.positions[symbol]['source'] = source
+            if metadata is not None:
+                self.positions[symbol]['metadata'] = metadata
     
     def update_trailing_stop(
         self,

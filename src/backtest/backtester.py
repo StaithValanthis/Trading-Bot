@@ -8,6 +8,7 @@ from datetime import datetime, date
 from ..config import BotConfig
 from ..signals.trend import TrendSignalGenerator, calculate_atr
 from ..signals.cross_sectional import CrossSectionalSignalGenerator
+from ..signals.funding_opportunity import FundingOpportunityGenerator
 from ..risk.position_sizing import PositionSizer
 from ..risk.portfolio_limits import PortfolioLimits
 from ..logging_utils import get_logger
@@ -133,6 +134,19 @@ class Backtester:
         self._sim_exchange = _SimulatedExchange()
         self.position_sizer = PositionSizer(config.risk, self._sim_exchange)
         self.portfolio_limits = PortfolioLimits(config.risk, self._sim_exchange)
+        
+        # Initialize funding opportunity generator if enabled
+        self.funding_opportunity_gen = None
+        if config.strategy.funding_opportunity.enabled:
+            # Create mock exchange for funding rates (backtest uses constant/approximated rates)
+            from unittest.mock import Mock
+            mock_exchange = Mock()
+            # Default funding rate (can be overridden per symbol via funding_rate_history)
+            mock_exchange.fetch_funding_rate = Mock(return_value={'fundingRate': 0.0})
+            self.funding_opportunity_gen = FundingOpportunityGenerator(
+                config.strategy.funding_opportunity,
+                mock_exchange
+            )
 
     def backtest(
         self,
@@ -360,7 +374,31 @@ class Backtester:
             allowed_symbols: Optional[Set[str]] = None
             if universe_history is not None:
                 as_of_date = timestamp.date()
-                allowed_symbols = universe_history.get(as_of_date, set())
+                # Try exact date match first
+                allowed_symbols = universe_history.get(as_of_date)
+                
+                # If no exact match, find nearest prior date (universe membership is forward-looking)
+                if allowed_symbols is None and universe_history:
+                    # Find the most recent date <= as_of_date
+                    prior_dates = [d for d in universe_history.keys() if d <= as_of_date]
+                    if prior_dates:
+                        nearest_date = max(prior_dates)
+                        allowed_symbols = universe_history[nearest_date]
+                    else:
+                        # No prior dates found - use all symbols in symbol_data as fallback
+                        # This handles edge cases where universe_history doesn't cover early dates
+                        allowed_symbols = set(symbol_data.keys())
+                        if i == 0:  # Log once at start
+                            logger.debug(
+                                f"Universe history missing date {as_of_date}, using all symbols as fallback "
+                                f"(universe_history has {len(universe_history)} dates, earliest: {min(universe_history.keys()) if universe_history else 'N/A'})"
+                            )
+                
+                # If still None (empty universe_history dict), use all symbols
+                if allowed_symbols is None:
+                    allowed_symbols = set(symbol_data.keys())
+                    if i == 0:
+                        logger.debug("Universe history is empty, using all symbols as fallback")
 
             # Generate signals for symbols with data at this timestamp
             symbol_signals: Dict[str, Dict] = {}
@@ -382,16 +420,88 @@ class Backtester:
                 trend_signal = self.trend_gen.generate_signal(df_up_to_now)
                 symbol_signals[symbol] = trend_signal
             
-            # Cross-sectional selection
+            # Generate funding opportunity signals if enabled
+            funding_signals = {}
+            funding_selected = []
+            if (self.config.strategy.funding_opportunity.enabled and 
+                self.funding_opportunity_gen and 
+                should_rebalance):
+                
+                # Get funding rates for symbols (from history or constant approximation)
+                funding_universe = list(symbol_data_at_timestamp.keys())
+                
+                # Update mock exchange to return funding rates
+                if funding_rate_history:
+                    def get_funding_rate(symbol: str):
+                        if symbol in funding_rate_history:
+                            series = funding_rate_history[symbol]
+                            # Find rate for current timestamp
+                            try:
+                                if timestamp in series.index:
+                                    return {'fundingRate': float(series.loc[timestamp])}
+                                # Find nearest prior
+                                prior = series.index[series.index <= timestamp]
+                                if len(prior) > 0:
+                                    return {'fundingRate': float(series.loc[prior[-1]])}
+                            except:
+                                pass
+                        # Fallback to constant
+                        return {'fundingRate': funding_rate_per_8h}
+                else:
+                    def get_funding_rate(symbol: str):
+                        return {'fundingRate': funding_rate_per_8h}
+                
+                self.funding_opportunity_gen.exchange.fetch_funding_rate = Mock(side_effect=get_funding_rate)
+                
+                # Scan for funding opportunities
+                try:
+                    funding_opportunities = self.funding_opportunity_gen.scan_opportunities(
+                        funding_universe,
+                        symbol_data_at_timestamp
+                    )
+                    
+                    # Select top opportunities
+                    top_opportunities = funding_opportunities[:self.config.strategy.funding_opportunity.max_positions]
+                    funding_selected = [opp.symbol for opp in top_opportunities]
+                    
+                    # Generate signals
+                    for opp in top_opportunities:
+                        signal = self.funding_opportunity_gen.generate_signal(
+                            opp.symbol,
+                            opp.funding_rate,
+                            symbol_data_at_timestamp.get(opp.symbol)
+                        )
+                        signal['source'] = 'funding_opportunity'
+                        signal['metadata'] = opp.metadata
+                        funding_signals[opp.symbol] = signal
+                except Exception as e:
+                    self.logger.warning(f"Error generating funding signals in backtest: {e}")
+                    funding_signals = {}
+                    funding_selected = []
+            
+            # Cross-sectional selection (main strategy)
             if should_rebalance and symbol_data_at_timestamp:
                 selected_symbols = self.cross_sectional_gen.select_top_symbols(
                     symbol_data_at_timestamp,
                     symbol_signals,
                     self.config.strategy.cross_sectional.require_trend_alignment
                 )
-                
-                # Close positions not in selected symbols
+            else:
+                selected_symbols = []
+            
+            # Close positions not in selected symbols (main strategy)
+            # Also close funding positions if they're not in funding_selected
+            if should_rebalance:
                 symbols_to_close = [s for s in positions.keys() if s not in selected_symbols]
+                if self.config.strategy.funding_opportunity.enabled:
+                    # Close funding positions not in funding_selected
+                    funding_positions_to_close = [
+                        s for s in positions.keys()
+                        if positions[s].get('source') in ['funding_opportunity'] and s not in funding_selected
+                    ]
+                    symbols_to_close.extend(funding_positions_to_close)
+                
+                for symbol in symbols_to_close:
                 for symbol in symbols_to_close:
                     pos = positions[symbol]
                     df_sym = symbol_data[symbol]
@@ -495,10 +605,127 @@ class Backtester:
                         # For trailing stop
                         "highest_price": entry_price if signal == "long" else None,
                         "lowest_price": entry_price if signal == "short" else None,
+                        # Source tracking (Phase 1: basic support)
+                        "source": signal_dict.get("source", "main_strategy"),
+                        "metadata": signal_dict.get("metadata", {}),
                     }
 
                     # Pay entry fee
                     current_equity -= abs(adjusted_size) * entry_price * taker_fee
+                
+                # Process funding strategy positions (excluding confluence)
+                if (self.config.strategy.funding_opportunity.enabled and 
+                    self.funding_opportunity_gen):
+                    funding_strategy_symbols = [s for s in funding_selected if s not in confluence_symbols]
+                    
+                    # Calculate total funding exposure
+                    total_funding_exposure = sum(
+                        abs(pos.get('notional', 0)) for pos in positions.values()
+                        if pos.get('source') in ['funding_opportunity', 'confluence']
+                    )
+                    
+                    for symbol in funding_strategy_symbols:
+                        if symbol in positions:
+                            continue
+                        
+                        signal_dict = funding_signals.get(symbol)
+                        if not signal_dict or signal_dict["signal"] == "flat":
+                            continue
+                        
+                        signal = signal_dict["signal"]
+                        entry_price = signal_dict["entry_price"]
+                        stop_loss = signal_dict["stop_loss"]
+                        
+                        if not stop_loss or not entry_price:
+                            continue
+                        
+                        # Funding-specific sizing
+                        base_size_fraction = self.config.strategy.funding_opportunity.sizing.base_size_fraction
+                        funding_rate = signal_dict.get('metadata', {}).get('funding_rate', 0.0)
+                        abs_funding = abs(funding_rate)
+                        
+                        size_multiplier = self.config.strategy.funding_opportunity.sizing.size_multiplier
+                        funding_multiplier = 1.0 + (abs_funding * size_multiplier)
+                        target_size_fraction = min(
+                            base_size_fraction * funding_multiplier,
+                            self.config.strategy.funding_opportunity.sizing.max_position_size
+                        )
+                        
+                        target_notional = current_equity * target_size_fraction
+                        size = target_notional / entry_price
+                        
+                        # Apply stop loss risk limit
+                        stop_distance = abs(entry_price - stop_loss) if signal == 'long' else abs(stop_loss - entry_price)
+                        if stop_distance > 0:
+                            risk_at_size = size * stop_distance
+                            max_risk = current_equity * self.config.risk.per_trade_risk_fraction
+                            if risk_at_size > max_risk:
+                                size = (max_risk / stop_distance)
+                        
+                        # Check funding exposure limit
+                        notional = size * entry_price
+                        max_allowed_exposure = current_equity * self.config.strategy.funding_opportunity.risk.max_total_funding_exposure
+                        if total_funding_exposure + notional > max_allowed_exposure:
+                            max_additional = max_allowed_exposure - total_funding_exposure
+                            if max_additional <= 0:
+                                continue
+                            size = min(size, max_additional / entry_price)
+                            notional = size * entry_price
+                        
+                        if size <= 0:
+                            continue
+                        
+                        # Check leverage
+                        sim_portfolio_state = _BacktestPortfolioState(current_equity, positions)
+                        adjusted_size, _ = self.portfolio_limits.scale_position_for_limits(
+                            sim_portfolio_state,
+                            symbol,
+                            size,
+                            entry_price,
+                            signal,
+                        )
+                        if adjusted_size <= 0:
+                            continue
+                        
+                        # Check max positions
+                        within_max, _ = self.portfolio_limits.check_max_positions(
+                            sim_portfolio_state,
+                            symbol,
+                        )
+                        if not within_max:
+                            continue
+                        
+                        # Calculate take-profit
+                        take_profit = None
+                        if self.config.strategy.funding_opportunity.exit.take_profit_rr and stop_loss:
+                            stop_distance = abs(entry_price - stop_loss)
+                            if signal == "long":
+                                take_profit = entry_price + (stop_distance * self.config.strategy.funding_opportunity.exit.take_profit_rr)
+                            else:
+                                take_profit = entry_price - (stop_distance * self.config.strategy.funding_opportunity.exit.take_profit_rr)
+                        
+                        # Open funding position
+                        notional = abs(adjusted_size) * entry_price
+                        positions[symbol] = {
+                            "size": adjusted_size,
+                            "contracts": adjusted_size,
+                            "entry_price": entry_price,
+                            "stop_loss": stop_loss,
+                            "take_profit": take_profit,
+                            "signal": signal,
+                            "entry_time": timestamp,
+                            "notional": notional,
+                            "highest_price": entry_price if signal == "long" else None,
+                            "lowest_price": entry_price if signal == "short" else None,
+                            "source": "funding_opportunity",
+                            "metadata": signal_dict.get("metadata", {}),
+                        }
+                        
+                        current_equity -= abs(adjusted_size) * entry_price * taker_fee
+                        total_funding_exposure += notional
+                
+                # Process confluence positions (simplified - would need full confluence logic)
+                # For now, confluence positions are handled by main strategy with source='confluence'
                 
                 last_rebalance_time = timestamp
             
@@ -533,7 +760,9 @@ class Backtester:
                 'exit_price': exit_price,
                 'pnl': pnl,
                 'return_pct': (pnl / (entry_price * size)) * 100,
-                'reason': 'end_of_backtest'
+                'reason': 'end_of_backtest',
+                'source': pos.get('source', 'main_strategy'),  # Preserve source
+                'metadata': pos.get('metadata', {}),  # Preserve metadata
             })
         
         # Calculate metrics
@@ -618,7 +847,81 @@ class Backtester:
             'trades': trades,
             'equity_history': equity_history,
             'funding_pnl_total': funding_pnl_total,
+            'timestamps': timestamps,  # Add timestamps for time-based calculations
         }
+        
+        # Calculate funding-specific metrics
+        if self.config.strategy.funding_opportunity.enabled:
+            funding_metrics = self._calculate_funding_metrics(trades, timestamps, initial_capital)
+            result['funding_metrics'] = funding_metrics
+    
+    def _calculate_funding_metrics(
+        self,
+        trades: List[Dict],
+        timestamps: List,
+        initial_capital: float
+    ) -> Dict:
+        """Calculate funding-specific metrics from trades."""
+        funding_trades = [
+            t for t in trades
+            if t.get('source') in ['funding_opportunity', 'confluence', 'confluence_prefer_funding', 'confluence_prefer_main']
+        ]
+        
+        metrics = {
+            'total_funding_trades': len(funding_trades),
+            'funding_trades_per_year': 0.0,
+            'holding_times_hours': [],
+            'entry_funding_rates': {'long': [], 'short': []},
+            'max_concurrent_funding_positions': 0,  # Would need position history
+            'max_funding_exposure_pct': 0.0,  # Would need position history
+        }
+        
+        if funding_trades and timestamps:
+            # Calculate holding times
+            for trade in funding_trades:
+                entry_time = trade.get('entry_time')
+                exit_time = trade.get('exit_time')
+                if entry_time and exit_time:
+                    if isinstance(entry_time, str):
+                        entry_time = pd.to_datetime(entry_time)
+                    if isinstance(exit_time, str):
+                        exit_time = pd.to_datetime(exit_time)
+                    hours = (exit_time - entry_time).total_seconds() / 3600
+                    metrics['holding_times_hours'].append(hours)
+                
+                # Extract entry funding rate from metadata
+                metadata = trade.get('metadata', {})
+                funding_rate = metadata.get('funding_rate')
+                if funding_rate is not None:
+                    signal = trade.get('side', 'long')
+                    metrics['entry_funding_rates'][signal].append(funding_rate)
+            
+            # Calculate trades per year
+            first_trade = min(t.get('entry_time', timestamps[0]) for t in funding_trades if t.get('entry_time'))
+            last_trade = max(t.get('exit_time', timestamps[-1]) for t in funding_trades if t.get('exit_time'))
+            if isinstance(first_trade, str):
+                first_trade = pd.to_datetime(first_trade)
+            if isinstance(last_trade, str):
+                last_trade = pd.to_datetime(last_trade)
+            years = (last_trade - first_trade).total_seconds() / (365.25 * 24 * 3600)
+            if years > 0:
+                metrics['funding_trades_per_year'] = len(funding_trades) / years
+            
+            # Calculate holding time statistics
+            if metrics['holding_times_hours']:
+                holding_times = sorted(metrics['holding_times_hours'])
+                metrics['holding_time_min'] = holding_times[0]
+                metrics['holding_time_median'] = holding_times[len(holding_times) // 2]
+                metrics['holding_time_90th_pct'] = holding_times[int(len(holding_times) * 0.9)] if len(holding_times) > 10 else holding_times[-1]
+                metrics['holding_time_max'] = holding_times[-1]
+            
+            # Calculate average entry funding rates
+            if metrics['entry_funding_rates']['long']:
+                metrics['avg_entry_funding_rate_long'] = np.mean(metrics['entry_funding_rates']['long'])
+            if metrics['entry_funding_rates']['short']:
+                metrics['avg_entry_funding_rate_short'] = np.mean(metrics['entry_funding_rates']['short'])
+        
+        return metrics
     
     def _calculate_max_drawdown(self, equity_series: pd.Series) -> float:
         """Calculate maximum drawdown."""

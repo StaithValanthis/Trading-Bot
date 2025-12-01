@@ -18,6 +18,8 @@ from ..data.downloader import DataDownloader
 from ..signals.trend import TrendSignalGenerator
 from ..signals.cross_sectional import CrossSectionalSignalGenerator
 from ..signals.funding_carry import FundingBiasGenerator
+from ..signals.funding_opportunity import FundingOpportunityGenerator
+from ..config import UniverseConfig
 from ..risk.position_sizing import PositionSizer
 from ..risk.portfolio_limits import PortfolioLimits
 from ..execution.executor import OrderExecutor
@@ -376,6 +378,18 @@ def run_live(config_path: str):
         trend_gen = TrendSignalGenerator(config.strategy.trend)
         cross_sectional_gen = CrossSectionalSignalGenerator(config.strategy.cross_sectional)
         funding_bias = FundingBiasGenerator(config.strategy.funding_bias, exchange)
+        
+        # Initialize funding opportunity generator (if enabled)
+        # Note: funding_universe_selector will be initialized later after universe_store is created
+        funding_opportunity_gen = None
+        funding_universe_selector = None
+        if config.strategy.funding_opportunity.enabled:
+            funding_opportunity_gen = FundingOpportunityGenerator(
+                config.strategy.funding_opportunity,
+                exchange
+            )
+            logger.info("Funding opportunity generator initialized")
+        
         position_sizer = PositionSizer(config.risk, exchange)
         portfolio_limits = PortfolioLimits(config.risk, exchange)
         trades_store = TradesStore(config.data.db_path)
@@ -441,6 +455,7 @@ def run_live(config_path: str):
     
     # Initialize universe selector if using dynamic universe
     universe_selector = None
+    universe_store = None
     if config.universe.rebalance_frequency_hours > 0:
         universe_store = UniverseStore(config.data.db_path)
         universe_selector = UniverseSelector(
@@ -450,6 +465,31 @@ def run_live(config_path: str):
             universe_store
         )
         logger.info("Dynamic universe selection enabled")
+    
+    # Initialize funding universe selector if needed (after universe_store is created)
+    if config.strategy.funding_opportunity.enabled and not config.strategy.funding_opportunity.universe.use_main_universe:
+        if universe_store is None:
+            universe_store = UniverseStore(config.data.db_path)
+        funding_universe_config = UniverseConfig(
+            min_24h_volume_entry=config.strategy.funding_opportunity.universe.min_24h_volume_entry,
+            min_24h_volume_exit=config.strategy.funding_opportunity.universe.min_24h_volume_exit,
+            volume_check_days=config.strategy.funding_opportunity.universe.volume_check_days,
+            min_history_days=config.strategy.funding_opportunity.universe.min_history_days,
+            warmup_days=config.strategy.funding_opportunity.universe.warmup_days,
+            max_days_since_last_update=config.strategy.funding_opportunity.universe.max_days_since_last_update,
+            max_data_gap_pct=config.strategy.funding_opportunity.universe.max_data_gap_pct,
+            include_list=config.strategy.funding_opportunity.universe.include_list,
+            exclude_list=config.strategy.funding_opportunity.universe.exclude_list,
+        )
+        funding_universe_selector = UniverseSelector(
+            funding_universe_config,
+            exchange,
+            store,
+            universe_store
+        )
+        logger.info("Funding opportunity strategy: Using independent universe")
+    elif config.strategy.funding_opportunity.enabled:
+        logger.info("Funding opportunity strategy: Using main strategy universe")
         
         # Pre-download data for initial universe to ensure data exists at startup
         logger.info("Pre-downloading data for initial universe...")
@@ -1017,6 +1057,139 @@ def run_live(config_path: str):
                             f"Stop Loss: ${stop_str}"
                         )
                 
+                # ============================================================
+                # FUNDING OPPORTUNITY STRATEGY (INDEPENDENT)
+                # ============================================================
+                
+                funding_signals = {}
+                funding_selected = []
+                funding_universe = set()
+                funding_symbol_data = {}
+                
+                if config.strategy.funding_opportunity.enabled and funding_opportunity_gen:
+                    logger.info("=" * 60)
+                    logger.info("FUNDING OPPORTUNITY STRATEGY - Scanning for opportunities")
+                    logger.info("=" * 60)
+                    
+                    # Build independent universe
+                    if config.strategy.funding_opportunity.universe.use_main_universe:
+                        funding_universe = universe  # Reuse main universe
+                        funding_symbol_data = symbol_data  # Reuse main data
+                        logger.info(f"Using main universe: {len(funding_universe)} symbols")
+                    else:
+                        # Build separate universe
+                        if funding_universe_selector:
+                            funding_universe = funding_universe_selector.build_universe(datetime.now(timezone.utc).date())
+                            logger.info(f"Built independent funding universe: {len(funding_universe)} symbols")
+                            
+                            # Load data for funding universe
+                            for symbol in funding_universe:
+                                try:
+                                    df = store.get_ohlcv(
+                                        symbol,
+                                        config.exchange.timeframe,
+                                        limit=config.data.lookback_bars
+                                    )
+                                    if df is not None and not df.empty:
+                                        funding_symbol_data[symbol] = df
+                                except Exception as e:
+                                    logger.warning(f"Error loading data for {symbol} in funding universe: {e}")
+                        else:
+                            logger.warning("Funding universe selector not initialized, skipping funding strategy")
+                            funding_universe = set()
+                    
+                    if funding_universe:
+                        # Scan for funding opportunities
+                        funding_opportunities = funding_opportunity_gen.scan_opportunities(
+                            list(funding_universe),
+                            funding_symbol_data
+                        )
+                        
+                        logger.info(f"Found {len(funding_opportunities)} funding opportunities")
+                        
+                        # Select top opportunities (up to max_positions)
+                        top_opportunities = funding_opportunities[:config.strategy.funding_opportunity.max_positions]
+                        funding_selected = [opp.symbol for opp in top_opportunities]
+                        
+                        # Log top opportunities
+                        if top_opportunities:
+                            logger.info("Top funding opportunities:")
+                            for i, opp in enumerate(top_opportunities, 1):
+                                logger.info(
+                                    f"  {i}. {opp.symbol}: {opp.signal.upper()} | "
+                                    f"Funding: {opp.funding_rate*100:.4f}% per 8h | "
+                                    f"Expected: {opp.expected_funding_per_day*100:.3f}% per day | "
+                                    f"Confidence: {opp.confidence:.2f}"
+                                )
+                        
+                        # Generate signals for opportunities
+                        for opp in top_opportunities:
+                            signal = funding_opportunity_gen.generate_signal(
+                                opp.symbol,
+                                opp.funding_rate,
+                                funding_symbol_data.get(opp.symbol)
+                            )
+                            signal['source'] = 'funding_opportunity'
+                            signal['metadata'] = opp.metadata
+                            funding_signals[opp.symbol] = signal
+                        
+                        # Check existing funding positions for exits
+                        for symbol, position in list(portfolio.positions.items()):
+                            if position.get('source') == 'funding_opportunity':
+                                current_funding = funding_opportunity_gen.get_funding_rate(symbol)
+                                if current_funding is not None:
+                                    should_exit, reason = funding_opportunity_gen.should_exit(
+                                        symbol,
+                                        position,
+                                        current_funding,
+                                        funding_symbol_data.get(symbol)
+                                    )
+                                    if should_exit:
+                                        logger.info(
+                                            f"Funding position {symbol} marked for exit: {reason} "
+                                            f"(funding: {current_funding*100:.4f}% per 8h)"
+                                        )
+                                        # Remove from funding_selected so it gets closed
+                                        if symbol in funding_selected:
+                                            funding_selected.remove(symbol)
+                
+                # ============================================================
+                # CONFLUENCE DETECTION & COORDINATION
+                # ============================================================
+                
+                confluence_symbols = set()
+                confluence_info = {}
+                
+                if (config.strategy.funding_opportunity.enabled and 
+                    config.strategy.funding_opportunity.confluence.enabled and
+                    funding_opportunity_gen and
+                    funding_selected):
+                    
+                    # Detect confluence
+                    confluence_info = funding_opportunity_gen.detect_confluence(
+                        funding_selected,
+                        funding_signals,
+                        selected_symbols,  # Main strategy selected symbols
+                        symbol_signals  # Main strategy signals
+                    )
+                    
+                    # Find symbols where both strategies agree (aligned signals)
+                    confluence_symbols = {
+                        symbol for symbol, info in confluence_info.items()
+                        if info.get('aligned', False)
+                    }
+                    
+                    if confluence_symbols:
+                        logger.info("=" * 60)
+                        logger.info(f"CONFLUENCE DETECTED: {len(confluence_symbols)} symbols")
+                        logger.info("=" * 60)
+                        for symbol in confluence_symbols:
+                            info = confluence_info[symbol]
+                            logger.info(
+                                f"  {symbol}: Both strategies want {info['confluence_type'].upper()} "
+                                f"(Main: {info['main_signal']}, Funding: {info['funding_signal']})"
+                            )
+                
                 # Generate target positions
                 # CRITICAL: Build target positions EVERY iteration (not just during rebalance)
                 # This ensures existing positions are preserved when they're still in selected_symbols
@@ -1030,7 +1203,29 @@ def run_live(config_path: str):
                     # This ensures positions are only closed when replacements can actually open
                     # STEP 1: Build unconstrained target positions (without max_positions/concentration checks)
                     unconstrained_targets = {}
-                    for symbol in selected_symbols:
+                    
+                    # Track which symbols are from confluence (to handle separately)
+                    confluence_targets = {}
+                    
+                    # Calculate total funding exposure from existing positions (SAFETY CHECK)
+                    total_funding_exposure = 0.0
+                    for symbol, pos in portfolio.positions.items():
+                        if pos.get('source') in ['funding_opportunity', 'confluence', 'confluence_prefer_funding', 'confluence_prefer_main']:
+                            total_funding_exposure += abs(pos.get('notional', 0))
+                    
+                    # Log exposure status for transparency
+                    if config.strategy.funding_opportunity.enabled and total_funding_exposure > 0:
+                        exposure_pct = (total_funding_exposure / portfolio.equity * 100) if portfolio.equity > 0 else 0
+                        max_exposure_pct = config.strategy.funding_opportunity.risk.max_total_funding_exposure * 100
+                        logger.debug(
+                            f"Current funding exposure: ${total_funding_exposure:,.2f} "
+                            f"({exposure_pct:.1f}% of equity, limit={max_exposure_pct:.1f}%)"
+                        )
+                    
+                    # Process main strategy positions (excluding confluence symbols)
+                    main_strategy_symbols = [s for s in selected_symbols if s not in confluence_symbols]
+                    
+                    for symbol in main_strategy_symbols:
                         signal_dict = symbol_signals.get(symbol)
                         if not signal_dict or signal_dict['signal'] == 'flat':
                             continue
@@ -1135,11 +1330,312 @@ def run_live(config_path: str):
                             'stop_loss': stop_loss,
                             'notional': abs(adjusted_size * entry_price * contract_size),
                             'adjusted_size': adjusted_size,
-                            'contract_size': contract_size
+                            'contract_size': contract_size,
+                            'source': 'main_strategy'
                         }
                     
-                    # STEP 2: Determine what will be closed (symbols not in selected_symbols)
-                    positions_to_close = [s for s in portfolio.positions if s not in selected_symbols]
+                    # Process funding strategy positions (excluding confluence symbols)
+                    if config.strategy.funding_opportunity.enabled and funding_opportunity_gen:
+                        funding_strategy_symbols = [s for s in funding_selected if s not in confluence_symbols]
+                        
+                        for symbol in funding_strategy_symbols:
+                            signal_dict = funding_signals.get(symbol)
+                            if not signal_dict or signal_dict['signal'] == 'flat':
+                                continue
+                            
+                            signal = signal_dict['signal']
+                            entry_price = signal_dict['entry_price']
+                            stop_loss = signal_dict['stop_loss']
+                            
+                            if not stop_loss or not entry_price:
+                                continue
+                            
+                            # Calculate position size for funding opportunity
+                            base_size_fraction = config.strategy.funding_opportunity.sizing.base_size_fraction
+                            funding_rate = signal_dict.get('metadata', {}).get('funding_rate', 0.0)
+                            abs_funding = abs(funding_rate)
+                            
+                            # Scale size by funding rate magnitude
+                            size_multiplier = config.strategy.funding_opportunity.sizing.size_multiplier
+                            funding_multiplier = 1.0 + (abs_funding * size_multiplier)
+                            target_size_fraction = min(
+                                base_size_fraction * funding_multiplier,
+                                config.strategy.funding_opportunity.sizing.max_position_size
+                            )
+                            
+                            # Calculate position size based on equity fraction
+                            market_info = exchange.get_market_info(symbol)
+                            contract_size = market_info.get('contractSize', 1.0)
+                            target_notional = portfolio.equity * target_size_fraction
+                            size = target_notional / (entry_price * contract_size)
+                            
+                            # Apply stop loss sizing (ensure risk is reasonable)
+                            stop_distance = abs(entry_price - stop_loss) if signal == 'long' else abs(stop_loss - entry_price)
+                            if stop_distance > 0:
+                                risk_at_size = size * stop_distance * contract_size
+                                max_risk = portfolio.equity * config.risk.per_trade_risk_fraction
+                                if risk_at_size > max_risk:
+                                    # Scale down to respect risk limit
+                                    size = (max_risk / (stop_distance * contract_size))
+                            
+                            # Check total funding exposure limit (SAFETY CHECK - STRICTLY ENFORCED)
+                            notional = size * entry_price * contract_size
+                            max_allowed_exposure = portfolio.equity * config.strategy.funding_opportunity.risk.max_total_funding_exposure
+                            if total_funding_exposure + notional > max_allowed_exposure:
+                                # Scale down to fit exposure limit
+                                max_additional_exposure = max_allowed_exposure - total_funding_exposure
+                                if max_additional_exposure <= 0:
+                                    logger.warning(
+                                        f"⚠️ SAFETY: Skipping {symbol}: total funding exposure limit reached "
+                                        f"({total_funding_exposure/portfolio.equity*100:.1f}% of equity, limit={config.strategy.funding_opportunity.risk.max_total_funding_exposure*100:.1f}%)"
+                                    )
+                                    continue
+                                size_before = size
+                                size = min(size, max_additional_exposure / (entry_price * contract_size))
+                                notional = size * entry_price * contract_size
+                                if size < size_before:
+                                    logger.info(
+                                        f"Scaled {symbol} funding position for exposure limit: "
+                                        f"{size_before:.6f} → {size:.6f} contracts "
+                                        f"(exposure: ${total_funding_exposure:,.2f} + ${notional:,.2f} = ${total_funding_exposure + notional:,.2f} / ${max_allowed_exposure:,.2f})"
+                                    )
+                            
+                            if size <= 0:
+                                logger.warning(f"Skipping {symbol}: invalid size")
+                                continue
+                            
+                            # Check leverage limits
+                            within_limits, limit_error = portfolio_limits.check_leverage_limit(
+                                portfolio,
+                                notional,
+                                signal
+                            )
+                            
+                            if not within_limits:
+                                size, _ = portfolio_limits.scale_position_for_limits(
+                                    portfolio,
+                                    symbol,
+                                    size,
+                                    entry_price,
+                                    signal
+                                )
+                                if size <= 0:
+                                    continue
+                            
+                            signed_size = size if signal == 'long' else -size
+                            unconstrained_targets[symbol] = {
+                                'size': signed_size,
+                                'signal': signal,
+                                'entry_price': entry_price,
+                                'stop_loss': stop_loss,
+                                'notional': abs(size * entry_price * contract_size),
+                                'adjusted_size': size,
+                                'contract_size': contract_size,
+                                'source': 'funding_opportunity',
+                                'metadata': signal_dict.get('metadata', {})
+                            }
+                            total_funding_exposure += notional
+                    
+                    # Process confluence positions (both strategies agree)
+                    if confluence_symbols and config.strategy.funding_opportunity.confluence.enabled:
+                        confluence_mode = config.strategy.funding_opportunity.confluence.mode
+                        
+                        for symbol in confluence_symbols:
+                            main_signal = symbol_signals.get(symbol, {})
+                            funding_signal = funding_signals.get(symbol, {})
+                            
+                            if main_signal.get('signal') != funding_signal.get('signal'):
+                                # Signals don't align, skip confluence
+                                continue
+                            
+                            signal = main_signal.get('signal')
+                            if signal == 'flat':
+                                continue
+                            
+                            # Use entry price and stop from main strategy (or funding, depending on mode)
+                            if confluence_mode == "prefer_funding":
+                                entry_price = funding_signal.get('entry_price')
+                                stop_loss = funding_signal.get('stop_loss')
+                            elif confluence_mode == "prefer_main":
+                                entry_price = main_signal.get('entry_price')
+                                stop_loss = main_signal.get('stop_loss')
+                            else:  # "share" or "independent"
+                                # Use main strategy's entry/stop, but will combine sizes
+                                entry_price = main_signal.get('entry_price')
+                                stop_loss = main_signal.get('stop_loss')
+                            
+                            if not entry_price or not stop_loss:
+                                continue
+                            
+                            market_info = exchange.get_market_info(symbol)
+                            contract_size = market_info.get('contractSize', 1.0)
+                            
+                            if confluence_mode == "share":
+                                # Combine position sizes from both strategies
+                                # Calculate main strategy size
+                                main_size, _ = position_sizer.calculate_position_size(
+                                    symbol,
+                                    portfolio.equity,
+                                    main_signal.get('entry_price'),
+                                    main_signal.get('stop_loss'),
+                                    signal
+                                )
+                                
+                                # Calculate funding strategy size
+                                funding_rate = funding_signal.get('metadata', {}).get('funding_rate', 0.0)
+                                abs_funding = abs(funding_rate)
+                                base_size_fraction = config.strategy.funding_opportunity.sizing.base_size_fraction
+                                size_multiplier = config.strategy.funding_opportunity.sizing.size_multiplier
+                                funding_multiplier = 1.0 + (abs_funding * size_multiplier)
+                                target_size_fraction = min(
+                                    base_size_fraction * funding_multiplier,
+                                    config.strategy.funding_opportunity.sizing.max_position_size
+                                )
+                                funding_notional = portfolio.equity * target_size_fraction
+                                funding_size = funding_notional / (entry_price * contract_size)
+                                
+                                # Combine sizes (capped)
+                                combined_size = main_size + funding_size
+                                max_shared_size = (
+                                    portfolio.equity * 
+                                    config.strategy.funding_opportunity.confluence.max_shared_position_size
+                                ) / (entry_price * contract_size)
+                                shared_size = min(combined_size, max_shared_size)
+                                
+                                # Apply tighter stop loss
+                                stop_distance = abs(entry_price - stop_loss) if signal == 'long' else abs(stop_loss - entry_price)
+                                tightened_distance = stop_distance * config.strategy.funding_opportunity.confluence.shared_stop_tightening
+                                if signal == 'long':
+                                    shared_stop = entry_price - tightened_distance
+                                else:
+                                    shared_stop = entry_price + tightened_distance
+                                
+                                # Check leverage
+                                shared_notional = shared_size * entry_price * contract_size
+                                within_limits, _ = portfolio_limits.check_leverage_limit(
+                                    portfolio,
+                                    shared_notional,
+                                    signal
+                                )
+                                if not within_limits:
+                                    shared_size, _ = portfolio_limits.scale_position_for_limits(
+                                        portfolio,
+                                        symbol,
+                                        shared_size,
+                                        entry_price,
+                                        signal
+                                    )
+                                    if shared_size <= 0:
+                                        continue
+                                
+                                signed_size = shared_size if signal == 'long' else -shared_size
+                                confluence_targets[symbol] = {
+                                    'size': signed_size,
+                                    'signal': signal,
+                                    'entry_price': entry_price,
+                                    'stop_loss': shared_stop,  # Use tightened stop
+                                    'notional': abs(shared_size * entry_price * contract_size),
+                                    'adjusted_size': shared_size,
+                                    'contract_size': contract_size,
+                                    'source': 'confluence',
+                                    'metadata': {
+                                        'main_contribution': main_size,
+                                        'funding_contribution': funding_size,
+                                        'funding_rate': funding_rate
+                                    }
+                                }
+                                
+                                logger.info(
+                                    f"Confluence position {symbol}: shared size={shared_size:.6f} "
+                                    f"(main={main_size:.6f}, funding={funding_size:.6f}), "
+                                    f"stop={shared_stop:.4f} (tightened by {config.strategy.funding_opportunity.confluence.shared_stop_tightening})"
+                                )
+                            
+                            elif confluence_mode == "prefer_funding":
+                                # Use funding strategy's sizing
+                                funding_rate = funding_signal.get('metadata', {}).get('funding_rate', 0.0)
+                                abs_funding = abs(funding_rate)
+                                base_size_fraction = config.strategy.funding_opportunity.sizing.base_size_fraction
+                                size_multiplier = config.strategy.funding_opportunity.sizing.size_multiplier
+                                funding_multiplier = 1.0 + (abs_funding * size_multiplier)
+                                target_size_fraction = min(
+                                    base_size_fraction * funding_multiplier,
+                                    config.strategy.funding_opportunity.sizing.max_position_size
+                                )
+                                target_notional = portfolio.equity * target_size_fraction
+                                size = target_notional / (entry_price * contract_size)
+                                
+                                # Apply risk limits
+                                stop_distance = abs(entry_price - stop_loss) if signal == 'long' else abs(stop_loss - entry_price)
+                                if stop_distance > 0:
+                                    risk_at_size = size * stop_distance * contract_size
+                                    max_risk = portfolio.equity * config.risk.per_trade_risk_fraction
+                                    if risk_at_size > max_risk:
+                                        size = (max_risk / (stop_distance * contract_size))
+                                
+                                notional = size * entry_price * contract_size
+                                within_limits, _ = portfolio_limits.check_leverage_limit(portfolio, notional, signal)
+                                if not within_limits:
+                                    size, _ = portfolio_limits.scale_position_for_limits(portfolio, symbol, size, entry_price, signal)
+                                    if size <= 0:
+                                        continue
+                                
+                                signed_size = size if signal == 'long' else -size
+                                unconstrained_targets[symbol] = {
+                                    'size': signed_size,
+                                    'signal': signal,
+                                    'entry_price': entry_price,
+                                    'stop_loss': stop_loss,
+                                    'notional': abs(size * entry_price * contract_size),
+                                    'adjusted_size': size,
+                                    'contract_size': contract_size,
+                                    'source': 'confluence_prefer_funding',
+                                    'metadata': funding_signal.get('metadata', {})
+                                }
+                            
+                            elif confluence_mode == "prefer_main":
+                                # Use main strategy's sizing
+                                main_size, _ = position_sizer.calculate_position_size(
+                                    symbol,
+                                    portfolio.equity,
+                                    entry_price,
+                                    stop_loss,
+                                    signal
+                                )
+                                if main_size <= 0:
+                                    continue
+                                
+                                notional = main_size * entry_price * contract_size
+                                within_limits, _ = portfolio_limits.check_leverage_limit(portfolio, notional, signal)
+                                if not within_limits:
+                                    main_size, _ = portfolio_limits.scale_position_for_limits(portfolio, symbol, main_size, entry_price, signal)
+                                    if main_size <= 0:
+                                        continue
+                                
+                                signed_size = main_size if signal == 'long' else -main_size
+                                unconstrained_targets[symbol] = {
+                                    'size': signed_size,
+                                    'signal': signal,
+                                    'entry_price': entry_price,
+                                    'stop_loss': stop_loss,
+                                    'notional': abs(main_size * entry_price * contract_size),
+                                    'adjusted_size': main_size,
+                                    'contract_size': contract_size,
+                                    'source': 'confluence_prefer_main',
+                                    'metadata': {
+                                        'funding_rate': funding_signal.get('metadata', {}).get('funding_rate')
+                                    }
+                                }
+                            
+                            # "independent" mode: each strategy manages separately (already handled above)
+                    
+                    # Add confluence targets to unconstrained_targets
+                    unconstrained_targets.update(confluence_targets)
+                    
+                    # STEP 2: Determine what will be closed (symbols not in selected_symbols or funding_selected)
+                    # Combine all selected symbols (main + funding, excluding confluence which is handled separately)
+                    all_selected_symbols = set(selected_symbols) | set(funding_selected) | set(confluence_symbols)
+                    positions_to_close = [s for s in portfolio.positions if s not in all_selected_symbols]
                     
                     # STEP 3: Count how many positions will remain after closes
                     current_position_count = len(portfolio.positions)
@@ -1204,7 +1700,9 @@ def run_live(config_path: str):
                             'size': target_data['size'],
                             'signal': target_data['signal'],
                             'entry_price': target_data['entry_price'],
-                            'stop_loss': target_data['stop_loss']
+                            'stop_loss': target_data['stop_loss'],
+                            'source': target_data.get('source', 'main_strategy'),
+                            'metadata': target_data.get('metadata', {})
                         }
                     
                     # Log constraint filtering results
@@ -1302,6 +1800,27 @@ def run_live(config_path: str):
                 # 1. Positions to open/adjust (in target_positions)
                 # 2. Positions to close (existing but not in target_positions)
                 # This ensures that positions opened before restart are properly managed
+                
+                # Check funding-specific exits before reconciling
+                if config.strategy.funding_opportunity.enabled and funding_opportunity_gen:
+                    for symbol, position in list(portfolio.positions.items()):
+                        if position.get('source') in ['funding_opportunity', 'confluence', 'confluence_prefer_funding', 'confluence_prefer_main']:
+                            current_funding = funding_opportunity_gen.get_funding_rate(symbol)
+                            if current_funding is not None:
+                                should_exit, reason = funding_opportunity_gen.should_exit(
+                                    symbol,
+                                    position,
+                                    current_funding,
+                                    funding_symbol_data.get(symbol) if funding_symbol_data else None
+                                )
+                                if should_exit:
+                                    logger.info(
+                                        f"Funding position {symbol} exit triggered: {reason} "
+                                        f"(funding: {current_funding*100:.4f}% per 8h)"
+                                    )
+                                    # Remove from target_positions to trigger close
+                                    if symbol in target_positions:
+                                        del target_positions[symbol]
                 
                 # CRITICAL: Always reconcile positions if we have open positions OR target positions
                 # This ensures positions close immediately when signals change to flat,
@@ -1428,8 +1947,9 @@ def run_live(config_path: str):
         sys.exit(1)
 
 
-def run_backtest(config_path: str, symbols: list = None, output_file: str = None):
-    """Run backtest."""
+def run_backtest(config_path: str, symbols: list = None, output_file: str = None, 
+                 mode: str = None, confluence_mode: str = None, param_sweep: bool = False):
+    """Run backtest with optional funding strategy modes."""
     # Load config FIRST
     config = BotConfig.from_yaml(config_path)
     
@@ -1468,6 +1988,58 @@ def run_backtest(config_path: str, symbols: list = None, output_file: str = None
         logger.error("No data available for backtest")
         sys.exit(1)
     
+    # Apply mode overrides
+    original_funding_enabled = config.strategy.funding_opportunity.enabled
+    original_confluence_mode = config.strategy.funding_opportunity.confluence.mode if config.strategy.funding_opportunity.enabled else None
+    
+    if mode == "funding_only":
+        config.strategy.funding_opportunity.enabled = True
+        logger.info("Mode: FUNDING ONLY - Main strategy disabled")
+    elif mode == "main_only":
+        config.strategy.funding_opportunity.enabled = False
+        logger.info("Mode: MAIN ONLY - Funding strategy disabled")
+    elif mode == "combined":
+        config.strategy.funding_opportunity.enabled = True
+        if confluence_mode:
+            config.strategy.funding_opportunity.confluence.mode = confluence_mode
+            logger.info(f"Mode: COMBINED with confluence mode: {confluence_mode}")
+        else:
+            logger.info("Mode: COMBINED (using config confluence mode)")
+    
+    # Recreate backtester with modified config
+    if mode:
+        backtester = Backtester(config)
+    
+    # Run parameter sweep if requested
+    if param_sweep:
+        from ..backtest.funding_backtest_runner import FundingBacktestRunner
+        runner = FundingBacktestRunner(config)
+        
+        # Define parameter ranges
+        param_ranges = {
+            'min_funding_rate': [0.0001, 0.0002, 0.0003, 0.0005],
+            'exit_funding_threshold': [0.00005, 0.0001, 0.00015, 0.0002],
+            'max_holding_hours': [24, 72, 120, 168],
+        }
+        
+        logger.info("Running parameter sensitivity analysis...")
+        results = runner.run_parameter_sensitivity(symbol_data, config, param_ranges)
+        
+        # Generate report
+        report = runner.generate_report({f"param_{i}": r for i, r in enumerate(results)})
+        if output_file:
+            report_path = output_file.replace('.json', '_param_sweep.md') if output_file.endswith('.json') else output_file + '_param_sweep.md'
+            with open(report_path, 'w') as f:
+                f.write(report)
+            logger.info(f"Parameter sweep report saved to {report_path}")
+        
+        # Restore config
+        config.strategy.funding_opportunity.enabled = original_funding_enabled
+        if original_confluence_mode:
+            config.strategy.funding_opportunity.confluence.mode = original_confluence_mode
+        
+        return
+    
     # Run backtest
     # Pass slippage parameters to backtest
     stop_slippage = config.risk.stop_slippage_bps if config.risk else 10.0
@@ -1486,14 +2058,37 @@ def run_backtest(config_path: str, symbols: list = None, output_file: str = None
     print("\n" + "="*60)
     print("BACKTEST RESULTS")
     print("="*60)
+    print(f"Mode: {mode or 'default'}")
+    if confluence_mode:
+        print(f"Confluence Mode: {confluence_mode}")
     print(f"Initial Capital: ${result['initial_capital']:,.2f}")
     print(f"Final Equity: ${result['final_equity']:,.2f}")
     print(f"Total Return: {result['total_return_pct']:+.2f}%")
+    print(f"CAGR: {result.get('annualized_return', 0)*100:+.2f}%")
     print(f"Sharpe Ratio: {result['sharpe_ratio']:.2f}")
     print(f"Max Drawdown: {result['max_drawdown_pct']:.2f}%")
     print(f"Total Trades: {result['total_trades']}")
     print(f"Win Rate: {result['win_rate']*100:.1f}%")
     print(f"Profit Factor: {result['profit_factor']:.2f}")
+    
+    # Print funding-specific metrics if available
+    if 'funding_metrics' in result:
+        funding_metrics = result['funding_metrics']
+        print("\n" + "-"*60)
+        print("FUNDING-SPECIFIC METRICS")
+        print("-"*60)
+        print(f"Funding Trades: {funding_metrics.get('total_funding_trades', 0)}")
+        print(f"Funding Trades/Year: {funding_metrics.get('funding_trades_per_year', 0.0):.1f}")
+        if funding_metrics.get('holding_times_hours'):
+            print(f"Holding Time: min={funding_metrics.get('holding_time_min', 0):.1f}h, "
+                  f"median={funding_metrics.get('holding_time_median', 0):.1f}h, "
+                  f"90th={funding_metrics.get('holding_time_90th_pct', 0):.1f}h, "
+                  f"max={funding_metrics.get('holding_time_max', 0):.1f}h")
+        if funding_metrics.get('avg_entry_funding_rate_long') is not None:
+            print(f"Avg Entry Funding (Long): {funding_metrics['avg_entry_funding_rate_long']*100:.4f}% per 8h")
+        if funding_metrics.get('avg_entry_funding_rate_short') is not None:
+            print(f"Avg Entry Funding (Short): {funding_metrics['avg_entry_funding_rate_short']*100:.4f}% per 8h")
+    
     print("="*60)
     
     # Save to file if requested
@@ -1657,7 +2252,7 @@ def run_optimize(config_path: str, use_universe_history: bool = False):
             logger.info(f"Loaded universe history for optimizer ({len(universe_history)} days)")
         except Exception as e:
             logger.warning(f"Failed to load universe history: {e}")
-
+    
     optimizer = Optimizer(config, store)
     
     # Run optimization
@@ -2057,6 +2652,12 @@ def main():
     backtest_parser = subparsers.add_parser('backtest', help='Run backtest')
     backtest_parser.add_argument('--symbols', nargs='+', help='Symbols for backtest (optional)')
     backtest_parser.add_argument('--output', help='Output file for backtest results (optional)')
+    backtest_parser.add_argument('--mode', choices=['funding_only', 'main_only', 'combined'], 
+                                 help='Backtest mode: funding_only, main_only, or combined')
+    backtest_parser.add_argument('--confluence-mode', choices=['share', 'prefer_funding', 'prefer_main', 'independent'],
+                                 help='Confluence mode (only used when mode=combined)')
+    backtest_parser.add_argument('--param-sweep', action='store_true',
+                                 help='Run parameter sensitivity analysis')
     
     # Optimize command
     optimize_parser = subparsers.add_parser('optimize', help='Run strategy parameter optimization')
@@ -2116,7 +2717,14 @@ def main():
     if args.command == 'live':
         run_live(config_path)
     elif args.command == 'backtest':
-        run_backtest(config_path, getattr(args, 'symbols', None), getattr(args, 'output', None))
+        run_backtest(
+            config_path, 
+            getattr(args, 'symbols', None), 
+            getattr(args, 'output', None),
+            getattr(args, 'mode', None),
+            getattr(args, 'confluence_mode', None),
+            getattr(args, 'param_sweep', False)
+        )
     elif args.command == 'optimize':
         run_optimize(config_path, getattr(args, 'use_universe_history', False))
     elif args.command == 'optimize-universe':

@@ -901,6 +901,9 @@ class OrderExecutor:
             
             # Set entry time in portfolio state if provided
             if portfolio_state:
+                # Get source and metadata from target_positions if available (passed via reconcile_positions)
+                # This is a workaround - ideally execute_position_change would accept these as parameters
+                # For now, we'll set them after position is opened via a separate call
                 portfolio_state.set_position_metadata(
                     symbol,
                     entry_time=datetime.now(timezone.utc),
@@ -1472,6 +1475,17 @@ class OrderExecutor:
                 target.get('signal', 'long'),
                 portfolio_state,
             )
+            
+            # Store source and metadata if position was successfully opened
+            if result.get('status') == 'filled' and portfolio_state:
+                source = target.get('source', 'main_strategy')
+                metadata = target.get('metadata', {})
+                portfolio_state.set_position_metadata(
+                    symbol,
+                    source=source,
+                    metadata=metadata
+                )
+            
             results.append(result)
         
         return results
