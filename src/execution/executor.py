@@ -1295,6 +1295,43 @@ class OrderExecutor:
             result = self.close_position(symbol)
             results.append(result)
             
+            # CRITICAL: After closing, verify position was actually closed and SL was canceled
+            # Double-check for any orphaned SL/TP orders that may remain
+            if result.get('status') == 'closed':
+                # Wait a moment for exchange to process the close
+                time.sleep(0.5)
+                
+                # Verify position is closed and check for orphaned SL orders
+                try:
+                    exchange_positions = self.exchange.fetch_positions()
+                    position_still_exists = False
+                    for pos in exchange_positions:
+                        pos_symbol = pos.get("symbol", "")
+                        pos_symbol_normalized = pos_symbol.replace("/USDT:USDT", "USDT").replace("/USDT", "USDT").replace(":USDT", "USDT")
+                        symbol_normalized = symbol.replace("/USDT:USDT", "USDT").replace("/USDT", "USDT").replace(":USDT", "USDT")
+                        if pos_symbol_normalized == symbol_normalized:
+                            contracts = float(pos.get("contracts", 0)) if pos.get("contracts") is not None else 0.0
+                            if abs(contracts) >= 0.001:
+                                position_still_exists = True
+                                break
+                    
+                    if position_still_exists:
+                        self.logger.warning(
+                            f"Position {symbol} still exists after close attempt. "
+                            "This may indicate a partial fill or exchange delay."
+                        )
+                    else:
+                        # Position is closed, verify no orphaned SL orders remain
+                        final_cancel_results = self._cancel_stop_orders(symbol, portfolio_state, force_refresh=True)
+                        if final_cancel_results.get('stop_cancelled') or final_cancel_results.get('tp_cancelled'):
+                            self.logger.info(
+                                f"Cleaned up orphaned orders for {symbol}: "
+                                f"SL={final_cancel_results.get('stop_cancelled')}, "
+                                f"TP={final_cancel_results.get('tp_cancelled')}"
+                            )
+                except Exception as e:
+                    self.logger.warning(f"Error verifying position close for {symbol}: {e}")
+            
             # CRITICAL: After closing, wait a moment and verify position was actually closed
             # Also check for and cancel any orphaned SL/TP orders that may remain
             if result.get('status') == 'closed':

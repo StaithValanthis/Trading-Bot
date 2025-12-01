@@ -1079,21 +1079,40 @@ def run_live(config_path: str):
                     else:
                         # Build separate universe
                         if funding_universe_selector:
-                            funding_universe = funding_universe_selector.build_universe(datetime.now(timezone.utc).date())
-                            logger.info(f"Built independent funding universe: {len(funding_universe)} symbols")
-                            
-                            # Load data for funding universe
-                            for symbol in funding_universe:
-                                try:
-                                    df = store.get_ohlcv(
-                                        symbol,
-                                        config.exchange.timeframe,
-                                        limit=config.data.lookback_bars
-                                    )
-                                    if df is not None and not df.empty:
-                                        funding_symbol_data[symbol] = df
-                                except Exception as e:
-                                    logger.warning(f"Error loading data for {symbol} in funding universe: {e}")
+                            try:
+                                funding_universe, funding_universe_changes = funding_universe_selector.build_universe(
+                                    config.exchange.timeframe,
+                                    current_date=datetime.now(timezone.utc).date()
+                                )
+                                # Ensure funding_universe is a set of strings
+                                if not isinstance(funding_universe, set):
+                                    logger.error(f"Invalid funding_universe type: {type(funding_universe)}, expected set")
+                                    funding_universe = set()
+                                else:
+                                    # Filter to ensure all elements are strings
+                                    funding_universe = {s for s in funding_universe if isinstance(s, str)}
+                                
+                                logger.info(f"Built independent funding universe: {len(funding_universe)} symbols")
+                                
+                                # Load data for funding universe
+                                for symbol in funding_universe:
+                                    try:
+                                        if not isinstance(symbol, str):
+                                            logger.warning(f"Skipping non-string symbol in funding universe: {type(symbol)}")
+                                            continue
+                                        df = store.get_ohlcv(
+                                            symbol,
+                                            config.exchange.timeframe,
+                                            limit=config.data.lookback_bars
+                                        )
+                                        if df is not None and not df.empty:
+                                            funding_symbol_data[symbol] = df
+                                    except Exception as e:
+                                        logger.warning(f"Error loading data for {symbol} in funding universe: {e}")
+                            except Exception as e:
+                                logger.error(f"Error building funding universe: {e}", exc_info=True)
+                                funding_universe = set()
+                                funding_symbol_data = {}
                         else:
                             logger.warning("Funding universe selector not initialized, skipping funding strategy")
                             funding_universe = set()
@@ -1188,7 +1207,7 @@ def run_live(config_path: str):
                             logger.info(
                                 f"  {symbol}: Both strategies want {info['confluence_type'].upper()} "
                                 f"(Main: {info['main_signal']}, Funding: {info['funding_signal']})"
-                            )
+                        )
                 
                 # Generate target positions
                 # CRITICAL: Build target positions EVERY iteration (not just during rebalance)
@@ -1199,6 +1218,23 @@ def run_live(config_path: str):
                 # During rebalance: Build full target positions with constraint checks
                 # Between rebalances: Build minimal target positions to preserve existing positions
                 if should_rebalance:
+                    # CRITICAL FIX: Refresh portfolio state BEFORE constraint checks to ensure accurate counts
+                    try:
+                        portfolio.update()
+                        logger.debug("Portfolio state refreshed before target building")
+                    except Exception as e:
+                        logger.warning(f"Error refreshing portfolio state before target building: {e}")
+                    
+                    # STEP 0: Calculate maximum allowed new positions BEFORE building targets
+                    # This ensures we don't build more targets than we can actually open
+                    current_position_count = len(portfolio.positions)
+                    max_new_positions = max(0, config.risk.max_positions - current_position_count)
+                    
+                    logger.info(
+                        f"Position constraint: {current_position_count} existing, "
+                        f"{config.risk.max_positions} max, {max_new_positions} new positions allowed"
+                    )
+                    
                     # FIX 3: Defer constraint checking until after determining what to close
                     # This ensures positions are only closed when replacements can actually open
                     # STEP 1: Build unconstrained target positions (without max_positions/concentration checks)
@@ -1638,13 +1674,15 @@ def run_live(config_path: str):
                     positions_to_close = [s for s in portfolio.positions if s not in all_selected_symbols]
                     
                     # STEP 3: Count how many positions will remain after closes
-                    current_position_count = len(portfolio.positions)
-                    positions_remaining_after_close = current_position_count - len(positions_to_close)
+                    # CRITICAL: Count positions that will be KEPT (not closed)
+                    positions_kept = [s for s in portfolio.positions if s in all_selected_symbols]
+                    positions_remaining_after_close = len(positions_kept)
                     
                     # STEP 4: Check constraints AFTER accounting for closes
                     # For each unconstrained target, check if it can be added after closes
                     target_positions = {}
                     symbols_filtered_by_constraints = []
+                    new_positions_count = 0  # Track new positions added in this loop
                     
                     for symbol, target_data in unconstrained_targets.items():
                         # Check if this symbol already has a position (won't count as new)
@@ -1652,20 +1690,20 @@ def run_live(config_path: str):
                         
                         # Check max positions: only matters for NEW positions
                         if not has_existing_position:
-                            # Simulate: would we be under max_positions after closes?
-                            simulated_position_count = positions_remaining_after_close
-                            
-                            # Count how many NEW positions we've already added in this loop
-                            new_positions_already_added = sum(
-                                1 for sym in target_positions 
-                                if sym not in portfolio.positions
-                            )
-                            
-                            # Total positions after closes + new positions added so far + this one
-                            total_after_this = simulated_position_count + new_positions_already_added + 1
+                            # Calculate total positions if we add this one
+                            # Positions kept + new positions already added + this one
+                            total_after_this = positions_remaining_after_close + new_positions_count + 1
                             
                             if total_after_this > config.risk.max_positions:
-                                symbols_filtered_by_constraints.append((symbol, f"max_positions (would be {total_after_this}, limit={config.risk.max_positions})"))
+                                symbols_filtered_by_constraints.append(
+                                    (symbol, f"max_positions (would be {total_after_this}, limit={config.risk.max_positions}, "
+                                     f"kept={positions_remaining_after_close}, new={new_positions_count})")
+                                )
+                                logger.debug(
+                                    f"Filtered {symbol} by max_positions: "
+                                    f"kept={positions_remaining_after_close}, new={new_positions_count}, "
+                                    f"total={total_after_this}, limit={config.risk.max_positions}"
+                                )
                                 continue
                         
                         # Check symbol concentration (with simulated portfolio state)
@@ -1704,6 +1742,10 @@ def run_live(config_path: str):
                             'source': target_data.get('source', 'main_strategy'),
                             'metadata': target_data.get('metadata', {})
                         }
+                        
+                        # Increment new positions count if this is a new position
+                        if not has_existing_position:
+                            new_positions_count += 1
                     
                     # Log constraint filtering results
                     if symbols_filtered_by_constraints:
@@ -1715,11 +1757,41 @@ def run_live(config_path: str):
                             logger.info(f"  - {symbol}: {reason}")
                     
                     # Log final target vs unconstrained comparison
+                    final_position_count = positions_remaining_after_close + new_positions_count
+                    logger.info(
+                        f"Position summary: {len(positions_to_close)} to close, "
+                        f"{positions_remaining_after_close} kept, {new_positions_count} new, "
+                        f"total={final_position_count}/{config.risk.max_positions} (limit)"
+                    )
+                    
                     if len(unconstrained_targets) != len(target_positions):
                         logger.info(
                             f"Target positions: {len(target_positions)} of {len(unconstrained_targets)} "
                             f"selected symbols passed constraint checks after accounting for closes"
                         )
+                    
+                    # CRITICAL SAFETY CHECK: Verify we didn't exceed max_positions
+                    if final_position_count > config.risk.max_positions:
+                        logger.error(
+                            f"⚠️ SAFETY VIOLATION: Final position count ({final_position_count}) exceeds "
+                            f"max_positions limit ({config.risk.max_positions}). This should never happen. "
+                            f"Filtering additional positions to enforce limit."
+                        )
+                        # Emergency filter: remove excess positions (prioritize keeping existing positions)
+                        excess_count = final_position_count - config.risk.max_positions
+                        new_targets = [s for s in target_positions if s not in portfolio.positions]
+                        if len(new_targets) >= excess_count:
+                            # Remove excess new positions (keep existing positions)
+                            for symbol in new_targets[:excess_count]:
+                                logger.warning(f"Emergency removal: {symbol} (exceeds max_positions)")
+                                del target_positions[symbol]
+                                new_positions_count -= 1
+                        else:
+                            # This shouldn't happen, but log it
+                            logger.error(
+                                f"Cannot fix violation: {excess_count} excess positions but only "
+                                f"{len(new_targets)} new targets to remove"
+                            )
                 else:
                     # Between rebalances: Preserve existing positions that are still in selected_symbols
                     # This prevents positions from being closed when they're still top-ranked

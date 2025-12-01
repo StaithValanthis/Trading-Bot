@@ -502,7 +502,6 @@ class Backtester:
                     symbols_to_close.extend(funding_positions_to_close)
                 
                 for symbol in symbols_to_close:
-                for symbol in symbols_to_close:
                     pos = positions[symbol]
                     df_sym = symbol_data[symbol]
                     if timestamp in df_sym.index:
