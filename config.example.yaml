@@ -67,14 +67,18 @@ strategy:
     # Ranking window (bars; 18 bars @4h ≈ 3 days)
     # Exit band (hysteresis): only close positions if rank falls below top_k + exit_band
     # This reduces churn from minor ranking changes (default: 2)
-    exit_band: 
+    exit_band: 2
     ranking_window: 12
     # Number of top symbols to trade
-    top_k: 10
+    top_k: 3
     # Rebalance frequency in hours (8h aligns with funding settlements)
     rebalance_frequency_hours: 6
     # Only trade symbols that also have positive time-series trend
     require_trend_alignment: true
+    # Balance selection between longs and shorts (true) or prioritize longs first (false)
+    # When true: selects top_k//2 longs and top_k//2 shorts for balanced exposure
+    # When false: selects all best longs first, then worst shorts (may crowd out shorts if top_k is small)
+    balanced_long_short: true
     
   # Sleeve C: Funding-rate bias overlay
   funding_bias:
@@ -302,6 +306,52 @@ optimizer:
   walk_forward_folds: 1
   # Embargo period in days: gap between IS and OOS windows to reduce leakage (0 = disabled)
   embargo_days: 0
+  
+  # Funding strategy optimization
+  # Optimizes funding opportunity strategy parameters using walk-forward analysis
+  funding:
+    # Enable funding strategy optimization (set to false to skip)
+    enabled: true
+    # Number of parameter sets to test
+    trials: 100
+    # Months of historical data to use
+    lookback_months: 12
+    # Walk-forward window size in days
+    walk_forward_window_days: 60
+    # Minimum number of funding trades required to consider a parameter set
+    min_trades: 20
+    # Minimum Sharpe ratio to consider
+    min_sharpe: 0.5
+    # Maximum drawdown allowed (%)
+    max_dd: -0.30
+    # Minimum fraction of total PnL that should come from funding strategy
+    # This ensures the funding strategy makes a meaningful contribution
+    min_funding_pnl_share: 0.3
+    # If true, disable main strategy during funding optimization (pure funding test)
+    # If false, test funding alongside main strategy (realistic scenario)
+    disable_main_strategy: false
+    # Sampling method for random search: "uniform" or "latin" (stratified)
+    sample_method: latin
+    # Optional seed for reproducibility (null = random)
+    random_seed: null
+    # Funding parameter ranges to explore
+    param_ranges:
+      # Minimum funding rate threshold (per 8h)
+      min_funding_rate: [0.0001, 0.0002, 0.0003, 0.0005]
+      # Exit funding threshold (per 8h, with hysteresis)
+      exit_funding_threshold: [0.00005, 0.0001, 0.00015, 0.0002]
+      # Base position size as fraction of equity
+      base_size_fraction: [0.05, 0.08, 0.10, 0.12]
+      # Maximum total funding exposure (fraction of equity)
+      max_total_funding_exposure: [0.30, 0.40, 0.50]
+      # Maximum holding period in hours (3-10 days)
+      max_holding_hours: [72, 120, 168, 240]
+      # Stop-loss ATR multiplier (wider stops for carry strategies)
+      stop_loss_atr_multiplier: [2.0, 2.5, 3.0]
+      # Take-profit risk-reward ratio (null = no TP, let winners run)
+      take_profit_rr: [null, 2.0, 2.5, 3.0]
+      # Require trend alignment for funding entries
+      require_trend_alignment: [true, false]
 
 # Universe optimizer settings (for universe parameter optimization)
 universe_optimizer:

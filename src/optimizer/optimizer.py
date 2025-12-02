@@ -1366,6 +1366,293 @@ class Optimizer:
             self.logger.error(f"Error saving optimization result: {e}")
             conn.rollback()
             conn.close()
+    
+    def optimize_funding_strategy(
+        self,
+        symbols: List[str],
+        timeframe: str,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        universe_history: Optional[Dict[date, Set[str]]] = None,
+    ) -> Dict:
+        """
+        Optimize funding opportunity strategy parameters using walk-forward analysis.
+        
+        Args:
+            symbols: List of symbols to optimize on
+            timeframe: Timeframe (e.g., '1h')
+            start_date: Optional start date for data
+            end_date: Optional end date for data
+            universe_history: Optional historical universe membership
+        
+        Returns:
+            Dictionary with optimization results
+        """
+        self.logger.info("="*80)
+        self.logger.info("=== FUNDING STRATEGY OPTIMIZATION START ===")
+        self.logger.info("="*80)
+        
+        funding_config = self.config.optimizer.funding
+        
+        if not funding_config.enabled:
+            self.logger.info("Funding optimization is disabled in config. Skipping.")
+            return {'skipped': True, 'reason': 'disabled'}
+        
+        if not self.config.strategy.funding_opportunity.enabled:
+            self.logger.warning("Funding opportunity strategy is disabled in config. Cannot optimize.")
+            return {'error': 'Funding strategy not enabled in config'}
+        
+        # Load historical data (same as main optimizer)
+        if start_date is not None:
+            since = int(start_date.timestamp() * 1000)
+        else:
+            lookback_days = funding_config.lookback_months * 30
+            since = int((datetime.now() - timedelta(days=lookback_days)).timestamp() * 1000)
+        
+        if end_date is not None:
+            until = int(end_date.timestamp() * 1000)
+        else:
+            until = None
+        
+        symbol_data = {}
+        for symbol in symbols:
+            try:
+                df = self.store.get_ohlcv(symbol, timeframe, since=since)
+                if end_date is not None and not df.empty:
+                    df = df[df.index <= end_date]
+                if not df.empty and len(df) >= 200:
+                    symbol_data[symbol] = df
+            except Exception as e:
+                self.logger.warning(f"Error loading data for {symbol}: {e}")
+                continue
+        
+        if not symbol_data:
+            return {'error': 'No data available for funding optimization'}
+        
+        # Generate funding parameter sets
+        rng = random
+        seed = funding_config.random_seed
+        if seed is not None:
+            rng = random.Random(seed)
+        
+        param_sets = self._generate_funding_param_candidates(
+            funding_config.trials,
+            funding_config.param_ranges,
+            rng=rng,
+            method=funding_config.sample_method
+        )
+        
+        # Add current config as baseline
+        current_funding_params = self._get_current_funding_params()
+        if current_funding_params not in param_sets:
+            param_sets.insert(0, current_funding_params)
+        
+        self.logger.info(f"Testing {len(param_sets)} funding parameter sets")
+        
+        # Walk-forward analysis
+        window_days = funding_config.walk_forward_window_days
+        results = []
+        
+        import time as time_module
+        start_time = time_module.time()
+        
+        for i, params in enumerate(param_sets):
+            try:
+                # Create test config with funding parameters
+                test_config = self._create_funding_test_config(params, timeframe)
+                
+                # Run walk-forward backtests
+                walk_forward_results = self._walk_forward_backtest(
+                    symbol_data,
+                    test_config,
+                    window_days,
+                    universe_history=universe_history,
+                    params=None,  # Funding params don't affect purge (no lookback)
+                )
+                
+                if not walk_forward_results:
+                    continue
+                
+                # Split IS/OOS
+                n_windows = len(walk_forward_results)
+                split_idx = max(1, int(n_windows * 0.7))
+                is_results = walk_forward_results[:split_idx]
+                oos_results = walk_forward_results[split_idx:] or walk_forward_results
+                
+                # Aggregate metrics
+                def _agg(results_list):
+                    if not results_list:
+                        return 0.0, 0.0, 0.0, 0, 0
+                    return (
+                        np.mean([r["total_return_pct"] for r in results_list]),
+                        np.mean([r["sharpe_ratio"] for r in results_list]),
+                        np.mean([r["max_drawdown_pct"] for r in results_list]),
+                        np.mean([r["total_trades"] for r in results_list]),
+                        min([r["total_trades"] for r in results_list]),
+                    )
+                
+                avg_return_is, avg_sharpe_is, avg_dd_is, avg_trades_is, min_trades_is = _agg(is_results)
+                avg_return_oos, avg_sharpe_oos, avg_dd_oos, avg_trades_oos, min_trades_oos = _agg(oos_results)
+                
+                # Extract funding-specific metrics
+                funding_trades_oos = []
+                funding_pnl_oos = 0.0
+                total_pnl_oos = 0.0
+                
+                for r in oos_results:
+                    funding_metrics = r.get('funding_metrics', {})
+                    funding_trades_oos.append(funding_metrics.get('total_funding_trades', 0))
+                    # Estimate funding PnL from trades (if available in result)
+                    # For now, we'll use total return as proxy
+                    total_pnl_oos += r.get("total_return_pct", 0.0)
+                
+                avg_funding_trades_oos = np.mean(funding_trades_oos) if funding_trades_oos else 0.0
+                min_funding_trades_oos = min(funding_trades_oos) if funding_trades_oos else 0.0
+                
+                # Calculate funding PnL share (approximate from funding trade count)
+                # This is a simplified metric - in production, track actual funding PnL separately
+                funding_pnl_share = min_funding_trades_oos / max(avg_trades_oos, 1.0) if avg_trades_oos > 0 else 0.0
+                
+                # Check criteria
+                passes_oos = (
+                    min_funding_trades_oos >= funding_config.min_trades
+                    and avg_sharpe_oos >= funding_config.min_sharpe
+                    and avg_dd_oos >= funding_config.max_dd
+                    and funding_pnl_share >= funding_config.min_funding_pnl_share
+                )
+                
+                result = {
+                    "params": params,
+                    "avg_return_pct": np.mean([r["total_return_pct"] for r in walk_forward_results]),
+                    "avg_sharpe": np.mean([r["sharpe_ratio"] for r in walk_forward_results]),
+                    "avg_drawdown_pct": np.mean([r["max_drawdown_pct"] for r in walk_forward_results]),
+                    "avg_trades": np.mean([r["total_trades"] for r in walk_forward_results]),
+                    "avg_sharpe_oos": avg_sharpe_oos,
+                    "avg_dd_oos": avg_dd_oos,
+                    "min_funding_trades_oos": min_funding_trades_oos,
+                    "funding_pnl_share": funding_pnl_share,
+                    "passes_oos": passes_oos,
+                }
+                
+                if passes_oos:
+                    results.append(result)
+                
+                if (i + 1) % 10 == 0:
+                    self.logger.info(
+                        f"Funding param set {i+1}/{len(param_sets)}: "
+                        f"OOS Sharpe={avg_sharpe_oos:.2f}, funding trades={min_funding_trades_oos:.0f}"
+                    )
+            except Exception as e:
+                self.logger.warning(f"Error testing funding parameter set {i}: {e}")
+                continue
+        
+        # Sort by OOS Sharpe
+        if results:
+            results.sort(key=lambda x: x['avg_sharpe_oos'], reverse=True)
+            best_result = results[0]
+            
+            self.logger.info(
+                f"Funding optimization complete: {len(results)}/{len(param_sets)} passed criteria. "
+                f"Best OOS Sharpe: {best_result['avg_sharpe_oos']:.2f}"
+            )
+            
+            return {
+                'best_params': best_result['params'],
+                'best_metrics': {
+                    'avg_sharpe_oos': best_result['avg_sharpe_oos'],
+                    'avg_dd_oos': best_result['avg_dd_oos'],
+                    'min_funding_trades_oos': best_result['min_funding_trades_oos'],
+                    'funding_pnl_share': best_result['funding_pnl_share'],
+                },
+                'all_results': results[:10],
+            }
+        
+        self.logger.warning("No funding parameter sets met criteria")
+        return {'error': 'No valid funding parameter sets found'}
+    
+    def _get_current_funding_params(self) -> Dict:
+        """Extract current funding strategy parameters."""
+        fo = self.config.strategy.funding_opportunity
+        params = {
+            'min_funding_rate': fo.min_funding_rate,
+            'exit_funding_threshold': fo.exit.exit_funding_threshold,
+            'base_size_fraction': fo.sizing.base_size_fraction,
+            'max_total_funding_exposure': fo.risk.max_total_funding_exposure,
+            'max_holding_hours': fo.exit.max_holding_hours,
+            'stop_loss_atr_multiplier': fo.exit.stop_loss_atr_multiplier,
+            'take_profit_rr': fo.exit.take_profit_rr,
+            'require_trend_alignment': fo.entry.require_trend_alignment,
+        }
+        return params
+    
+    def _generate_funding_param_candidates(
+        self,
+        n_trials: int,
+        param_ranges: Dict,
+        rng=random,
+        method: str = "uniform",
+    ) -> List[Dict]:
+        """Generate random funding parameter sets."""
+        param_sets = []
+        
+        if method == "latin" and param_ranges:
+            param_names = list(param_ranges.keys())
+            buckets: Dict[str, List[Any]] = {}
+            for name, values in param_ranges.items():
+                if not values:
+                    buckets[name] = [None] * n_trials
+                    continue
+                repeated = []
+                while len(repeated) < n_trials:
+                    repeated.extend(values)
+                repeated = repeated[:n_trials]
+                rng.shuffle(repeated)
+                buckets[name] = repeated
+            for i in range(n_trials):
+                params = {name: buckets[name][i] for name in param_names}
+                param_sets.append(params)
+        else:
+            for _ in range(n_trials):
+                params = {}
+                for param_name, values in param_ranges.items():
+                    params[param_name] = rng.choice(values)
+                param_sets.append(params)
+        
+        return param_sets
+    
+    def _create_funding_test_config(self, params: Dict, timeframe: str) -> BotConfig:
+        """Create a test config with funding parameters."""
+        import copy
+        
+        test_config = copy.deepcopy(self.config)
+        test_config.exchange.timeframe = timeframe
+        
+        # Update funding parameters
+        fo = test_config.strategy.funding_opportunity
+        
+        if 'min_funding_rate' in params:
+            fo.min_funding_rate = params['min_funding_rate']
+        if 'exit_funding_threshold' in params:
+            fo.exit.exit_funding_threshold = params['exit_funding_threshold']
+        if 'base_size_fraction' in params:
+            fo.sizing.base_size_fraction = params['base_size_fraction']
+        if 'max_total_funding_exposure' in params:
+            fo.risk.max_total_funding_exposure = params['max_total_funding_exposure']
+        if 'max_holding_hours' in params:
+            fo.exit.max_holding_hours = params['max_holding_hours']
+        if 'stop_loss_atr_multiplier' in params:
+            fo.exit.stop_loss_atr_multiplier = params['stop_loss_atr_multiplier']
+        if 'take_profit_rr' in params:
+            fo.exit.take_profit_rr = params['take_profit_rr']
+        if 'require_trend_alignment' in params:
+            fo.entry.require_trend_alignment = params['require_trend_alignment']
+        
+        # Optionally disable main strategy for pure funding test
+        if self.config.optimizer.funding.disable_main_strategy:
+            test_config.strategy.trend.ma_short = 999  # Effectively disable
+            test_config.strategy.cross_sectional.top_k = 0
+        
+        return test_config
 
 
 # Import numpy here to avoid circular import

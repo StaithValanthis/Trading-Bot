@@ -179,7 +179,7 @@ main() {
         warn "config.example.yaml not found. You'll need to create config.yaml manually."
     fi
     
-    # Verify critical modules exist
+    # Verify critical modules exist (including funding strategy and optimizer integration)
     CRITICAL_MODULES=(
         "src/config.py"
         "src/exchange/bybit_client.py"
@@ -193,10 +193,13 @@ main() {
         "src/signals/trend.py"
         "src/signals/cross_sectional.py"
         "src/signals/funding_opportunity.py"
+        "src/signals/funding_carry.py"
         "src/risk/position_sizing.py"
         "src/risk/portfolio_limits.py"
         "src/universe/selector.py"
         "src/universe/store.py"
+        "src/reporting/discord_reporter.py"
+        "src/cli/main.py"
     )
     
     MISSING_MODULES=()
@@ -222,11 +225,33 @@ main() {
         info "All critical modules found"
     fi
     
-    # Verify funding opportunity module (new feature)
-    if [ -f "$BOT_DIR/src/signals/funding_opportunity.py" ]; then
-        info "✓ Funding opportunity strategy module found"
+    # Verify funding strategy modules (funding opportunity + optimizer integration)
+    FUNDING_MODULES=(
+        "src/signals/funding_opportunity.py"
+        "src/reporting/discord_reporter.py"  # Includes funding metrics in reports
+    )
+    
+    FUNDING_MISSING=()
+    for module in "${FUNDING_MODULES[@]}"; do
+        if [ ! -f "$BOT_DIR/$module" ]; then
+            FUNDING_MISSING+=("$module")
+        fi
+    done
+    
+    if [ ${#FUNDING_MISSING[@]} -eq 0 ]; then
+        info "✓ All funding strategy modules found"
     else
-        warn "src/signals/funding_opportunity.py not found (funding strategy may not be available)"
+        warn "Some funding strategy modules are missing:"
+        for module in "${FUNDING_MISSING[@]}"; do
+            warn "  - $module"
+        done
+    fi
+    
+    # Verify optimizer includes funding optimization
+    if grep -q "optimize_funding_strategy" "$BOT_DIR/src/optimizer/optimizer.py" 2>/dev/null; then
+        info "✓ Funding optimizer integration found in optimizer.py"
+    else
+        warn "Funding optimizer integration not found in optimizer.py (funding optimization may not be available)"
     fi
     
     # Verify scripts directory exists (optional, scripts are standalone)
@@ -294,15 +319,18 @@ main() {
     # Create results directory for optimizer/analysis outputs
     mkdir -p "$BOT_DIR/results" || warn "Failed to create results directory (non-critical)"
     
+    # Create optimizer_results directory for funding optimizer results (JSON files)
+    mkdir -p "$BOT_DIR/optimizer_results" || warn "Failed to create optimizer_results directory (non-critical)"
+    
     # Set permissions
-    chmod 755 "$BOT_DIR/data" "$BOT_DIR/logs" "$BOT_DIR/results" 2>/dev/null || warn "Failed to set directory permissions"
+    chmod 755 "$BOT_DIR/data" "$BOT_DIR/logs" "$BOT_DIR/results" "$BOT_DIR/optimizer_results" 2>/dev/null || warn "Failed to set directory permissions"
     
     # Set ownership if running as root
     if [ "$EUID" -eq 0 ] && [ "$SERVICE_USER" != "root" ]; then
-        chown -R "$SERVICE_USER:$SERVICE_USER" "$BOT_DIR/data" "$BOT_DIR/logs" "$BOT_DIR/results" 2>/dev/null || warn "Failed to set directory ownership"
+        chown -R "$SERVICE_USER:$SERVICE_USER" "$BOT_DIR/data" "$BOT_DIR/logs" "$BOT_DIR/results" "$BOT_DIR/optimizer_results" 2>/dev/null || warn "Failed to set directory ownership"
     fi
     
-    info "Directories created: data/, logs/, results/"
+    info "Directories created: data/, logs/, results/, optimizer_results/"
     echo ""
     
     # ============================================================
@@ -335,11 +363,37 @@ main() {
         if [ -f "$BOT_DIR/config.example.yaml" ]; then
             cp "$BOT_DIR/config.example.yaml" "$CONFIG_FILE" || error_exit "Failed to copy config.example.yaml"
             info "Created config.yaml from example"
+            
+            # Verify funding strategy sections exist in the new config
+            if grep -q "funding_opportunity:" "$CONFIG_FILE" 2>/dev/null; then
+                info "✓ Funding opportunity strategy section found in config"
+            else
+                warn "Funding opportunity strategy section not found in config.example.yaml"
+            fi
+            
+            if grep -q "funding:" "$CONFIG_FILE" 2>/dev/null && grep -A 1 "optimizer:" "$CONFIG_FILE" | grep -q "funding:" 2>/dev/null; then
+                info "✓ Funding optimizer section found in config"
+            else
+                warn "Funding optimizer section not found in config.example.yaml"
+            fi
         else
             warn "config.example.yaml not found. You'll need to create config.yaml manually."
         fi
     else
-        info "config.yaml already exists, skipping..."
+        info "config.yaml already exists, skipping copy (preserving existing configuration)"
+        
+        # Check if existing config has funding sections (informational only)
+        if grep -q "funding_opportunity:" "$CONFIG_FILE" 2>/dev/null; then
+            info "✓ Existing config.yaml contains funding_opportunity section"
+        else
+            warn "Existing config.yaml does not contain funding_opportunity section (funding strategy may not be enabled)"
+        fi
+        
+        if grep -q "funding:" "$CONFIG_FILE" 2>/dev/null && grep -A 1 "optimizer:" "$CONFIG_FILE" | grep -q "funding:" 2>/dev/null; then
+            info "✓ Existing config.yaml contains funding optimizer section"
+        else
+            warn "Existing config.yaml does not contain funding optimizer section (funding optimization may not be enabled)"
+        fi
     fi
     
     # Set ownership if running as root
@@ -536,12 +590,12 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
     
-    # Optimizer service
+    # Optimizer service (runs both main strategy and funding strategy optimization)
     OPTIMIZER_SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}-optimizer.service"
     info "Creating ${SERVICE_NAME}-optimizer.service..."
     sudo tee "$OPTIMIZER_SERVICE_FILE" > /dev/null <<EOF || error_exit "Failed to create optimizer service file"
 [Unit]
-Description=Bybit Trading Bot - Parameter Optimizer
+Description=Bybit Trading Bot - Parameter Optimizer (Main + Funding Strategies)
 After=network.target
 
 [Service]
@@ -550,6 +604,7 @@ User=$SERVICE_USER
 WorkingDirectory=$BOT_DIR
 EnvironmentFile=$ENV_FILE
 Environment="PATH=$VENV_DIR/bin"
+# Runs main strategy optimization, then funding strategy optimization (if enabled in config)
 ExecStart=$VENV_DIR/bin/python -m src.main --config $CONFIG_FILE optimize --use-universe-history
 StandardOutput=journal
 StandardError=journal
@@ -759,7 +814,14 @@ EOF
     echo "5. Test universe optimization (optional):"
     echo "   python -m src.main optimize-universe --config config.yaml --start 2023-01-01 --end 2024-01-01 --n-combinations 50"
     echo ""
-    echo "6. Run timeframe comparison analysis (optional, requires historical data):"
+    echo "6. Test parameter optimization (includes both main and funding strategies if enabled):"
+    echo "   python -m src.main optimize --config config.yaml --use-universe-history"
+    echo ""
+    echo "7. Test funding strategy (if enabled in config):"
+    echo "   python -m pytest tests/test_funding_opportunity.py -v"
+    echo "   python -m pytest tests/test_funding_optimizer.py -v"
+    echo ""
+    echo "8. Run timeframe comparison analysis (optional, requires historical data):"
     echo "   python scripts/optimize_and_compare_timeframes.py --config config.yaml --start 2022-01-01 --end 2024-12-31"
     echo ""
     echo -e "${RED}IMPORTANT: Before starting live trading:${NC}"
@@ -768,19 +830,27 @@ EOF
     echo "   - Test thoroughly in testnet/paper mode first"
     echo "   - Only set exchange.mode to 'live' when ready for real trading"
     echo ""
-    echo "7. Start the bot (when ready):"
+    echo "9. Start the bot (when ready):"
     echo "   sudo systemctl start $SERVICE_NAME"
     echo ""
-    echo "8. Monitor the bot:"
+    echo "10. Monitor the bot:"
     echo "   sudo systemctl status $SERVICE_NAME"
     echo "   sudo journalctl -u $SERVICE_NAME -f"
     echo ""
-    echo "9. Check scheduled tasks:"
+    echo "11. Check scheduled tasks:"
     echo "   sudo systemctl list-timers ${SERVICE_NAME}-*"
     echo ""
-    echo "10. Available analysis scripts:"
+    echo "12. Monitor optimizer runs (check logs for both main and funding optimization):"
+    echo "   sudo journalctl -u ${SERVICE_NAME}-optimizer.service -f"
+    echo "   # Look for 'MAIN STRATEGY OPTIMIZATION START' and 'FUNDING STRATEGY OPTIMIZATION START'"
+    echo ""
+    echo "13. Check funding optimizer results:"
+    echo "   cat optimizer_results/funding_best.json"
+    echo ""
+    echo "14. Available analysis scripts:"
     echo "   - scripts/optimize_and_compare_timeframes.py - Compare timeframes with optimized parameters"
     echo "   - scripts/download_historical_data.py - Download historical OHLCV data"
+    echo "   - scripts/funding_parameter_tune.py - Manual funding parameter tuning"
     echo ""
     echo -e "${GREEN}For more information, see README.md${NC}"
     echo ""

@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 from typing import Dict, List, Optional, Tuple, Set
 from datetime import datetime, date
+from unittest.mock import Mock
 
 from ..config import BotConfig
 from ..signals.trend import TrendSignalGenerator, calculate_atr
@@ -137,9 +138,11 @@ class Backtester:
         
         # Initialize funding opportunity generator if enabled
         self.funding_opportunity_gen = None
-        if config.strategy.funding_opportunity.enabled:
+        # Defensive check: ensure funding_opportunity config exists and is enabled
+        if (hasattr(config.strategy, 'funding_opportunity') and 
+            hasattr(config.strategy.funding_opportunity, 'enabled') and
+            config.strategy.funding_opportunity.enabled):
             # Create mock exchange for funding rates (backtest uses constant/approximated rates)
-            from unittest.mock import Mock
             mock_exchange = Mock()
             # Default funding rate (can be overridden per symbol via funding_rate_history)
             mock_exchange.fetch_funding_rate = Mock(return_value={'fundingRate': 0.0})
@@ -155,6 +158,7 @@ class Backtester:
         taker_fee: float = 0.00055,  # Bybit taker fee
         universe_history: Optional[Dict[date, Set[str]]] = None,
         funding_rate_per_8h: float = 0.0,  # Optional constant funding rate approximation
+        funding_rate_history: Optional[Dict[str, pd.Series]] = None,  # Optional per-symbol time-varying funding rates
         stop_slippage_bps: float = 10.0,  # Slippage in basis points when stop is hit
         tp_slippage_bps: float = 5.0,  # Slippage for take-profit orders
     ) -> Dict:
@@ -165,6 +169,11 @@ class Backtester:
             symbol_data: Dictionary mapping symbol to OHLCV DataFrame
             initial_capital: Starting capital
             taker_fee: Trading fee (0.00055 = 0.055% for Bybit)
+            universe_history: Optional dictionary mapping date to set of tradable symbols
+            funding_rate_per_8h: Constant funding rate approximation (per 8h period)
+            funding_rate_history: Optional dictionary mapping symbol to Series of funding rates over time
+            stop_slippage_bps: Slippage in basis points when stop-loss is hit
+            tp_slippage_bps: Slippage in basis points for take-profit orders
         
         Returns:
             Dictionary with backtest results
@@ -423,6 +432,7 @@ class Backtester:
             # Generate funding opportunity signals if enabled
             funding_signals = {}
             funding_selected = []
+            confluence_symbols = set()  # Initialize confluence symbols (not yet implemented in backtester)
             if (self.config.strategy.funding_opportunity.enabled and 
                 self.funding_opportunity_gen and 
                 should_rebalance):

@@ -266,6 +266,7 @@ class FundingOpportunityGenerator:
         funding_confidence = min(1.0, abs_funding / (self.config.min_funding_rate * 2))
         
         # Trend alignment confidence (if required)
+        # SOFTENED: Make shorts easier to trigger even with mildly positive momentum
         trend_confidence = 1.0
         if self.config.entry.require_trend_alignment and len(price_data) >= 20:
             close = price_data['close']
@@ -281,12 +282,21 @@ class FundingOpportunityGenerator:
                 else:
                     trend_confidence = 1.0
             else:  # short
-                # Prefer negative or neutral momentum for shorts
-                if momentum > 0.05:  # Strongly positive
-                    trend_confidence = 0.3
+                # SOFTENED PENALTY: Allow shorts even with mildly positive momentum
+                # Strongly positive momentum (>10%) still gets heavy penalty
+                # Mildly positive (0-10%) gets only mild penalty instead of crushing it
+                strong_pos_threshold = 0.10  # 10% positive momentum
+                if momentum > strong_pos_threshold:
+                    # Strongly positive momentum: heavier penalty (but not zero)
+                    trend_confidence = 0.5
                 elif momentum > 0:
-                    trend_confidence = 0.7
+                    # Mildly positive momentum (0-10%): mild penalty instead of 0.7
+                    trend_confidence = 0.8
+                elif momentum > -0.05:
+                    # Neutral to slightly negative: full confidence
+                    trend_confidence = 1.0
                 else:
+                    # Strongly negative: full confidence (perfect for shorts)
                     trend_confidence = 1.0
         
         # Combine confidences

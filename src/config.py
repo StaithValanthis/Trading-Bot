@@ -135,6 +135,7 @@ class CrossSectionalStrategyConfig:
     rebalance_frequency_hours: int = 8
     require_trend_alignment: bool = True
     exit_band: int = 2  # Exit band - only close if rank falls below top_k + exit_band (hysteresis to reduce churn)
+    balanced_long_short: bool = True  # If True, balance selection between longs and shorts (top_k//2 each). If False, select all longs first, then shorts.
 
 
 @dataclass
@@ -256,6 +257,37 @@ class DataConfig:
 
 
 @dataclass
+class FundingOptimizerConfig:
+    """Funding strategy optimizer configuration."""
+    enabled: bool = True  # Enable funding strategy optimization
+    trials: int = 100  # Number of parameter sets to test
+    lookback_months: int = 12  # Months of historical data to use
+    walk_forward_window_days: int = 60  # Walk-forward window size in days
+    min_trades: int = 20  # Minimum number of funding trades required
+    min_sharpe: float = 0.5  # Minimum Sharpe ratio to consider
+    max_dd: float = -0.30  # Maximum drawdown allowed (%)
+    # Minimum fraction of total PnL that should come from funding strategy
+    min_funding_pnl_share: float = 0.3  # Require meaningful funding contribution
+    # Whether to disable main strategy during funding optimization (pure funding test)
+    disable_main_strategy: bool = False
+    # Parameter ranges for funding strategy
+    param_ranges: Dict[str, List[Any]] = field(default_factory=lambda: {
+        "min_funding_rate": [0.0001, 0.0002, 0.0003, 0.0005],
+        "exit_funding_threshold": [0.00005, 0.0001, 0.00015, 0.0002],
+        "base_size_fraction": [0.05, 0.08, 0.10, 0.12],
+        "max_total_funding_exposure": [0.30, 0.40, 0.50],
+        "max_holding_hours": [72, 120, 168, 240],  # 3-10 days
+        "stop_loss_atr_multiplier": [2.0, 2.5, 3.0],
+        "take_profit_rr": [None, 2.0, 2.5, 3.0],
+        "require_trend_alignment": [True, False],
+    })
+    # Sampling method for random search
+    sample_method: str = "latin"
+    # Random seed for reproducibility
+    random_seed: Optional[int] = None
+
+
+@dataclass
 class OptimizerConfig:
     """Optimizer configuration."""
     lookback_months: int = 6
@@ -291,6 +323,8 @@ class OptimizerConfig:
         "top_k": [2, 3, 4, 5],
         "ranking_window": [12, 18, 24, 36, 48]  # Bars for ranking lookback (timeframe-dependent)
     })
+    # Funding strategy optimization
+    funding: FundingOptimizerConfig = field(default_factory=FundingOptimizerConfig)
 
 
 @dataclass
@@ -453,6 +487,13 @@ class BotConfig:
         reporting_dict = config_dict.get("reporting", {})
         logging_dict = config_dict.get("logging", {})
         
+        # Parse optimizer config with funding sub-config
+        optimizer_dict_parsed = optimizer_dict.copy()
+        funding_optimizer_dict = optimizer_dict_parsed.pop("funding", {})
+        funding_optimizer_config = FundingOptimizerConfig(**funding_optimizer_dict) if funding_optimizer_dict else FundingOptimizerConfig()
+        optimizer_config = OptimizerConfig(**optimizer_dict_parsed)
+        optimizer_config.funding = funding_optimizer_config
+        
         return cls(
             exchange=ExchangeConfig(**exchange_dict),
             strategy=StrategyConfig(
@@ -463,7 +504,7 @@ class BotConfig:
             ),
             risk=RiskConfig(**risk_dict),
             data=DataConfig(**data_dict),
-            optimizer=OptimizerConfig(**optimizer_dict),
+            optimizer=optimizer_config,
             universe=UniverseConfig(**universe_dict),
             universe_optimizer=UniverseOptimizerConfig(**universe_optimizer_dict),
             reporting=ReportingConfig(**reporting_dict),

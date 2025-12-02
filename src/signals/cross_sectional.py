@@ -105,15 +105,14 @@ class CrossSectionalSignalGenerator:
         long_candidates = []  # (symbol, return_pct) for symbols with positive momentum
         short_candidates = []  # (symbol, return_pct) for symbols with negative momentum
         
+        # Track symbols excluded due to trend alignment for diagnostic logging
+        excluded_negative_momentum = []
+        
         for symbol, return_pct in rankings:
             # Check trend alignment if required
             if require_trend_alignment and trend_signals:
                 trend_signal = trend_signals.get(symbol, {})
                 signal_direction = trend_signal.get('signal', 'flat')
-                
-                # Skip symbols without valid trend signal
-                if signal_direction == 'flat':
-                    continue
                 
                 # When require_trend_alignment=True:
                 # - For positive momentum (best performers): require 'long' trend signal
@@ -122,39 +121,87 @@ class CrossSectionalSignalGenerator:
                     # Positive momentum: require long signal
                     if signal_direction == 'long':
                         long_candidates.append((symbol, return_pct))
+                    # If signal is 'flat' or 'short', skip (trend doesn't support long)
                 else:
                     # Negative momentum: require short signal
                     if signal_direction == 'short':
                         short_candidates.append((symbol, return_pct))
+                    elif signal_direction == 'flat':
+                        # Negative momentum but no short trend signal - excluded due to trend alignment
+                        excluded_negative_momentum.append((symbol, return_pct))
+                        self.logger.debug(
+                            f"Excluding {symbol} from shorts: negative momentum ({return_pct*100:.2f}%) "
+                            f"but no short trend signal (require_trend_alignment=True)"
+                        )
+                    # If signal is 'long', skip (trend doesn't support short)
             elif not require_trend_alignment:
-                # No trend alignment required: accept all signals
+                # No trend alignment required: accept symbols based on momentum alone
+                # For positive momentum: include if trend signal is 'long' or 'flat'
+                # For negative momentum: include if trend signal is 'short' or 'flat'
                 trend_signal = trend_signals.get(symbol, {}) if trend_signals else {}
                 signal_direction = trend_signal.get('signal', 'flat')
-                if signal_direction != 'flat':
-                    if return_pct > 0:
+                
+                if return_pct > 0:
+                    # Positive momentum: prefer long signal, but allow flat if no alignment required
+                    if signal_direction in ['long', 'flat']:
                         long_candidates.append((symbol, return_pct))
-                    else:
+                else:
+                    # Negative momentum: prefer short signal, but allow flat if no alignment required
+                    # This allows shorts based on negative momentum alone when require_trend_alignment=False
+                    if signal_direction in ['short', 'flat']:
                         short_candidates.append((symbol, return_pct))
             else:
                 # require_trend_alignment=True but no trend_signals provided: skip
                 continue
         
+        # Log diagnostic info if shorts are being excluded
+        if excluded_negative_momentum and require_trend_alignment:
+            self.logger.debug(
+                f"Trend alignment filter excluded {len(excluded_negative_momentum)} symbols with negative momentum "
+                f"(require_trend_alignment=True, no short trend signals available)"
+            )
+        
         # Select top candidates from both groups
-        # Prioritize best performers (longs) and worst performers (shorts)
-        # Distribute top_k between longs and shorts based on availability
+        # Support balanced selection (top_k//2 longs, top_k//2 shorts) or priority-based (longs first)
         
-        # Start with best longs (positive momentum, descending)
-        for symbol, _ in long_candidates:
-            if len(selected) >= self.config.top_k:
-                break
-            selected.append(symbol)
-        
-        # Then add worst performers with short signals (negative momentum, ascending by absolute return)
-        short_candidates_sorted = sorted(short_candidates, key=lambda x: x[1])  # Most negative first
-        for symbol, _ in short_candidates_sorted:
-            if len(selected) >= self.config.top_k:
-                break
-            selected.append(symbol)
+        if self.config.balanced_long_short:
+            # Balanced selection: distribute top_k evenly between longs and shorts
+            long_limit = min(len(long_candidates), self.config.top_k // 2)
+            short_limit = min(len(short_candidates), self.config.top_k - long_limit)
+            
+            # Select top long_limit longs (positive momentum, descending)
+            for symbol, _ in long_candidates[:long_limit]:
+                selected.append(symbol)
+            
+            # Select top short_limit shorts (negative momentum, most negative first)
+            short_candidates_sorted = sorted(short_candidates, key=lambda x: x[1])  # Most negative first
+            for symbol, _ in short_candidates_sorted[:short_limit]:
+                selected.append(symbol)
+            
+            self.logger.debug(
+                f"Balanced selection: {long_limit} longs, {short_limit} shorts "
+                f"(from {len(long_candidates)} long candidates, {len(short_candidates)} short candidates)"
+            )
+        else:
+            # Priority-based selection: select all best longs first, then worst shorts
+            # Start with best longs (positive momentum, descending)
+            for symbol, _ in long_candidates:
+                if len(selected) >= self.config.top_k:
+                    break
+                selected.append(symbol)
+            
+            # Then add worst performers with short signals (negative momentum, ascending by absolute return)
+            short_candidates_sorted = sorted(short_candidates, key=lambda x: x[1])  # Most negative first
+            for symbol, _ in short_candidates_sorted:
+                if len(selected) >= self.config.top_k:
+                    break
+                selected.append(symbol)
+            
+            self.logger.debug(
+                f"Priority selection: {len([s for s in selected if s in [c[0] for c in long_candidates]])} longs, "
+                f"{len([s for s in selected if s in [c[0] for c in short_candidates]])} shorts "
+                f"(from {len(long_candidates)} long candidates, {len(short_candidates)} short candidates)"
+            )
         
         return selected
     

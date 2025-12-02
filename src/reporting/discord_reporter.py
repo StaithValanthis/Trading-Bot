@@ -70,8 +70,11 @@ class DiscordReporter:
             # Calculate funding-specific metrics from positions
             funding_metrics = self._calculate_funding_metrics(portfolio_state.positions)
             
-            # Get optimizer changes
+            # Get optimizer changes (main strategy)
             optimizer_changes = self._get_optimizer_changes(db_path)
+            
+            # Get funding optimizer results
+            funding_optimizer_results = self._get_funding_optimizer_results(db_path)
             
             # Get universe stats (if config provided)
             universe_stats = None
@@ -107,7 +110,8 @@ class DiscordReporter:
                 recent_errors,
                 universe_stats,
                 universe_changes,
-                funding_metrics
+                funding_metrics,
+                funding_optimizer_results
             )
             
             response = requests.post(
@@ -358,6 +362,36 @@ class DiscordReporter:
             self.logger.warning(f"Error getting optimizer changes: {e}")
             return None
     
+    def _get_funding_optimizer_results(self, db_path: str) -> Optional[Dict]:
+        """Get recent funding optimizer results from JSON file."""
+        try:
+            from pathlib import Path
+            import os
+            
+            # Funding results are saved to optimizer_results/funding_best.json
+            db_dir = Path(db_path).parent
+            funding_results_file = db_dir / "optimizer_results" / "funding_best.json"
+            
+            if not funding_results_file.exists():
+                return None
+            
+            # Check file modification time (only show if updated in last 7 days)
+            file_mtime = os.path.getmtime(funding_results_file)
+            file_age_days = (datetime.now().timestamp() - file_mtime) / (24 * 3600)
+            
+            if file_age_days > 7:
+                # Results are older than 7 days, don't show
+                return None
+            
+            with open(funding_results_file, 'r') as f:
+                funding_results = json.load(f)
+            
+            return funding_results
+            
+        except Exception as e:
+            self.logger.warning(f"Error getting funding optimizer results: {e}")
+            return None
+    
     def _get_recent_errors(self) -> List[str]:
         """Get recent errors from logs or database."""
         # TODO: Query error log or database for recent errors
@@ -374,7 +408,8 @@ class DiscordReporter:
         recent_errors: List[str],
         universe_stats: Optional[Dict] = None,
         universe_changes: Optional[Dict] = None,
-        funding_metrics: Optional[Dict] = None
+        funding_metrics: Optional[Dict] = None,
+        funding_optimizer_results: Optional[Dict] = None
     ) -> Dict:
         """Create Discord embed message."""
         now = datetime.now()
@@ -548,7 +583,7 @@ class DiscordReporter:
                         'inline': False
                     })
         
-        # Optimizer Changes
+        # Optimizer Changes (Main Strategy)
         if optimizer_changes:
             params_text = "\n".join([
                 f"• **{param}**: {change['old']} → {change['new']}"
@@ -571,10 +606,53 @@ class DiscordReporter:
                     params_text += "\n" + perf_text
             
             fields.append({
-                'name': '🔧 Parameter Updates',
+                'name': '🔧 Main Strategy Parameter Updates',
                 'value': params_text,
                 'inline': False
             })
+        
+        # Funding Optimizer Results
+        if funding_optimizer_results:
+            best_params = funding_optimizer_results.get('best_params', {})
+            best_metrics = funding_optimizer_results.get('best_metrics', {})
+            timestamp = funding_optimizer_results.get('timestamp', '')
+            
+            if best_params:
+                params_text = "\n".join([
+                    f"• **{param}**: {value}"
+                    for param, value in best_params.items()
+                ])
+                
+                # Add metrics if available
+                if best_metrics:
+                    metrics_text = "\n**OOS Performance:**\n"
+                    if 'avg_sharpe_oos' in best_metrics:
+                        metrics_text += f"• Sharpe (OOS): {best_metrics['avg_sharpe_oos']:.2f}\n"
+                    if 'avg_dd_oos' in best_metrics:
+                        metrics_text += f"• Drawdown (OOS): {best_metrics['avg_dd_oos']:.2f}%\n"
+                    if 'min_funding_trades_oos' in best_metrics:
+                        metrics_text += f"• Funding Trades (OOS): {best_metrics['min_funding_trades_oos']:.0f}\n"
+                    if 'funding_pnl_share' in best_metrics:
+                        metrics_text += f"• Funding PnL Share: {best_metrics['funding_pnl_share']:.1%}\n"
+                    
+                    if metrics_text != "\n**OOS Performance:**\n":
+                        params_text += "\n" + metrics_text
+                
+                # Add timestamp if available
+                if timestamp:
+                    try:
+                        from datetime import datetime as dt
+                        opt_time = dt.fromisoformat(timestamp.replace('Z', '+00:00'))
+                        time_str = opt_time.strftime('%Y-%m-%d %H:%M UTC')
+                        params_text += f"\n*Optimized: {time_str}*"
+                    except:
+                        pass
+                
+                fields.append({
+                    'name': '💰 Funding Strategy Optimizer Results',
+                    'value': params_text,
+                    'inline': False
+                })
         
         # Errors
         if recent_errors:

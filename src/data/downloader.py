@@ -1,8 +1,8 @@
 """OHLCV data downloader from exchange."""
 
 import time
-from typing import List, Optional
-from datetime import datetime, timedelta
+from typing import List, Optional, Tuple
+from datetime import datetime, timedelta, timezone
 import ccxt
 
 from ..exchange.bybit_client import BybitClient
@@ -70,7 +70,7 @@ class DataDownloader:
                 )
             else:
                 # Fetch from lookback_days ago - initial download
-                since = int((datetime.now() - timedelta(days=lookback_days)).timestamp() * 1000)
+                since = int((datetime.now(timezone.utc) - timedelta(days=lookback_days)).timestamp() * 1000)
                 self.logger.debug(
                     f"Initial download for {symbol} {timeframe}: "
                     f"no existing data, downloading {lookback_days} days of history"
@@ -88,7 +88,11 @@ class DataDownloader:
             
             # Calculate how many candles we need
             if force_from_date is not None:
-                days_to_now = (datetime.now() - force_from_date).days
+                # Ensure both datetimes are timezone-aware (UTC)
+                now_utc = datetime.now(timezone.utc)
+                if force_from_date.tzinfo is None:
+                    force_from_date = force_from_date.replace(tzinfo=timezone.utc)
+                days_to_now = (now_utc - force_from_date).days
                 lookback_days = max(lookback_days, days_to_now)
             
             desired_total_candles = int(lookback_days * 24 / hours_per_bar)
@@ -102,7 +106,7 @@ class DataDownloader:
             self.logger.info(f"Downloading {symbol} {timeframe} data from {datetime.fromtimestamp(since/1000)}")
             
             # Download in chunks forward from since timestamp
-            now_ms = int(datetime.now().timestamp() * 1000)
+            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
             
             self.logger.info(f"Starting chunked download for {symbol} {timeframe}: from {datetime.fromtimestamp(since/1000)} to now (~{(now_ms - since) / (1000 * 3600 * 24):.0f} days, max {max_iterations} iterations)")
             
@@ -179,30 +183,25 @@ class DataDownloader:
                     )
                 
                 # If we got fewer candles than requested, check if we should stop
-                # When force_from_date is set, only stop if we've actually reached "now"
+                # FIXED: Continue downloading even for incremental updates if not at "now" yet
                 if len(ohlcv_data) < limit:
                     # Exchange returned fewer candles than requested
-                    if force_from_date is not None:
-                        # For force downloads, check if we've reached "now" before stopping
-                        if ohlcv_data:
-                            last_candle_time = ohlcv_data[-1][0]
-                            ms_per_bar = hours_per_bar * 3600 * 1000
-                            ms_from_last_to_now = now_ms - last_candle_time
-                            bars_from_last_to_now = ms_from_last_to_now / ms_per_bar
-                            
-                            # If we're within 2 bars of "now", we're done
-                            if bars_from_last_to_now <= 2:
-                                self.logger.info(f"  Iteration {iteration+1}: Reached present time (last candle: {datetime.fromtimestamp(last_candle_time/1000)}, bars to now: {bars_from_last_to_now:.1f}). Stopping.")
-                                break
-                            # Otherwise, continue - exchange might have rate-limited or there might be a gap
-                            self.logger.info(f"  Iteration {iteration+1}: Got {len(ohlcv_data)} candles (less than limit {limit}), but not at 'now' yet (bars to now: {bars_from_last_to_now:.0f}). Continuing...")
-                        else:
-                            # Empty response - break
-                            self.logger.warning(f"  Iteration {iteration+1}: Got empty response. Stopping.")
+                    if ohlcv_data:
+                        last_candle_time = ohlcv_data[-1][0]
+                        ms_per_bar = hours_per_bar * 3600 * 1000
+                        ms_from_last_to_now = now_ms - last_candle_time
+                        bars_from_last_to_now = ms_from_last_to_now / ms_per_bar
+                        
+                        # If we're within 2 bars of "now", we're done (for both force and incremental)
+                        if bars_from_last_to_now <= 2:
+                            self.logger.info(f"  Iteration {iteration+1}: Reached present time (last candle: {datetime.fromtimestamp(last_candle_time/1000)}, bars to now: {bars_from_last_to_now:.1f}). Stopping.")
                             break
+                        # Otherwise, continue - exchange might have rate-limited or there might be a gap
+                        # This applies to both force downloads AND incremental updates
+                        self.logger.info(f"  Iteration {iteration+1}: Got {len(ohlcv_data)} candles (less than limit {limit}), but not at 'now' yet (bars to now: {bars_from_last_to_now:.0f}). Continuing...")
                     else:
-                        # Not force downloading - stop if we got fewer than requested
-                        self.logger.debug(f"  Iteration {iteration+1}: Got {len(ohlcv_data)} candles (less than limit {limit}). Stopping (not force download).")
+                        # Empty response - break
+                        self.logger.warning(f"  Iteration {iteration+1}: Got empty response. Stopping.")
                         break
                 else:
                     # Got full limit (or more) - definitely continue
@@ -250,7 +249,7 @@ class DataDownloader:
                 )
             else:
                 if latest_ts:
-                    self.logger.debug(
+                    self.logger.info(
                         f"No new data for {symbol} {timeframe} "
                         f"(latest in DB: {datetime.fromtimestamp(latest_ts/1000)}, already up-to-date)"
                     )
@@ -269,6 +268,72 @@ class DataDownloader:
             # Other errors (network, rate limit, etc.) - log as error
             self.logger.error(f"Error downloading data for {symbol} {timeframe}: {e}")
             raise
+    
+    def _get_hours_per_bar(self, timeframe: str) -> float:
+        """Get hours per bar for a timeframe."""
+        timeframe_to_hours = {
+            '1m': 1/60, '5m': 5/60, '15m': 15/60, '30m': 0.5,
+            '1h': 1, '2h': 2, '4h': 4, '6h': 6, '12h': 12, '1d': 24
+        }
+        return timeframe_to_hours.get(timeframe, 1)
+    
+    def backfill_gaps(
+        self,
+        symbol: str,
+        timeframe: str,
+        missing_ranges: List[Tuple[int, int]],
+        max_iterations: int = 10
+    ) -> int:
+        """
+        Backfill missing candle ranges.
+        
+        Args:
+            symbol: Trading pair symbol
+            timeframe: Timeframe (e.g., '1h')
+            missing_ranges: List of (start_ms, end_ms) tuples for missing ranges
+            max_iterations: Maximum number of backfill attempts per range
+        
+        Returns:
+            Number of candles backfilled (estimated)
+        """
+        if not missing_ranges:
+            return 0
+        
+        total_backfilled = 0
+        
+        for start_ms, end_ms in missing_ranges:
+            self.logger.info(
+                f"Backfilling gap for {symbol} {timeframe}: "
+                f"{datetime.fromtimestamp(start_ms/1000)} to {datetime.fromtimestamp(end_ms/1000)}"
+            )
+            
+            try:
+                # Download from start_ms to end_ms
+                force_from_date = datetime.fromtimestamp(start_ms / 1000)
+                force_from_date = force_from_date.replace(tzinfo=timezone.utc)
+                
+                # Calculate days to backfill
+                days_to_backfill = (end_ms - start_ms) / (1000 * 3600 * 24)
+                lookback_days = int(days_to_backfill) + 1  # Add 1 for safety
+                
+                # Download with force_from_date
+                self.download_and_store(
+                    symbol,
+                    timeframe,
+                    lookback_days=lookback_days,
+                    force_from_date=force_from_date
+                )
+                
+                # Count how many candles were added (approximate)
+                hours_per_bar = self._get_hours_per_bar(timeframe)
+                estimated_candles = int(days_to_backfill * (24 / hours_per_bar))
+                total_backfilled += estimated_candles
+                
+            except Exception as e:
+                self.logger.warning(f"Failed to backfill gap {start_ms}-{end_ms} for {symbol}: {e}")
+                continue
+        
+        return total_backfilled
     
     def update_all_symbols(
         self,

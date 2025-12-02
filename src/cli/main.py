@@ -465,6 +465,59 @@ def run_live(config_path: str):
             universe_store
         )
         logger.info("Dynamic universe selection enabled")
+        
+        # Validate universe symbols meet min_history_days on startup
+        current_universe = list(universe_selector.get_universe())
+        if current_universe:
+            logger.info(f"Validating {len(current_universe)} universe symbols meet min_history_days ({config.universe.min_history_days} days)...")
+            invalid_symbols = []
+            for symbol in current_universe:
+                passes, reason, metadata = universe_selector.check_historical_data(symbol, config.exchange.timeframe)
+                if not passes:
+                    invalid_symbols.append((symbol, reason, metadata))
+                    logger.warning(
+                        f"Symbol {symbol} in universe but fails history check: {reason} "
+                        f"(has {metadata.get('history_days', 0)} days, need {config.universe.min_history_days})"
+                    )
+            
+            if invalid_symbols:
+                logger.warning(
+                    f"Found {len(invalid_symbols)} symbols in universe that don't meet min_history_days. "
+                    f"Attempting to backfill missing data..."
+                )
+                
+                # Automatically backfill data for symbols with insufficient history
+                lookback_days = _get_history_lookback_days(config.universe)
+                force_from_date = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+                
+                backfilled_count = 0
+                failed_count = 0
+                for symbol, reason, metadata in invalid_symbols:
+                    if reason == 'insufficient_history':
+                        try:
+                            logger.info(f"Backfilling {symbol} {config.exchange.timeframe} (need {config.universe.min_history_days} days, have {metadata.get('history_days', 0)} days)...")
+                            downloader.download_and_store(
+                                symbol,
+                                config.exchange.timeframe,
+                                lookback_days=lookback_days,
+                                force_from_date=force_from_date
+                            )
+                            backfilled_count += 1
+                            
+                            # Re-check after backfill
+                            passes_after, reason_after, metadata_after = universe_selector.check_historical_data(symbol, config.exchange.timeframe)
+                            if passes_after:
+                                logger.info(f"✓ {symbol} now meets min_history_days requirement after backfill")
+                            else:
+                                logger.warning(f"⚠ {symbol} still insufficient after backfill: {reason_after} (has {metadata_after.get('history_days', 0)} days)")
+                        except Exception as e:
+                            logger.error(f"Failed to backfill {symbol}: {e}")
+                            failed_count += 1
+                
+                if backfilled_count > 0:
+                    logger.info(f"Backfilled {backfilled_count} symbols. {failed_count} failed.")
+            else:
+                logger.info(f"✓ All {len(current_universe)} universe symbols meet min_history_days requirement")
     
     # Initialize funding universe selector if needed (after universe_store is created)
     if config.strategy.funding_opportunity.enabled and not config.strategy.funding_opportunity.universe.use_main_universe:
@@ -488,6 +541,59 @@ def run_live(config_path: str):
             universe_store
         )
         logger.info("Funding opportunity strategy: Using independent universe")
+        
+        # Validate funding universe symbols meet min_history_days on startup
+        funding_universe = list(funding_universe_selector.get_universe())
+        if funding_universe:
+            logger.info(f"Validating {len(funding_universe)} funding universe symbols meet min_history_days ({funding_universe_config.min_history_days} days)...")
+            invalid_funding_symbols = []
+            for symbol in funding_universe:
+                passes, reason, metadata = funding_universe_selector.check_historical_data(symbol, config.exchange.timeframe)
+                if not passes:
+                    invalid_funding_symbols.append((symbol, reason, metadata))
+                    logger.warning(
+                        f"Funding symbol {symbol} in universe but fails history check: {reason} "
+                        f"(has {metadata.get('history_days', 0)} days, need {funding_universe_config.min_history_days})"
+                    )
+            
+            if invalid_funding_symbols:
+                logger.warning(
+                    f"Found {len(invalid_funding_symbols)} funding symbols in universe that don't meet min_history_days. "
+                    f"Attempting to backfill missing data..."
+                )
+                
+                # Automatically backfill data for symbols with insufficient history
+                funding_lookback_days = funding_universe_config.min_history_days + max(getattr(funding_universe_config, "history_buffer_days", 5), 0)
+                funding_force_from_date = datetime.now(timezone.utc) - timedelta(days=funding_lookback_days)
+                
+                backfilled_count = 0
+                failed_count = 0
+                for symbol, reason, metadata in invalid_funding_symbols:
+                    if reason == 'insufficient_history':
+                        try:
+                            logger.info(f"Backfilling funding symbol {symbol} {config.exchange.timeframe} (need {funding_universe_config.min_history_days} days, have {metadata.get('history_days', 0)} days)...")
+                            downloader.download_and_store(
+                                symbol,
+                                config.exchange.timeframe,
+                                lookback_days=funding_lookback_days,
+                                force_from_date=funding_force_from_date
+                            )
+                            backfilled_count += 1
+                            
+                            # Re-check after backfill
+                            passes_after, reason_after, metadata_after = funding_universe_selector.check_historical_data(symbol, config.exchange.timeframe)
+                            if passes_after:
+                                logger.info(f"✓ Funding symbol {symbol} now meets min_history_days requirement after backfill")
+                            else:
+                                logger.warning(f"⚠ Funding symbol {symbol} still insufficient after backfill: {reason_after} (has {metadata_after.get('history_days', 0)} days)")
+                        except Exception as e:
+                            logger.error(f"Failed to backfill funding symbol {symbol}: {e}")
+                            failed_count += 1
+                
+                if backfilled_count > 0:
+                    logger.info(f"Backfilled {backfilled_count} funding symbols. {failed_count} failed.")
+            else:
+                logger.info(f"✓ All {len(funding_universe)} funding universe symbols meet min_history_days requirement")
     elif config.strategy.funding_opportunity.enabled:
         logger.info("Funding opportunity strategy: Using main strategy universe")
         
@@ -932,6 +1038,48 @@ def run_live(config_path: str):
                         f"{len(flat_signals)} FLAT out of {len(symbol_signals)} symbols"
                     )
                     
+                    # DIAGNOSTIC: Log why shorts aren't triggering if no short signals
+                    if len(short_signals) == 0:
+                        # Track consecutive iterations with no shorts (rate-limited logging)
+                        if not hasattr(run_live, '_no_shorts_count'):
+                            run_live._no_shorts_count = 0
+                        run_live._no_shorts_count += 1
+                        
+                        # Log diagnostic every 5 iterations or on first occurrence
+                        if run_live._no_shorts_count == 1 or run_live._no_shorts_count % 5 == 0:
+                            # Count negative momentum symbols
+                            if symbol_data:
+                                rankings = cross_sectional_gen.rank_symbols(symbol_data)
+                                negative_momentum_symbols = [s for s, ret in rankings if ret < 0]
+                                
+                                # Count cross-sectional candidates before filters
+                                long_candidates_count = len([s for s, ret in rankings if ret > 0])
+                                short_candidates_count = len(negative_momentum_symbols)
+                                
+                                logger.warning(
+                                    f"⚠️ DIAGNOSTIC: No short signals generated (iteration {run_live._no_shorts_count}). "
+                                    f"Trend shorts: {len(short_signals)}, "
+                                    f"Negative momentum symbols: {len(negative_momentum_symbols)}, "
+                                    f"Cross-sectional candidates (long/short): {long_candidates_count}/{short_candidates_count}, "
+                                    f"require_trend_alignment: {config.strategy.cross_sectional.require_trend_alignment}, "
+                                    f"balanced_long_short: {config.strategy.cross_sectional.balanced_long_short}"
+                                )
+                                
+                                # Show top negative momentum symbols for debugging
+                                if negative_momentum_symbols:
+                                    top_negative = sorted(
+                                        [(s, ret) for s, ret in rankings if ret < 0],
+                                        key=lambda x: x[1]
+                                    )[:5]
+                                    logger.debug(
+                                        f"Top 5 negative momentum symbols: "
+                                        f"{', '.join([f'{s} ({ret*100:.2f}%)' for s, ret in top_negative])}"
+                                    )
+                    else:
+                        # Reset counter when shorts are found
+                        if hasattr(run_live, '_no_shorts_count'):
+                            run_live._no_shorts_count = 0
+                    
                     # Log top signals by confidence
                     signals_with_conf = [
                         (s, sig) for s, sig in symbol_signals.items() 
@@ -962,10 +1110,22 @@ def run_live(config_path: str):
                     config.strategy.cross_sectional.require_trend_alignment
                 )
                 
+                # DIAGNOSTIC: Log cross-sectional selection breakdown
+                if selected_symbols and symbol_data:
+                    rankings = cross_sectional_gen.rank_symbols(symbol_data)
+                    ranking_map = {s: ret for s, ret in rankings}
+                    selected_longs = [s for s in selected_symbols if ranking_map.get(s, 0) > 0]
+                    selected_shorts = [s for s in selected_symbols if ranking_map.get(s, 0) < 0]
+                    logger.debug(
+                        f"Cross-sectional selection: {len(selected_longs)} longs, {len(selected_shorts)} shorts "
+                        f"(balanced_long_short={config.strategy.cross_sectional.balanced_long_short}, "
+                        f"require_trend_alignment={config.strategy.cross_sectional.require_trend_alignment})"
+                )
+                
                 # Apply exit band/hysteresis: keep positions that are still within top_k + exit_band
                 # This prevents unnecessary churn when rankings change slightly
                 rankings = None
-                if portfolio.positions and config.strategy.cross_sectional.exit_band > 0:
+                if portfolio.positions and (config.strategy.cross_sectional.exit_band or 0) > 0:
                     rankings = cross_sectional_gen.rank_symbols(symbol_data)
                     if rankings:
                         # Create rank map: symbol -> rank (0-indexed, lower = better)
@@ -1791,7 +1951,7 @@ def run_live(config_path: str):
                             logger.error(
                                 f"Cannot fix violation: {excess_count} excess positions but only "
                                 f"{len(new_targets)} new targets to remove"
-                            )
+                        )
                 else:
                     # Between rebalances: Preserve existing positions that are still in selected_symbols
                     # This prevents positions from being closed when they're still top-ranked
@@ -2393,6 +2553,55 @@ def run_optimize(config_path: str, use_universe_history: bool = False):
     
     # Save result
     optimizer.save_optimization_result(result, config.data.db_path)
+    
+    # Run funding strategy optimization if enabled
+    if config.optimizer.funding.enabled and config.strategy.funding_opportunity.enabled:
+        logger.info("="*80)
+        logger.info("=== FUNDING STRATEGY OPTIMIZATION START ===")
+        logger.info("="*80)
+        
+        funding_result = optimizer.optimize_funding_strategy(
+            target_symbols,
+            config.exchange.timeframe,
+            universe_history=universe_history,
+        )
+        
+        if 'error' not in funding_result and 'skipped' not in funding_result:
+            # Print funding strategy results
+            print("\n" + "="*80)
+            print("FUNDING STRATEGY OPTIMIZATION RESULTS")
+            print("="*80)
+            print(f"\nBest funding parameters found:")
+            for param, value in funding_result['best_params'].items():
+                print(f"  {param}: {value}")
+            
+            print(f"\nPerformance metrics:")
+            funding_metrics = funding_result['best_metrics']
+            print(f"  Average Sharpe (OOS): {funding_metrics['avg_sharpe_oos']:.2f}")
+            print(f"  Average drawdown (OOS): {funding_metrics['avg_dd_oos']:.2f}%")
+            print(f"  Minimum funding trades (OOS): {funding_metrics['min_funding_trades_oos']:.0f}")
+            print(f"  Funding PnL share: {funding_metrics['funding_pnl_share']:.2%}")
+            
+            # Save funding results to separate file/table
+            try:
+                import json
+                from pathlib import Path
+                results_dir = Path(config.data.db_path).parent / "optimizer_results"
+                results_dir.mkdir(exist_ok=True)
+                funding_results_file = results_dir / "funding_best.json"
+                with open(funding_results_file, 'w') as f:
+                    json.dump({
+                        'timestamp': datetime.now().isoformat(),
+                        'best_params': funding_result['best_params'],
+                        'best_metrics': funding_result['best_metrics'],
+                    }, f, indent=2)
+                logger.info(f"Saved funding optimization results to {funding_results_file}")
+            except Exception as e:
+                logger.warning(f"Failed to save funding optimization results: {e}")
+        elif 'error' in funding_result:
+            logger.warning(f"Funding optimization failed: {funding_result['error']}")
+    elif config.optimizer.funding.enabled:
+        logger.info("Funding optimization enabled but funding strategy is disabled in config. Skipping.")
 
 
 def run_optimize_universe(

@@ -2,6 +2,7 @@
 
 import sqlite3
 import pandas as pd
+import math
 from pathlib import Path
 from typing import List, Optional, Tuple
 from datetime import datetime
@@ -276,4 +277,175 @@ class OHLCVStore:
             self.logger.error(f"Error deleting old data: {e}")
             conn.rollback()
             conn.close()
+    
+    def check_health(
+        self,
+        symbol: str,
+        timeframe: str,
+        required_days: int,
+        max_gap_pct: float = 5.0
+    ) -> dict:
+        """
+        Check OHLCV data health for a symbol/timeframe.
+        
+        Args:
+            symbol: Trading pair symbol
+            timeframe: Timeframe (e.g., '1h')
+            required_days: Minimum calendar days of history required
+            max_gap_pct: Maximum allowed gap percentage (default: 5.0)
+        
+        Returns:
+            Dictionary with health metrics:
+            {
+                'symbol': str,
+                'timeframe': str,
+                'required_days': int,
+                'history_days': float,
+                'actual_bars': int,
+                'expected_bars': int,
+                'gap_pct': float,
+                'earliest_timestamp': int or None,
+                'latest_timestamp': int or None,
+                'is_healthy': bool,
+                'needs_backfill': bool,
+                'missing_ranges': List[Tuple[int, int]],  # List of (start_ms, end_ms) gaps
+                'issues': List[str]  # List of issue descriptions
+            }
+        """
+        from ..utils import parse_timeframe_to_hours
+        
+        result = {
+            'symbol': symbol,
+            'timeframe': timeframe,
+            'required_days': required_days,
+            'history_days': 0.0,
+            'actual_bars': 0,
+            'expected_bars': 0,
+            'gap_pct': 0.0,
+            'earliest_timestamp': None,
+            'latest_timestamp': None,
+            'is_healthy': False,
+            'needs_backfill': False,
+            'missing_ranges': [],
+            'issues': []
+        }
+        
+        try:
+            # Get all data for this symbol/timeframe
+            df = self.get_ohlcv(symbol, timeframe)
+            
+            if df.empty:
+                result['issues'].append('no_data')
+                result['needs_backfill'] = True
+                return result
+            
+            # Calculate metrics
+            hours_per_bar = parse_timeframe_to_hours(timeframe)
+            if hours_per_bar <= 0:
+                result['issues'].append('invalid_timeframe')
+                return result
+            
+            candles_per_day = max(24.0 / hours_per_bar, 1.0)
+            required_bars = int(math.ceil(required_days * candles_per_day))
+            
+            # Get timestamps
+            earliest_ts = df.index[0]
+            latest_ts = df.index[-1]
+            
+            # Convert to datetime if needed
+            if hasattr(earliest_ts, 'timestamp'):
+                earliest_dt = earliest_ts.to_pydatetime() if hasattr(earliest_ts, 'to_pydatetime') else earliest_ts
+                latest_dt = latest_ts.to_pydatetime() if hasattr(latest_ts, 'to_pydatetime') else latest_ts
+            else:
+                earliest_dt = earliest_ts
+                latest_dt = latest_ts
+            
+            # Ensure UTC-aware
+            from datetime import timezone
+            if earliest_dt.tzinfo is None:
+                earliest_dt = earliest_dt.replace(tzinfo=timezone.utc)
+            if latest_dt.tzinfo is None:
+                latest_dt = latest_dt.replace(tzinfo=timezone.utc)
+            
+            # Calculate history days
+            history_days = (latest_dt - earliest_dt).total_seconds() / 86400.0
+            actual_bars = len(df)
+            expected_bars = max(int(history_days * candles_per_day), 1)
+            gap_pct = (1 - actual_bars / expected_bars) * 100 if expected_bars > 0 else 100.0
+            
+            # Convert timestamps to milliseconds
+            if hasattr(earliest_ts, 'timestamp'):
+                earliest_timestamp_ms = int(earliest_ts.timestamp() * 1000)
+            else:
+                earliest_timestamp_ms = int(earliest_dt.timestamp() * 1000)
+            
+            if hasattr(latest_ts, 'timestamp'):
+                latest_timestamp_ms = int(latest_ts.timestamp() * 1000)
+            else:
+                latest_timestamp_ms = int(latest_dt.timestamp() * 1000)
+            
+            # Detect missing ranges (gaps)
+            missing_ranges = []
+            if len(df) > 1:
+                timestamps = df.index
+                ms_per_bar = hours_per_bar * 3600 * 1000
+                
+                for i in range(len(timestamps) - 1):
+                    current_ts = timestamps[i]
+                    next_ts = timestamps[i + 1]
+                    
+                    # Convert to milliseconds
+                    if hasattr(current_ts, 'timestamp'):
+                        current_ms = int(current_ts.timestamp() * 1000)
+                    elif hasattr(current_ts, 'to_pydatetime'):
+                        current_ms = int(current_ts.to_pydatetime().timestamp() * 1000)
+                    else:
+                        # Assume it's already a timestamp in some form
+                        try:
+                            current_ms = int(pd.Timestamp(current_ts).timestamp() * 1000)
+                        except:
+                            continue
+                    
+                    if hasattr(next_ts, 'timestamp'):
+                        next_ms = int(next_ts.timestamp() * 1000)
+                    elif hasattr(next_ts, 'to_pydatetime'):
+                        next_ms = int(next_ts.to_pydatetime().timestamp() * 1000)
+                    else:
+                        try:
+                            next_ms = int(pd.Timestamp(next_ts).timestamp() * 1000)
+                        except:
+                            continue
+                    
+                    # Check if gap is larger than expected (more than 1.5x the bar duration)
+                    expected_next_ms = current_ms + ms_per_bar
+                    if next_ms > expected_next_ms + (ms_per_bar * 0.5):  # Allow 0.5 bar tolerance
+                        missing_ranges.append((expected_next_ms, next_ms))
+            
+            # Update result
+            result['history_days'] = history_days
+            result['actual_bars'] = actual_bars
+            result['expected_bars'] = expected_bars
+            result['gap_pct'] = gap_pct
+            result['earliest_timestamp'] = earliest_timestamp_ms
+            result['latest_timestamp'] = latest_timestamp_ms
+            result['missing_ranges'] = missing_ranges
+            
+            # Determine health
+            if history_days < required_days:
+                result['issues'].append('insufficient_history')
+                result['needs_backfill'] = True
+            
+            if gap_pct > max_gap_pct:
+                result['issues'].append('too_many_gaps')
+                result['needs_backfill'] = True
+            
+            if not result['issues']:
+                result['is_healthy'] = True
+            
+        except Exception as e:
+            self.logger.error(f"Error checking health for {symbol} {timeframe}: {e}", exc_info=True)
+            result['issues'].append(f'check_error: {str(e)}')
+            result['needs_backfill'] = True
+        
+        return result
 
