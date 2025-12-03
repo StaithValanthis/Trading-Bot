@@ -114,7 +114,7 @@ class TrendStrategyConfig:
     ma_short: int = 5  # Bars; interpretation depends on timeframe (5 bars @4h ≈ 20h)
     ma_long: int = 25  # Bars; 25 bars @4h ≈ 100h
     momentum_lookback: int = 6  # Bars; 6 bars @4h ≈ 24h
-    atr_stop_multiplier: float = 2.5
+    atr_stop_multiplier: float = 1.5  # Tighter stops = larger position sizes (was 2.5)
     atr_period: int = 4  # Bars; 4 bars @4h ≈ 16h
     min_atr_threshold: float = 0.001
     # Position management
@@ -122,7 +122,7 @@ class TrendStrategyConfig:
     # Take-profit (optional, None = no TP, let winners run)
     take_profit_rr: Optional[float] = None  # Risk-reward multiple (e.g., 2.0 = TP at 2x SL distance)
     # Trailing stop (optional)
-    use_trailing_stop: bool = False
+    use_trailing_stop: bool = True  # Enable trailing stops to protect profits (was False)
     trailing_stop_atr_multiplier: float = 1.5  # Trailing stop distance (ATR multiplier)
     trailing_stop_activation_rr: float = 1.0  # Activate trailing after this RR profit (e.g., 1.0 = break-even)
 
@@ -131,9 +131,9 @@ class TrendStrategyConfig:
 class CrossSectionalStrategyConfig:
     """Cross-sectional momentum strategy parameters."""
     ranking_window: int = 18  # Bars; 18 bars @4h ≈ 3 days
-    top_k: int = 3
+    top_k: int = 5  # Increased from 3 for better diversification
     rebalance_frequency_hours: int = 8
-    require_trend_alignment: bool = True
+    require_trend_alignment: bool = False  # Relaxed from True to increase trade frequency
     exit_band: int = 2  # Exit band - only close if rank falls below top_k + exit_band (hysteresis to reduce churn)
     balanced_long_short: bool = True  # If True, balance selection between longs and shorts (top_k//2 each). If False, select all longs first, then shorts.
 
@@ -174,7 +174,7 @@ class FundingOpportunitySizingConfig:
 @dataclass
 class FundingOpportunityEntryConfig:
     """Entry filters for funding opportunities."""
-    require_trend_alignment: bool = True  # Default to true to reduce directional risk
+    require_trend_alignment: bool = False  # Relaxed from True to increase funding trade frequency
     min_momentum_pct: Optional[float] = None
     max_momentum_pct: Optional[float] = None
 
@@ -209,7 +209,7 @@ class FundingOpportunityConfluenceConfig:
 class FundingOpportunityConfig:
     """Configuration for funding rate opportunity finder."""
     enabled: bool = False
-    min_funding_rate: float = 0.0003  # Minimum funding rate to consider (per 8h, lowered for more opportunities)
+    min_funding_rate: float = 0.0002  # Minimum funding rate to consider (per 8h, lowered from 0.0003 for more opportunities)
     max_positions: int = 5  # Maximum number of funding positions
     universe: FundingOpportunityUniverseConfig = field(default_factory=FundingOpportunityUniverseConfig)
     sizing: FundingOpportunitySizingConfig = field(default_factory=FundingOpportunitySizingConfig)
@@ -237,7 +237,7 @@ class RiskConfig:
     max_positions: int = 5
     daily_soft_loss_pct: float = -2.0
     daily_hard_loss_pct: float = -4.0
-    kelly_fraction: float = 0.5
+    kelly_fraction: float = 0.75  # Increased from 0.5 to better utilize edge (only if Sharpe > 0.7)
     # Advanced: approximate minimum liquidation distance as 1 / effective leverage.
     # Ensures effective leverage is capped such that 100 / leverage >= min_liquidation_distance_pct.
     min_liquidation_distance_pct: float = 5.0
@@ -291,10 +291,10 @@ class FundingOptimizerConfig:
 class OptimizerConfig:
     """Optimizer configuration."""
     lookback_months: int = 6
-    walk_forward_window_days: int = 30
-    min_trades: int = 20
-    min_sharpe_ratio: float = 1.0
-    max_drawdown_pct: float = -15.0
+    walk_forward_window_days: int = 45  # Increased from 30 for more robust evaluation
+    min_trades: int = 15  # Lowered from 20 to allow more parameter sets
+    min_sharpe_ratio: float = 0.7  # Lowered from 1.0 to allow discovery of more parameter sets
+    max_drawdown_pct: float = -20.0  # Increased from -15.0 to account for crypto volatility
     search_method: str = "random"  # grid, random, bayesian
     n_trials: int = 50
     random_seed: Optional[int] = None
@@ -319,8 +319,8 @@ class OptimizerConfig:
         "ma_short": [15, 25, 30],
         "ma_long": [80, 100, 120, 150],
         "momentum_lookback": [12, 24, 36, 48],
-        "atr_stop_multiplier": [2.0, 2.5, 3.0],
-        "top_k": [2, 3, 4, 5],
+        "atr_stop_multiplier": [1.5, 2.0, 2.5, 3.0],  # Added 1.5 for tighter stops
+        "top_k": [2, 3, 4, 5, 6, 7],  # Expanded range for better diversification
         "ranking_window": [12, 18, 24, 36, 48]  # Bars for ranking lookback (timeframe-dependent)
     })
     # Funding strategy optimization

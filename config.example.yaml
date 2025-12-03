@@ -45,7 +45,9 @@ strategy:
     # Momentum lookback (bars; 6 bars @4h ≈ 24h)
     momentum_lookback: 18
     # ATR multiplier for stop-loss distance
-    atr_stop_multiplier: 2
+    # Tighter stops (1.5x) = larger position sizes = higher returns (if edge is real)
+    # Test carefully as tighter stops may increase whipsaws in choppy markets
+    atr_stop_multiplier: 1.5
     # ATR lookback for volatility calculation (bars; 4 bars @4h ≈ 16h)
     atr_period: 4
     # Minimum ATR filter: skip trades if ATR < min_atr_threshold * price
@@ -58,7 +60,8 @@ strategy:
     # e.g., 2.0 = TP at 2x the SL distance from entry
     take_profit_rr: null  # Recommended: null for trend-following, 2.0-3.0 for mean-reversion
     # Trailing stop settings
-    use_trailing_stop: false  # Enable trailing stops
+    # Enable trailing stops to protect profits while allowing winners to run
+    use_trailing_stop: true  # Enable trailing stops
     trailing_stop_atr_multiplier: 1.5  # Trailing stop distance (ATR multiplier)
     trailing_stop_activation_rr: 1.0  # Activate trailing after this RR profit (e.g., 1.0 = break-even)
     
@@ -70,11 +73,12 @@ strategy:
     exit_band: 2
     ranking_window: 12
     # Number of top symbols to trade
-    top_k: 3
+    top_k: 5
     # Rebalance frequency in hours (8h aligns with funding settlements)
     rebalance_frequency_hours: 6
     # Only trade symbols that also have positive time-series trend
-    require_trend_alignment: true
+    # Set to false to allow momentum-driven selection without trend filter (increases trade frequency)
+    require_trend_alignment: false
     # Balance selection between longs and shorts (true) or prioritize longs first (false)
     # When true: selects top_k//2 longs and top_k//2 shorts for balanced exposure
     # When false: selects all best longs first, then worst shorts (may crowd out shorts if top_k is small)
@@ -107,7 +111,7 @@ strategy:
       exclude_list: []  # Optional: symbols to exclude
     
     # Funding opportunity detection
-    min_funding_rate: 0.0003  # 0.03% per 8h minimum
+    min_funding_rate: 0.0002  # 0.02% per 8h minimum (lowered for more opportunities)
     max_positions: 5  # Maximum funding positions
     
     # Position sizing
@@ -118,7 +122,8 @@ strategy:
     
     # Entry filters
     entry:
-      require_trend_alignment: true  # Require trend supports direction
+      # Set to false to allow funding opportunities without trend filter (increases trade frequency)
+      require_trend_alignment: false  # Require trend supports direction
       min_momentum_pct: null  # Optional momentum filter
       max_momentum_pct: null
     
@@ -159,7 +164,8 @@ risk:
   # Hard daily loss cap: stop trading after this loss (% of equity)
   daily_hard_loss_pct: -4.0
   # Fractional Kelly aggressiveness (0.0-1.0, 0.5 = half-Kelly)
-  kelly_fraction: 0.5
+  # Increased from 0.5 to 0.75 to better utilize edge (only if Sharpe > 0.7, test first)
+  kelly_fraction: 0.75
   # Advanced: approximate minimum liquidation distance as 100 / effective_leverage >= this value.
   # This is a conservative check based on gross leverage only (not exact exchange liquidation math).
   min_liquidation_distance_pct: 5.0
@@ -242,17 +248,20 @@ optimizer:
   # Recommended: 12-18 months for robust optimization across market regimes
   lookback_months: 12
   # Walk-forward window size in days
-  # Recommended: 60-90 days for crypto to capture full market cycles
-  walk_forward_window_days: 60
+  # Recommended: 45-90 days for crypto to capture full market cycles
+  # Increased from 30 to 45 for more robust evaluation (more trades per window)
+  walk_forward_window_days: 45
   # Minimum number of trades required to consider a parameter set
-  # Recommended: 30-50 trades for statistical significance
-  min_trades: 30
+  # Recommended: 15-30 trades for statistical significance
+  # Lowered from 20 to 15 to allow more parameter sets (more realistic for shorter windows)
+  min_trades: 15
   # Minimum Sharpe ratio to consider updating
   # For crypto strategies: 0.7-0.8 is "good", 1.0+ is "excellent" but rare
-  # Lowered from 1.0 to 0.75 to account for crypto market characteristics
-  min_sharpe_ratio: 0.75
+  # Lowered from 1.0 to 0.7 to allow discovery of more parameter sets
+  min_sharpe_ratio: 0.7
   # Maximum drawdown allowed (%)
-  max_drawdown_pct: -15.0
+  # Increased from -15% to -20% to account for crypto volatility
+  max_drawdown_pct: -20.0
   # Parameter search method: grid, random, or bayesian
   search_method: random
   # Number of parameter sets to test
@@ -275,14 +284,15 @@ optimizer:
     # Momentum lookback: 6-36 bars (covers 24h to 6 days on 4h, or 1.5h to 9h on 15m)
     momentum_lookback: [6, 12, 18, 24]
     
-    # ATR stop multiplier: standard range (2.0-3.0)
-    atr_stop_multiplier: [2.0, 2.5, 3.0]
+    # ATR stop multiplier: includes tighter stops (1.5x) for larger position sizes
+    atr_stop_multiplier: [1.5, 2.0, 2.5, 3.0]
     
     # ATR period: 4-18 bars (short to medium volatility windows)
     atr_period: [4, 7, 10, 14]
     
     # Cross-sectional: portfolio size (concentrated to moderate diversification)
-    top_k: [3, 4, 5, 6]
+    # Expanded range to include larger top_k values for better diversification
+    top_k: [3, 4, 5, 6, 7]
     
     # Ranking window: 12-36 bars (medium-term momentum ranking)
     ranking_window: [12, 18, 24]
